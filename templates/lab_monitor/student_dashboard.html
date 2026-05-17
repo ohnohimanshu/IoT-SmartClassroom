@@ -1,0 +1,104 @@
+{% extends 'lab_monitor/student_base.html' %}
+
+{% block title %}Dashboard - Student Portal{% endblock %}
+
+{% block content %}
+<div class="row g-4">
+  <div class="col-lg-4">
+    <div class="stat-card">
+      <div class="d-flex align-items-center gap-3 mb-3">
+        <img src="{{ student.photo.url }}" class="student-avatar" style="width:80px;height:80px">
+        <div>
+          <h5 class="mb-0">{{ student.name }}</h5>
+          <small class="text-muted">{{ student.roll_no }}</small>
+        </div>
+      </div>
+      <div class="row g-2">
+        <div class="col-6">
+          <div class="p-2 bg-light rounded text-center">
+            <div class="small text-muted">Course</div>
+            <div class="fw-semibold">{{ student.course }}</div>
+          </div>
+        </div>
+        <div class="col-6">
+          <div class="p-2 bg-light rounded text-center">
+            <div class="small text-muted">Year</div>
+            <div class="fw-semibold">{{ student.get_year_display }}</div>
+          </div>
+        </div>
+      </div>
+      <a href="{% url 'student_session' %}" class="btn w-100 mt-3" style="background:linear-gradient(135deg,#4f46e5,#06b6d4);color:#fff;border:none">
+        <i class="bi bi-play-circle me-2"></i> Start Lab Session
+      </a>
+    </div>
+  </div>
+  
+  <div class="col-lg-8">
+    <div class="stat-card mb-4">
+      <div class="section-hdr">
+        <h5><i class="bi bi-calendar-check me-2" style="color:#4f46e5"></i> Recent Attendance</h5>
+      </div>
+      {% if attendance_logs %}
+      <div class="data-table">
+        <table class="table table-sm">
+          <thead>
+            <tr>
+              <th>Date</th>
+              <th>Entry</th>
+              <th>Exit</th>
+              <th>Duration</th>
+              <th>Emotion</th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for log in attendance_logs %}
+            <tr>
+              <td>{{ log.date }}</td>
+              <td>{{ log.entry_time|time:"H:i" }}</td>
+              <td>{{ log.exit_time|time:"H:i"|default:"-" }}</td>
+              <td>{{ log.duration_minutes|default:"-" }} min</td>
+              <td><span class="emotion-badge badge-{{ log.entry_emotion }}">{{ log.get_entry_emotion_display }}</span></td>
+            </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+      {% else %}
+      <p class="text-muted text-center py-4">No attendance records yet</p>
+      {% endif %}
+    </div>
+    
+    <div class="stat-card">
+      <div class="section-hdr">
+        <h5><i class="bi bi-collection me-2" style="color:#06b6d4"></i> Past Lab Sessions</h5>
+      </div>
+      {% if past_sessions %}
+      <div class="data-table">
+        <table class="table table-sm">
+          <thead>
+            <tr>
+              <th>Date</th>
+              <th>Start</th>
+              <th>End</th>
+              <th>Duration</th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for session in past_sessions %}
+            <tr>
+              <td>{{ session.start_time|date:"Y-m-d" }}</td>
+              <td>{{ session.start_time|time:"H:i" }}</td>
+              <td>{{ session.end_time|time:"H:i" }}</td>
+              <td>{{ session.duration_minutes|default:"-" }} min</td>
+            </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+      {% else %}
+      <p class="text-muted text-center py-4">No lab sessions yet</p>
+      {% endif %}
+    </div>
+  </div>
+</div>
+{% endblock %}

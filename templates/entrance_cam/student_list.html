@@ -1,0 +1,74 @@
+{% extends "entrance_cam/base.html" %}
+{% block title %}Students{% endblock %}
+{% block page_title %}Students{% endblock %}
+{% block content %}
+<div class="form-card">
+  <div class="section-hdr">
+    <h5><i class="bi bi-people-fill me-2" style="color:#4f46e5"></i>All Students</h5>
+    <a href="{% url 'student_add' %}" class="btn btn-sm" style="background:#4f46e5;color:#fff;border:none;border-radius:8px">
+      <i class="bi bi-plus-lg me-1"></i>Add Student
+    </a>
+  </div>
+  <form method="get" class="d-flex gap-2 mb-4">
+    <input type="text" name="q" value="{{ q }}" class="form-control" style="max-width:300px;border-radius:10px" placeholder="Search name, roll no, email…">
+    <button class="btn" style="background:#ede9fe;color:#7c3aed;border:none;border-radius:10px">
+      <i class="bi bi-search"></i>
+    </button>
+    {% if q %}<a href="{% url 'student_list' %}" class="btn btn-outline-secondary" style="border-radius:10px">Clear</a>{% endif %}
+  </form>
+
+  {% if students %}
+  <div class="table-responsive">
+    <table class="table table-hover align-middle mb-0">
+      <thead>
+        <tr>
+          <th>Student</th><th>Roll No</th><th>Course / Branch</th><th>Year</th><th>Email</th><th>Status</th><th>Actions</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for s in students %}
+        <tr>
+          <td>
+            <div class="d-flex align-items-center gap-2">
+              {% if s.photo %}
+              <img src="{{ s.photo.url }}" class="student-avatar">
+              {% else %}
+              <span class="avatar-placeholder">{{ s.name.0 }}</span>
+              {% endif %}
+              <div>
+                <div class="fw-500">{{ s.name }}</div>
+                <small class="text-muted">Added {{ s.created_at|date:"d M Y" }}</small>
+              </div>
+            </div>
+          </td>
+          <td><code>{{ s.roll_no }}</code></td>
+          <td>{{ s.course }}<br><small class="text-muted">{{ s.branch }}</small></td>
+          <td>Year {{ s.year }}</td>
+          <td style="font-size:0.85rem">{{ s.email }}</td>
+          <td>
+            {% if s.is_active %}
+            <span class="emotion-badge" style="background:#dcfce7;color:#166534"><span class="dot-online"></span>Active</span>
+            {% else %}
+            <span class="emotion-badge" style="background:#fee2e2;color:#991b1b"><span class="dot-offline"></span>Inactive</span>
+            {% endif %}
+          </td>
+          <td>
+            <div class="d-flex gap-1">
+              <a href="{% url 'student_detail' s.pk %}" class="btn btn-sm" style="background:#ede9fe;color:#7c3aed;border:none;border-radius:7px" title="View"><i class="bi bi-eye"></i></a>
+              <a href="{% url 'student_edit' s.pk %}" class="btn btn-sm" style="background:#cffafe;color:#0891b2;border:none;border-radius:7px" title="Edit"><i class="bi bi-pencil"></i></a>
+              <a href="{% url 'student_delete' s.pk %}" class="btn btn-sm" style="background:#fee2e2;color:#dc2626;border:none;border-radius:7px" title="Delete"><i class="bi bi-trash"></i></a>
+            </div>
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% else %}
+  <div class="text-center py-5 text-muted">
+    <i class="bi bi-people fs-1 d-block mb-2 opacity-20"></i>
+    {% if q %}No students found for "{{ q }}"{% else %}No students yet. <a href="{% url 'student_add' %}">Add one</a>.{% endif %}
+  </div>
+  {% endif %}
+</div>
+{% endblock %}

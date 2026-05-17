@@ -1,0 +1,167 @@
+{% extends "entrance_cam/base.html" %}
+{% block title %}Dashboard — ClassroomIoT{% endblock %}
+{% block page_title %}Dashboard{% endblock %}
+
+{% block content %}
+<!-- Stat cards -->
+<div class="row g-3 mb-4">
+  <div class="col-sm-6 col-xl-3">
+    <div class="stat-card">
+      <div class="d-flex align-items-center justify-content-between mb-3">
+        <div class="stat-icon" style="background:#ede9fe"><i class="bi bi-people-fill" style="color:#7c3aed"></i></div>
+        <span class="badge" style="background:#ede9fe;color:#7c3aed;font-size:0.7rem">Total</span>
+      </div>
+      <div class="stat-val">{{ total_students }}</div>
+      <div class="stat-label">Registered Students</div>
+    </div>
+  </div>
+  <div class="col-sm-6 col-xl-3">
+    <div class="stat-card">
+      <div class="d-flex align-items-center justify-content-between mb-3">
+        <div class="stat-icon" style="background:#cffafe"><i class="bi bi-camera-video-fill" style="color:#0891b2"></i></div>
+        <span class="badge" style="background:#cffafe;color:#0891b2;font-size:0.7rem">Active</span>
+      </div>
+      <div class="stat-val">{{ total_cameras }}</div>
+      <div class="stat-label">Active Cameras</div>
+    </div>
+  </div>
+  <div class="col-sm-6 col-xl-3">
+    <div class="stat-card">
+      <div class="d-flex align-items-center justify-content-between mb-3">
+        <div class="stat-icon" style="background:#dcfce7"><i class="bi bi-calendar-check-fill" style="color:#16a34a"></i></div>
+        <span class="badge" style="background:#dcfce7;color:#16a34a;font-size:0.7rem">Today</span>
+      </div>
+      <div class="stat-val">{{ today_attendance }}</div>
+      <div class="stat-label">Attendance Today</div>
+    </div>
+  </div>
+  <div class="col-sm-6 col-xl-3">
+    <div class="stat-card">
+      <div class="d-flex align-items-center justify-content-between mb-3">
+        <div class="stat-icon" style="background:#fef9c3"><i class="bi bi-person-fill-check" style="color:#ca8a04"></i></div>
+        <span class="badge" style="background:#fef9c3;color:#ca8a04;font-size:0.7rem">Live</span>
+      </div>
+      <div class="stat-val">{{ currently_inside }}</div>
+      <div class="stat-label">Currently Inside</div>
+    </div>
+  </div>
+</div>
+
+<!-- Charts row -->
+<div class="row g-3 mb-4">
+  <div class="col-lg-8">
+    <div class="form-card">
+      <div class="section-hdr">
+        <h5><i class="bi bi-bar-chart-fill me-2" style="color:#4f46e5"></i>Weekly Attendance</h5>
+      </div>
+      <canvas id="weekChart" height="80"></canvas>
+    </div>
+  </div>
+  <div class="col-lg-4">
+    <div class="form-card h-100">
+      <div class="section-hdr">
+        <h5><i class="bi bi-emoji-smile me-2" style="color:#06b6d4"></i>Today's Emotions</h5>
+      </div>
+      {% if emotions_today %}
+      <canvas id="emotionChart"></canvas>
+      {% else %}
+      <div class="text-center py-4 text-muted">
+        <i class="bi bi-camera-video-off fs-2 d-block mb-2 opacity-30"></i>
+        No emotion data today
+      </div>
+      {% endif %}
+    </div>
+  </div>
+</div>
+
+<!-- Recent activity -->
+<div class="form-card">
+  <div class="section-hdr">
+    <h5><i class="bi bi-clock-history me-2" style="color:#4f46e5"></i>Recent Activity</h5>
+    <a href="{% url 'attendance_list' %}" class="btn btn-sm" style="background:#ede9fe;color:#7c3aed;border:none;border-radius:8px">View All</a>
+  </div>
+  {% if recent_logs %}
+  <div class="table-responsive">
+    <table class="table table-hover align-middle mb-0">
+      <thead>
+        <tr>
+          <th>Student</th>
+          <th>Roll No</th>
+          <th>Entry Time</th>
+          <th>Exit Time</th>
+          <th>Entry Mood</th>
+          <th>Exit Mood</th>
+          <th>Duration</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for log in recent_logs %}
+        <tr>
+          <td>
+            <div class="d-flex align-items-center gap-2">
+              {% if log.student.photo %}
+              <img src="{{ log.student.photo.url }}" class="student-avatar">
+              {% else %}
+              <span class="avatar-placeholder">{{ log.student.name.0 }}</span>
+              {% endif %}
+              <span class="fw-500">{{ log.student.name }}</span>
+            </div>
+          </td>
+          <td><code style="font-size:0.8rem">{{ log.student.roll_no }}</code></td>
+          <td>{% if log.entry_time %}{{ log.entry_time|date:"H:i:s" }}{% else %}<span class="text-muted">—</span>{% endif %}</td>
+          <td>{% if log.exit_time %}{{ log.exit_time|date:"H:i:s" }}{% else %}<span class="text-muted text-warning">Inside</span>{% endif %}</td>
+          <td><span class="emotion-badge badge-{{ log.entry_emotion }}">{{ log.entry_emotion|title }}</span></td>
+          <td><span class="emotion-badge badge-{{ log.exit_emotion }}">{% if log.exit_time %}{{ log.exit_emotion|title }}{% else %}—{% endif %}</span></td>
+          <td>{% if log.duration_minutes %}<span class="fw-500">{{ log.duration_minutes }} min</span>{% else %}<span class="text-muted">—</span>{% endif %}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% else %}
+  <div class="text-center py-4 text-muted">
+    <i class="bi bi-inbox fs-2 d-block mb-2 opacity-30"></i>No attendance records yet.
+  </div>
+  {% endif %}
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+// Weekly chart
+const weekData = {{ week_data|safe }};
+new Chart(document.getElementById('weekChart'), {
+  type: 'bar',
+  data: {
+    labels: weekData.map(d => d.date),
+    datasets: [{
+      label: 'Students',
+      data: weekData.map(d => d.count),
+      backgroundColor: 'rgba(79,70,229,0.15)',
+      borderColor: '#4f46e5',
+      borderWidth: 2,
+      borderRadius: 6,
+    }]
+  },
+  options: {
+    responsive: true,
+    plugins: { legend: { display: false } },
+    scales: { y: { beginAtZero: true, ticks: { stepSize: 1 } }, x: { grid: { display: false } } }
+  }
+});
+
+// Emotion pie
+{% if emotions_today %}
+const emotionData = {{ emotions_today|safe }};
+const colors = { happy:'#22c55e', sad:'#3b82f6', angry:'#ef4444', neutral:'#94a3b8', surprise:'#f59e0b', fear:'#ec4899', disgust:'#a855f7', unknown:'#cbd5e1' };
+new Chart(document.getElementById('emotionChart'), {
+  type: 'doughnut',
+  data: {
+    labels: emotionData.map(e => e.entry_emotion),
+    datasets: [{ data: emotionData.map(e => e.count), backgroundColor: emotionData.map(e => colors[e.entry_emotion] || '#94a3b8'), borderWidth: 2 }]
+  },
+  options: { responsive: true, plugins: { legend: { position: 'bottom', labels: { font: { size: 11 } } } } }
+});
+{% endif %}
+</script>
+{% endblock %}

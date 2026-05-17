@@ -1,0 +1,89 @@
+{% extends "entrance_cam/base.html" %}
+{% block title %}Attendance{% endblock %}
+{% block page_title %}Attendance Records{% endblock %}
+{% block content %}
+<div class="form-card">
+  <div class="section-hdr">
+    <h5><i class="bi bi-calendar-check me-2" style="color:#16a34a"></i>Attendance — {{ filter_date|date:"d F Y" }}</h5>
+  </div>
+  <form method="get" class="d-flex align-items-center gap-2 mb-4">
+    <label class="small fw-500 text-muted">Select Date:</label>
+    <input type="date" name="date" value="{{ selected_date }}" class="form-control" style="max-width:200px;border-radius:10px">
+    <button class="btn btn-sm" style="background:#4f46e5;color:#fff;border:none;border-radius:10px">Go</button>
+  </form>
+
+  <div class="row g-3 mb-4">
+    <div class="col-sm-4">
+      <div class="stat-card">
+        <div class="stat-val" style="font-size:1.4rem">{{ logs.count }}</div>
+        <div class="stat-label">Total Present</div>
+      </div>
+    </div>
+    <div class="col-sm-4">
+      <div class="stat-card">
+        <div class="stat-val" style="font-size:1.4rem;color:#ca8a04">
+          {{ logs|length }}
+        </div>
+        <div class="stat-label">Logged Entries</div>
+      </div>
+    </div>
+  </div>
+
+  {% if logs %}
+  <div class="table-responsive">
+    <table class="table table-hover align-middle mb-0">
+      <thead>
+        <tr>
+          <th>Student</th><th>Camera</th><th>Entry Time</th><th>Exit Time</th>
+          <th>Entry Mood</th><th>Exit Mood</th><th>Duration</th><th>Snapshots</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for log in logs %}
+        <tr>
+          <td>
+            <div class="d-flex align-items-center gap-2">
+              {% if log.student.photo %}<img src="{{ log.student.photo.url }}" class="student-avatar">
+              {% else %}<span class="avatar-placeholder">{{ log.student.name.0 }}</span>{% endif %}
+              <div>
+                <div class="fw-500">{{ log.student.name }}</div>
+                <small class="text-muted">{{ log.student.roll_no }}</small>
+              </div>
+            </div>
+          </td>
+          <td><small class="text-muted">{{ log.camera.name|default:"—" }}</small></td>
+          <td>{{ log.entry_time|date:"H:i:s"|default:"—" }}</td>
+          <td>
+            {% if log.exit_time %}{{ log.exit_time|date:"H:i:s" }}
+            {% else %}<span class="fw-500" style="color:#ca8a04"><i class="bi bi-arrow-right-circle me-1"></i>Still Inside</span>{% endif %}
+          </td>
+          <td><span class="emotion-badge badge-{{ log.entry_emotion }}">{{ log.entry_emotion|title }}</span></td>
+          <td>
+            {% if log.exit_time %}<span class="emotion-badge badge-{{ log.exit_emotion }}">{{ log.exit_emotion|title }}</span>
+            {% else %}—{% endif %}
+          </td>
+          <td>
+            {% if log.duration_minutes %}
+            <span class="fw-600">{{ log.duration_minutes }}</span> <small class="text-muted">min</small>
+            {% else %}—{% endif %}
+          </td>
+          <td>
+            <div class="d-flex gap-1">
+              {% if log.entry_snapshot %}<a href="{{ log.entry_snapshot.url }}" target="_blank" class="btn btn-sm" style="background:#ede9fe;color:#7c3aed;border:none;border-radius:6px;font-size:0.7rem">Entry</a>{% endif %}
+              {% if log.exit_snapshot %}<a href="{{ log.exit_snapshot.url }}" target="_blank" class="btn btn-sm" style="background:#dcfce7;color:#166534;border:none;border-radius:6px;font-size:0.7rem">Exit</a>{% endif %}
+              {% if not log.entry_snapshot and not log.exit_snapshot %}<span class="text-muted small">—</span>{% endif %}
+            </div>
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% else %}
+  <div class="text-center py-5 text-muted">
+    <i class="bi bi-calendar-x fs-1 d-block mb-2 opacity-20"></i>
+    No attendance records for {{ filter_date|date:"d F Y" }}.
+  </div>
+  {% endif %}
+</div>
+{% endblock %}

@@ -1,0 +1,256 @@
+{% extends 'entrance_cam/base.html' %}
+
+{% block title %}Session Detail - ClassroomIoT{% endblock %}
+{% block page_title %}Session Detail: {{ session.student.name }}{% endblock %}
+
+{% block content %}
+<div class="row g-4 mb-4">
+  <div class="col-12">
+    <div class="stat-card">
+      <div class="d-flex align-items-center gap-3">
+        {% if session.student.photo %}
+        <img src="{{ session.student.photo.url }}" class="student-avatar" style="width:64px;height:64px">
+        {% else %}
+        <div class="avatar-placeholder" style="width:64px;height:64px;font-size:1.5rem">{{ session.student.name.0|upper }}</div>
+        {% endif %}
+        <div>
+          <h4 class="mb-0">{{ session.student.name }}</h4>
+          <div class="text-muted">{{ session.student.roll_no }} • {{ session.student.course }} • {{ session.student.get_year_display }}</div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="row g-4">
+  <div class="col-lg-8">
+    <div class="stat-card mb-4">
+      <div class="section-hdr">
+        <h5><i class="bi bi-images me-2" style="color:#4f46e5"></i> Live Screen</h5>
+      </div>
+      <video id="live-screen" autoplay playsinline class="w-100 rounded" style="max-height:500px;object-fit:contain;background:#000;"></video>
+    </div>
+    
+    <div class="stat-card mb-4">
+      <div class="section-hdr">
+        <h5><i class="bi bi-bar-chart-line me-2" style="color:#06b6d4"></i> Emotion Over Time</h5>
+      </div>
+      <canvas id="emotion-chart" style="height:300px"></canvas>
+    </div>
+    
+    <div class="stat-card">
+      <div class="section-hdr">
+        <h5><i class="bi bi-camera-video me-2" style="color:#10b981"></i> Live Camera</h5>
+      </div>
+      <video id="live-camera" autoplay playsinline class="w-100 rounded" style="max-height:400px;object-fit:contain;background:#000;"></video>
+      <div class="d-flex gap-2 mt-2">
+        <span id="emotion-display" class="emotion-badge badge-unknown">Emotion: Unknown</span>
+        <span id="pose-display" class="emotion-badge badge-neutral">Pose: Unknown</span>
+      </div>
+    </div>
+  </div>
+  
+  <div class="col-lg-4">
+    <div class="stat-card">
+      <div class="section-hdr">
+        <h5><i class="bi bi-list-ul me-2" style="color:#f59e0b"></i> Activity Log</h5>
+      </div>
+      {% if session.activity_logs.all %}
+      <div class="data-table" style="max-height:600px;overflow-y:auto">
+        <table class="table table-sm">
+          <thead class="sticky-top bg-white">
+            <tr>
+              <th>Time</th>
+              <th>Activity</th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for log in session.activity_logs.all %}
+            <tr>
+              <td class="text-nowrap">{{ log.timestamp|time:"H:i:s" }}</td>
+              <td>
+                <div class="small fw-semibold">{{ log.get_activity_type_display }}</div>
+                <div class="text-muted small">{{ log.tab_title|truncatechars:30 }}</div>
+              </td>
+            </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+      {% else %}
+      <p class="text-muted text-center py-4">No activity logs yet</p>
+      {% endif %}
+    </div>
+  </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+<script>
+function getCookie(name) {
+    let cookieValue = null;
+    if (document.cookie && document.cookie !== '') {
+        const cookies = document.cookie.split(';');
+        for (let cookie of cookies) {
+            cookie = cookie.trim();
+            if (cookie.startsWith(name + '=')) {
+                cookieValue = decodeURIComponent(cookie.substring(name.length + 1));
+                break;
+            }
+        }
+    }
+    return cookieValue;
+}
+const csrftoken = getCookie('csrftoken');
+
+document.addEventListener('DOMContentLoaded', function() {
+    const ctx = document.getElementById('emotion-chart').getContext('2d');
+    
+    const initialSnapshots = [
+        {% for snapshot in session.camera_snapshots.all %}
+        {
+            timestamp: "{{ snapshot.timestamp|time:'H:i:s' }}",
+            emotion: "{{ snapshot.emotion }}",
+            score: {{ snapshot.emotion_score|default:0 }}
+        }{% if not forloop.last %},{% endif %}
+        {% endfor %}
+    ];
+    
+    const emotionColors = {
+        happy: '#22c55e', sad: '#3b82f6', angry: '#ef4444',
+        neutral: '#64748b', surprise: '#eab308', fear: '#ec4899',
+        disgust: '#8b5cf6', unknown: '#94a3b8'
+    };
+    
+    let emotionChart = null;
+    if (initialSnapshots.length > 0) {
+        emotionChart = new Chart(ctx, {
+            type: 'line',
+            data: {
+                labels: initialSnapshots.map(s => s.timestamp),
+                datasets: [{
+                    label: 'Emotion Score',
+                    data: initialSnapshots.map(s => s.score * 100),
+                    borderColor: '#4f46e5',
+                    backgroundColor: 'rgba(79, 70, 229, 0.1)',
+                    fill: true,
+                    tension: 0.4
+                }]
+            },
+            options: {
+                responsive: true,
+                plugins: { legend: { display: false } },
+                scales: { y: { beginAtZero: true, max: 100 } }
+            }
+        });
+    }
+    
+    const sessionId = {{ session.id }};
+    let peerConnection = null;
+    let pollingInterval = null;
+    const liveScreen = document.getElementById('live-screen');
+    const liveCamera = document.getElementById('live-camera');
+    const emotionDisplay = document.getElementById('emotion-display');
+    const poseDisplay = document.getElementById('pose-display');
+    
+    async function startWebRTC() {
+        try {
+            peerConnection = new RTCPeerConnection({
+                iceServers: [
+                    { urls: 'stun:stun.l.google.com:19302' }
+                ]
+            });
+            
+            peerConnection.ontrack = (event) => {
+                const track = event.track;
+                const stream = event.streams[0];
+                console.log('Received track:', track.id);
+                
+                if (track.id.startsWith('screen-')) {
+                    liveScreen.srcObject = stream;
+                    console.log('Screen stream received');
+                } else if (track.id.startsWith('camera-')) {
+                    liveCamera.srcObject = stream;
+                    console.log('Camera stream received');
+                }
+            };
+            
+            peerConnection.onicecandidate = async (event) => {
+                if (event.candidate) {
+                    try {
+                        await fetch(`/lab/api/session/${sessionId}/webrtc/ice/`, {
+                            method: 'POST',
+                            headers: {
+                                'X-CSRFToken': csrftoken,
+                                'Content-Type': 'application/json'
+                            },
+                            body: JSON.stringify({
+                                candidate: event.candidate,
+                                role: 'admin'
+                            })
+                        });
+                    } catch (e) {
+                        console.error('Error sending ICE candidate:', e);
+                    }
+                }
+            };
+            
+            pollingInterval = setInterval(pollForOffer, 2000);
+        } catch (e) {
+            console.error('WebRTC setup failed:', e);
+        }
+    }
+    
+    async function pollForOffer() {
+        try {
+            const response = await fetch(`/lab/api/session/${sessionId}/`);
+            const data = await response.json();
+            
+            if (data.webrtc_offer && !peerConnection.remoteDescription) {
+                await peerConnection.setRemoteDescription(new RTCSessionDescription(data.webrtc_offer));
+                const answer = await peerConnection.createAnswer();
+                await peerConnection.setLocalDescription(answer);
+                
+                await fetch(`/lab/api/session/${sessionId}/webrtc/answer/`, {
+                    method: 'POST',
+                    headers: {
+                        'X-CSRFToken': csrftoken,
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify({ answer: peerConnection.localDescription })
+                });
+                
+                console.log('WebRTC answer sent');
+            }
+            
+            if (data.webrtc_ice_candidates_student) {
+                for (const candidate of data.webrtc_ice_candidates_student) {
+                    if (!candidate || !peerConnection.remoteDescription) continue;
+                    try {
+                        await peerConnection.addIceCandidate(new RTCIceCandidate(candidate));
+                    } catch (e) {
+                        console.error('Error adding student ICE candidate:', e);
+                    }
+                }
+            }
+            
+            if (data.latest_emotion) {
+                emotionDisplay.className = `emotion-badge badge-${data.latest_emotion}`;
+                emotionDisplay.textContent = `Emotion: ${data.latest_emotion.charAt(0).toUpperCase() + data.latest_emotion.slice(1)}`;
+            }
+            
+            if (data.latest_pose) {
+                poseDisplay.textContent = `Pose: ${data.latest_pose.charAt(0).toUpperCase() + data.latest_pose.slice(1)}`;
+            }
+        } catch (e) {
+            console.error('Error polling for offer:', e);
+        }
+    }
+    
+    if ({{ session.is_active|lower }}) {
+        startWebRTC();
+    }
+});
+</script>
+{% endblock %}

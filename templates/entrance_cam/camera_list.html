@@ -1,0 +1,73 @@
+{% extends "entrance_cam/base.html" %}
+{% block title %}Cameras{% endblock %}
+{% block page_title %}Cameras{% endblock %}
+{% block content %}
+<div class="form-card">
+  <div class="section-hdr">
+    <h5><i class="bi bi-camera-video me-2" style="color:#0891b2"></i>Entrance Cameras</h5>
+    <a href="{% url 'camera_add' %}" class="btn btn-sm" style="background:#0891b2;color:#fff;border:none;border-radius:8px">
+      <i class="bi bi-plus-lg me-1"></i>Add Camera
+    </a>
+  </div>
+  {% if cameras %}
+  <div class="row g-3">
+    {% for cam in cameras %}
+    <div class="col-md-6 col-xl-4">
+      <div class="stat-card" style="border-radius:14px">
+        <div class="d-flex align-items-start justify-content-between mb-3">
+          <div class="stat-icon" style="background:{% if cam.is_active %}#cffafe{% else %}#fee2e2{% endif %}">
+            <i class="bi bi-camera-video{% if not cam.is_active %}-off{% endif %}-fill" style="color:{% if cam.is_active %}#0891b2{% else %}#dc2626{% endif %}"></i>
+          </div>
+          <span class="emotion-badge" style="background:{% if cam.is_active %}#dcfce7;color:#166534{% else %}#fee2e2;color:#991b1b{% endif %}">
+            {% if cam.is_active %}
+            <span class="dot-online"></span>Active
+            {% else %}
+            <span class="dot-offline"></span>Offline
+            {% endif %}
+          </span>
+        </div>
+        <div class="fw-700 mb-1" style="color:#1e293b">{{ cam.name }}</div>
+        <div class="small text-muted mb-1"><i class="bi bi-geo-alt me-1"></i>{{ cam.location }}</div>
+        <div class="small text-muted mb-3" style="word-break:break-all;font-size:0.75rem">
+          <i class="bi bi-link-45deg me-1"></i><code>{{ cam.url }}</code>
+        </div>
+        <div class="d-flex gap-2">
+          <button onclick="testCamera({{ cam.pk }}, this)" class="btn btn-sm flex-fill" style="background:#f1f5f9;color:#475569;border:none;border-radius:8px">
+            <i class="bi bi-wifi me-1"></i>Test
+          </button>
+          <a href="{% url 'camera_edit' cam.pk %}" class="btn btn-sm" style="background:#cffafe;color:#0891b2;border:none;border-radius:8px"><i class="bi bi-pencil"></i></a>
+          <a href="{% url 'camera_delete' cam.pk %}" class="btn btn-sm" style="background:#fee2e2;color:#dc2626;border:none;border-radius:8px"><i class="bi bi-trash"></i></a>
+        </div>
+      </div>
+    </div>
+    {% endfor %}
+  </div>
+  {% else %}
+  <div class="text-center py-5 text-muted">
+    <i class="bi bi-camera-video-off fs-1 d-block mb-2 opacity-20"></i>
+    No cameras added yet. <a href="{% url 'camera_add' %}">Add one</a>.
+  </div>
+  {% endif %}
+</div>
+{% endblock %}
+{% block scripts %}
+<script>
+function testCamera(pk, btn) {
+  btn.disabled = true;
+  btn.innerHTML = '<span class="spinner-border spinner-border-sm me-1"></span>Testing…';
+  fetch(`/cameras/${pk}/test/`)
+    .then(r => r.json())
+    .then(d => {
+      btn.disabled = false;
+      if (d.status === 'online') {
+        btn.innerHTML = '<i class="bi bi-check-circle-fill me-1"></i>Online';
+        btn.style.background = '#dcfce7'; btn.style.color = '#166534';
+      } else {
+        btn.innerHTML = '<i class="bi bi-x-circle-fill me-1"></i>Offline';
+        btn.style.background = '#fee2e2'; btn.style.color = '#dc2626';
+      }
+      setTimeout(() => { btn.innerHTML = '<i class="bi bi-wifi me-1"></i>Test'; btn.style.background=''; btn.style.color=''; btn.disabled=false; }, 3000);
+    });
+}
+</script>
+{% endblock %}

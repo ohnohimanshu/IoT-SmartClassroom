@@ -1,0 +1,9 @@
+django
+django-sslserver
+pillow
+opencv-python-headless
+deepface
+tf-keras
+requests
+face-recognition
+mediapipe

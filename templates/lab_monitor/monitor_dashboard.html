@@ -1,0 +1,131 @@
+{% extends 'entrance_cam/base.html' %}
+
+{% block title %}Live Monitor - ClassroomIoT{% endblock %}
+{% block page_title %}Live Lab Monitor{% endblock %}
+
+{% block content %}
+<div id="sessions-container" class="row g-4">
+  {% for session in active_sessions %}
+  <div class="col-lg-4 col-md-6" id="session-card-{{ session.id }}">
+    <div class="stat-card">
+      <div class="d-flex align-items-center gap-3 mb-3">
+        {% if session.student.photo %}
+        <img src="{{ session.student.photo.url }}" class="student-avatar">
+        {% else %}
+        <div class="avatar-placeholder">{{ session.student.name.0|upper }}</div>
+        {% endif %}
+        <div>
+          <h6 class="mb-0">{{ session.student.name }}</h6>
+          <small class="text-muted">{{ session.student.roll_no }}</small>
+        </div>
+      </div>
+      <div class="mb-3">
+        <div class="d-flex justify-content-between mb-1">
+          <span class="small text-muted">Duration</span>
+          <span class="fw-semibold" id="duration-{{ session.id }}">0 min</span>
+        </div>
+        <div class="d-flex gap-2">
+          <span id="emotion-{{ session.id }}" class="emotion-badge badge-unknown">Unknown</span>
+          <span id="pose-{{ session.id }}" class="emotion-badge badge-unknown">Unknown</span>
+        </div>
+      </div>
+      {% with latest_screenshot=session.screenshots.first %}
+      {% if latest_screenshot %}
+      <img id="screenshot-{{ session.id }}" src="{{ latest_screenshot.image.url }}" class="w-100 rounded mb-3" style="height:180px;object-fit:cover">
+      {% else %}
+      <div id="screenshot-placeholder-{{ session.id }}" class="w-100 rounded mb-3 bg-light d-flex align-items-center justify-content-center" style="height:180px">
+        <span class="text-muted">Waiting for screenshot...</span>
+      </div>
+      {% endif %}
+      {% endwith %}
+      <a href="{% url 'monitor_detail' session.id %}" class="btn w-100" style="background:#4f46e5;color:#fff;border:none">
+        <i class="bi bi-eye me-2"></i> View Detail
+      </a>
+    </div>
+  </div>
+  {% empty %}
+  <div class="col-12">
+    <div class="stat-card text-center py-5">
+      <i class="bi bi-display" style="font-size:3rem;color:#94a3b8"></i>
+      <h5 class="mt-3 text-muted">No active sessions</h5>
+      <p class="text-muted small">Waiting for students to start lab sessions...</p>
+    </div>
+  </div>
+  {% endfor %}
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+function updateSessions() {
+    fetch('/lab/api/active-sessions/')
+        .then(response => response.json())
+        .then(data => {
+            const container = document.getElementById('sessions-container');
+            container.innerHTML = '';
+            
+            if (data.sessions.length === 0) {
+                container.innerHTML = `
+                    <div class="col-12">
+                        <div class="stat-card text-center py-5">
+                            <i class="bi bi-display" style="font-size:3rem;color:#94a3b8"></i>
+                            <h5 class="mt-3 text-muted">No active sessions</h5>
+                            <p class="text-muted small">Waiting for students to start lab sessions...</p>
+                        </div>
+                    </div>
+                `;
+                return;
+            }
+            
+            data.sessions.forEach(session => {
+                const card = document.createElement('div');
+                card.className = 'col-lg-4 col-md-6';
+                card.id = `session-card-${session.id}`;
+                
+                let screenshotHtml = '';
+                if (session.latest_screenshot) {
+                    screenshotHtml = `<img src="${session.latest_screenshot}" class="w-100 rounded mb-3" style="height:180px;object-fit:cover">`;
+                } else {
+                    screenshotHtml = `<div class="w-100 rounded mb-3 bg-light d-flex align-items-center justify-content-center" style="height:180px"><span class="text-muted">Waiting for screenshot...</span></div>`;
+                }
+                
+                let avatarHtml = '';
+                if (session.student_photo) {
+                    avatarHtml = `<img src="${session.student_photo}" class="student-avatar">`;
+                } else {
+                    avatarHtml = `<div class="avatar-placeholder">${session.student_name.charAt(0).toUpperCase()}</div>`;
+                }
+                
+                card.innerHTML = `
+                    <div class="stat-card">
+                        <div class="d-flex align-items-center gap-3 mb-3">
+                            ${avatarHtml}
+                            <div>
+                                <h6 class="mb-0">${session.student_name}</h6>
+                                <small class="text-muted">${session.student_roll_no}</small>
+                            </div>
+                        </div>
+                        <div class="mb-3">
+                            <div class="d-flex justify-content-between mb-1">
+                                <span class="small text-muted">Duration</span>
+                                <span class="fw-semibold">${session.duration} min</span>
+                            </div>
+                            <div class="d-flex gap-2">
+                                <span class="emotion-badge badge-${session.latest_emotion}">${session.latest_emotion.charAt(0).toUpperCase() + session.latest_emotion.slice(1)}</span>
+                                <span class="emotion-badge badge-neutral">${session.latest_pose.replace('_', ' ').charAt(0).toUpperCase() + session.latest_pose.replace('_', ' ').slice(1)}</span>
+                            </div>
+                        </div>
+                        ${screenshotHtml}
+                        <a href="/lab/monitor/${session.id}/" class="btn w-100" style="background:#4f46e5;color:#fff;border:none">
+                            <i class="bi bi-eye me-2"></i> View Detail
+                        </a>
+                    </div>
+                `;
+                container.appendChild(card);
+            });
+        });
+}
+
+setInterval(updateSessions, 5000);
+</script>
+{% endblock %}

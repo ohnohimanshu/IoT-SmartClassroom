@@ -1,0 +1,62 @@
+{% extends "entrance_cam/base.html" %}
+{% block title %}{{ student.name }}{% endblock %}
+{% block page_title %}Student Profile{% endblock %}
+{% block content %}
+<div class="row g-4">
+  <div class="col-lg-4">
+    <div class="form-card text-center">
+      {% if student.photo %}
+      <img src="{{ student.photo.url }}" style="width:120px;height:120px;object-fit:cover;border-radius:16px;border:3px solid #e2e8f0;margin-bottom:16px">
+      {% else %}
+      <div style="width:120px;height:120px;background:#ede9fe;border-radius:16px;display:flex;align-items:center;justify-content:center;margin:0 auto 16px;font-size:2.5rem;font-weight:700;color:#7c3aed">{{ student.name.0 }}</div>
+      {% endif %}
+      <h5 class="fw-700 mb-1">{{ student.name }}</h5>
+      <code style="font-size:0.85rem">{{ student.roll_no }}</code>
+      <div class="mt-3">
+        <span class="emotion-badge {% if student.is_active %}badge-happy{% else %}badge-angry{% endif %}">
+          {% if student.is_active %}Active{% else %}Inactive{% endif %}
+        </span>
+      </div>
+      <hr>
+      <div class="text-start" style="font-size:0.875rem">
+        <div class="d-flex align-items-center gap-2 mb-2"><i class="bi bi-envelope text-muted"></i> {{ student.email }}</div>
+        <div class="d-flex align-items-center gap-2 mb-2"><i class="bi bi-book text-muted"></i> {{ student.course }} — {{ student.branch }}</div>
+        <div class="d-flex align-items-center gap-2 mb-2"><i class="bi bi-mortarboard text-muted"></i> Year {{ student.year }}</div>
+        <div class="d-flex align-items-center gap-2"><i class="bi bi-calendar text-muted"></i> Joined {{ student.created_at|date:"d M Y" }}</div>
+      </div>
+      <div class="d-flex gap-2 mt-3">
+        <a href="{% url 'student_edit' student.pk %}" class="btn btn-sm flex-fill" style="background:#ede9fe;color:#7c3aed;border:none;border-radius:8px"><i class="bi bi-pencil me-1"></i>Edit</a>
+        <a href="{% url 'student_delete' student.pk %}" class="btn btn-sm flex-fill" style="background:#fee2e2;color:#dc2626;border:none;border-radius:8px"><i class="bi bi-trash me-1"></i>Delete</a>
+      </div>
+    </div>
+  </div>
+  <div class="col-lg-8">
+    <div class="form-card">
+      <div class="section-hdr">
+        <h5><i class="bi bi-clock-history me-2" style="color:#4f46e5"></i>Attendance History</h5>
+      </div>
+      {% if logs %}
+      <div class="table-responsive">
+        <table class="table table-hover align-middle mb-0">
+          <thead><tr><th>Date</th><th>Entry</th><th>Exit</th><th>Entry Mood</th><th>Exit Mood</th><th>Duration</th></tr></thead>
+          <tbody>
+            {% for log in logs %}
+            <tr>
+              <td>{{ log.date|date:"d M Y" }}</td>
+              <td>{{ log.entry_time|date:"H:i" }}</td>
+              <td>{% if log.exit_time %}{{ log.exit_time|date:"H:i" }}{% else %}<span class="text-warning fw-500">Inside</span>{% endif %}</td>
+              <td><span class="emotion-badge badge-{{ log.entry_emotion }}">{{ log.entry_emotion|title }}</span></td>
+              <td>{% if log.exit_time %}<span class="emotion-badge badge-{{ log.exit_emotion }}">{{ log.exit_emotion|title }}</span>{% else %}—{% endif %}</td>
+              <td>{% if log.duration_minutes %}{{ log.duration_minutes }} min{% else %}—{% endif %}</td>
+            </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+      {% else %}
+      <div class="text-center py-4 text-muted"><i class="bi bi-calendar-x fs-2 d-block mb-2 opacity-30"></i>No attendance records yet.</div>
+      {% endif %}
+    </div>
+  </div>
+</div>
+{% endblock %}
