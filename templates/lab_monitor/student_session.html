@@ -147,7 +147,32 @@ async function startSharing() {
         await startWebRTC();
     }
     
-    pollingInterval = setInterval(pollForAnswer, 2000);
+    pollingInterval = setInterval(pollForStudentWebrtc, 2000);
+}
+
+async function pollForStudentWebrtc() {
+    try {
+        const response = await fetch(`/lab/api/session/${sessionId}/student-webrtc/`);
+        const data = await response.json();
+        
+        if (data.webrtc_answer && !peerConnection.remoteDescription) {
+            await peerConnection.setRemoteDescription(new RTCSessionDescription(data.webrtc_answer));
+            console.log('WebRTC answer received and set');
+        }
+        
+        if (data.webrtc_ice_candidates_admin) {
+            for (const candidate of data.webrtc_ice_candidates_admin) {
+                if (!candidate || !peerConnection.remoteDescription) continue;
+                try {
+                    await peerConnection.addIceCandidate(new RTCIceCandidate(candidate));
+                } catch (e) {
+                    console.error('Error adding admin ICE candidate:', e);
+                }
+            }
+        }
+    } catch (e) {
+        console.error('Error polling for student webrtc:', e);
+    }
 }
 
 async function startWebRTC() {
@@ -207,31 +232,6 @@ async function startWebRTC() {
         console.log('WebRTC offer sent');
     } catch (e) {
         console.error('WebRTC setup failed:', e);
-    }
-}
-
-async function pollForAnswer() {
-    try {
-        const response = await fetch(`/lab/api/session/${sessionId}/`);
-        const data = await response.json();
-        
-        if (data.webrtc_answer && !peerConnection.remoteDescription) {
-            await peerConnection.setRemoteDescription(new RTCSessionDescription(data.webrtc_answer));
-            console.log('WebRTC answer received and set');
-        }
-        
-        if (data.webrtc_ice_candidates_admin) {
-            for (const candidate of data.webrtc_ice_candidates_admin) {
-                if (!candidate || !peerConnection.remoteDescription) continue;
-                try {
-                    await peerConnection.addIceCandidate(new RTCIceCandidate(candidate));
-                } catch (e) {
-                    console.error('Error adding admin ICE candidate:', e);
-                }
-            }
-        }
-    } catch (e) {
-        console.error('Error polling for answer:', e);
     }
 }
 

@@ -71,8 +71,8 @@ class DetectionService:
             base_dir = settings.BASE_DIR
             script_path = os.path.join(base_dir, 'entrance_cam', 'detection_script.py')
             
-            # Get server URL from environment or default to localhost:8000
-            server_url = os.getenv('DJANGO_SERVER_URL', 'http://localhost:8000')
+            # Get server URL from environment or default to your server
+            server_url = os.getenv('DJANGO_SERVER_URL', 'https://192.168.1.5:8000')
             
             # Build command
             cmd = [

@@ -28,7 +28,8 @@
       <div class="section-hdr">
         <h5><i class="bi bi-images me-2" style="color:#4f46e5"></i> Live Screen</h5>
       </div>
-      <video id="live-screen" autoplay playsinline class="w-100 rounded" style="max-height:500px;object-fit:contain;background:#000;"></video>
+      <video id="live-screen" autoplay playsinline class="w-100 rounded" style="max-height:500px;object-fit:contain;background:#000;display:none;"></video>
+      <img id="fallback-screen" class="w-100 rounded" style="max-height:500px;object-fit:contain;background:#000;">
     </div>
     
     <div class="stat-card mb-4">
@@ -42,7 +43,8 @@
       <div class="section-hdr">
         <h5><i class="bi bi-camera-video me-2" style="color:#10b981"></i> Live Camera</h5>
       </div>
-      <video id="live-camera" autoplay playsinline class="w-100 rounded" style="max-height:400px;object-fit:contain;background:#000;"></video>
+      <video id="live-camera" autoplay playsinline class="w-100 rounded" style="max-height:400px;object-fit:contain;background:#000;display:none;"></video>
+      <img id="fallback-camera" class="w-100 rounded" style="max-height:400px;object-fit:contain;background:#000;">
       <div class="d-flex gap-2 mt-2">
         <span id="emotion-display" class="emotion-badge badge-unknown">Emotion: Unknown</span>
         <span id="pose-display" class="emotion-badge badge-neutral">Pose: Unknown</span>
@@ -123,34 +125,33 @@ document.addEventListener('DOMContentLoaded', function() {
         disgust: '#8b5cf6', unknown: '#94a3b8'
     };
     
-    let emotionChart = null;
-    if (initialSnapshots.length > 0) {
-        emotionChart = new Chart(ctx, {
-            type: 'line',
-            data: {
-                labels: initialSnapshots.map(s => s.timestamp),
-                datasets: [{
-                    label: 'Emotion Score',
-                    data: initialSnapshots.map(s => s.score * 100),
-                    borderColor: '#4f46e5',
-                    backgroundColor: 'rgba(79, 70, 229, 0.1)',
-                    fill: true,
-                    tension: 0.4
-                }]
-            },
-            options: {
-                responsive: true,
-                plugins: { legend: { display: false } },
-                scales: { y: { beginAtZero: true, max: 100 } }
-            }
-        });
-    }
+    let emotionChart = new Chart(ctx, {
+        type: 'line',
+        data: {
+            labels: initialSnapshots.length > 0 ? initialSnapshots.map(s => s.timestamp) : [],
+            datasets: [{
+                label: 'Emotion Score',
+                data: initialSnapshots.length > 0 ? initialSnapshots.map(s => s.score * 100) : [],
+                borderColor: '#4f46e5',
+                backgroundColor: 'rgba(79, 70, 229, 0.1)',
+                fill: true,
+                tension: 0.4
+            }]
+        },
+        options: {
+            responsive: true,
+            plugins: { legend: { display: false } },
+            scales: { y: { beginAtZero: true, max: 100 } }
+        }
+    });
     
     const sessionId = {{ session.id }};
     let peerConnection = null;
     let pollingInterval = null;
     const liveScreen = document.getElementById('live-screen');
     const liveCamera = document.getElementById('live-camera');
+    const fallbackScreen = document.getElementById('fallback-screen');
+    const fallbackCamera = document.getElementById('fallback-camera');
     const emotionDisplay = document.getElementById('emotion-display');
     const poseDisplay = document.getElementById('pose-display');
     
@@ -169,9 +170,13 @@ document.addEventListener('DOMContentLoaded', function() {
                 
                 if (track.id.startsWith('screen-')) {
                     liveScreen.srcObject = stream;
+                    liveScreen.style.display = 'block';
+                    fallbackScreen.style.display = 'none';
                     console.log('Screen stream received');
                 } else if (track.id.startsWith('camera-')) {
                     liveCamera.srcObject = stream;
+                    liveCamera.style.display = 'block';
+                    fallbackCamera.style.display = 'none';
                     console.log('Camera stream received');
                 }
             };
@@ -242,6 +247,34 @@ document.addEventListener('DOMContentLoaded', function() {
             
             if (data.latest_pose) {
                 poseDisplay.textContent = `Pose: ${data.latest_pose.charAt(0).toUpperCase() + data.latest_pose.slice(1)}`;
+            }
+            
+            if (data.latest_screenshot) {
+                fallbackScreen.style.display = 'block';
+                const timestamp = new Date().getTime();
+                fallbackScreen.src = data.latest_screenshot + '?t=' + timestamp;
+            }
+            
+            if (data.latest_camera) {
+                fallbackCamera.style.display = 'block';
+                const timestamp = new Date().getTime();
+                fallbackCamera.src = data.latest_camera + '?t=' + timestamp;
+                
+                const now = new Date();
+                const timeStr = now.toLocaleTimeString('en-US', { hour12: false });
+                
+                const lastLabel = emotionChart.data.labels[emotionChart.data.labels.length - 1];
+                if (lastLabel !== timeStr) {
+                    emotionChart.data.labels.push(timeStr);
+                    emotionChart.data.datasets[0].data.push(data.latest_emotion === 'unknown' ? 0 : 50);
+                    
+                    if (emotionChart.data.labels.length > 20) {
+                        emotionChart.data.labels.shift();
+                        emotionChart.data.datasets[0].data.shift();
+                    }
+                    
+                    emotionChart.update();
+                }
             }
         } catch (e) {
             console.error('Error polling for offer:', e);

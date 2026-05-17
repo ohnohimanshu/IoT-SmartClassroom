@@ -260,6 +260,7 @@ def api_log_entry(request):
 
 
 # ── API: Get student face encodings (called by detection script) ──
+@csrf_exempt
 def api_students_encodings(request):
     """GET: Return list of students with face encodings for recognition."""
     if request.method != 'GET':

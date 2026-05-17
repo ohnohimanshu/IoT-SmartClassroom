@@ -20,7 +20,10 @@ import requests
 import numpy as np
 import sys
 import os
+import urllib3
 from datetime import datetime
+
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # Suppress TensorFlow warnings
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
@@ -43,7 +46,7 @@ except ImportError:
 def load_known_faces(server_url):
     """Download student face encodings from Django."""
     try:
-        resp = requests.get(f"{server_url}/api/students/encodings/", timeout=5)
+        resp = requests.get(f"{server_url}/api/students/encodings/", timeout=5, verify=False)
         return resp.json()  # [{id, name, encoding}]
     except Exception as e:
         print(f"[ERROR] Could not load student encodings: {e}")
@@ -91,7 +94,8 @@ def log_to_server(server_url, student_id, camera_id, emotion, score, snapshot_b6
                 "score": score,
                 "snapshot": snapshot_b64,
             },
-            timeout=5
+            timeout=5,
+            verify=False
         )
         data = resp.json()
         print(f"[LOG] {data.get('status')} — student {student_id}, emotion: {emotion} ({score}%)")

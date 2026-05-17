@@ -12,6 +12,7 @@ urlpatterns = [
     path('activity/', views.receive_activity, name='receive_activity'),
     path('api/active-sessions/', views.api_active_sessions, name='api_active_sessions'),
     path('api/session/<int:session_id>/', views.api_session_detail, name='api_session_detail'),
+    path('api/session/<int:session_id>/student-webrtc/', views.api_student_session_webrtc, name='api_student_session_webrtc'),
     path('api/session/<int:session_id>/webrtc/offer/', views.api_webrtc_offer, name='api_webrtc_offer'),
     path('api/session/<int:session_id>/webrtc/answer/', views.api_webrtc_answer, name='api_webrtc_answer'),
     path('api/session/<int:session_id>/webrtc/ice/', views.api_webrtc_ice_candidate, name='api_webrtc_ice_candidate'),

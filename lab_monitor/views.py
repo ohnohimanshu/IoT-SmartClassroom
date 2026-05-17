@@ -228,10 +228,14 @@ def receive_camera_frame(request):
                         if analysis:
                             if isinstance(analysis, list):
                                 analysis = analysis[0]
-                            emotion = analysis.get('dominant_emotion', 'unknown')
-                            emotion_score = analysis.get('emotion', {}).get(emotion, 0.0)
+                            emotion = analysis.get('dominant_emotion', 'neutral')
+                            emotion_score = analysis.get('emotion', {}).get(emotion, 0.5)
                     except Exception:
-                        pass
+                        emotion = 'neutral'
+                        emotion_score = 0.5
+                else:
+                    emotion = 'neutral'
+                    emotion_score = 0.5
                 
                 if MEDIAPIPE_AVAILABLE:
                     try:
@@ -263,7 +267,9 @@ def receive_camera_frame(request):
                             else:
                                 pose = 'focused'
                     except Exception:
-                        pass
+                        pose = 'focused'
+                else:
+                    pose = 'focused'
                 
                 snapshot = CameraSnapshot(session=session, emotion=emotion, emotion_score=emotion_score, pose=pose)
                 filename = f"camera_{session.id}_{timezone.now().strftime('%Y%m%d_%H%M%S')}.{ext}"
@@ -428,3 +434,17 @@ def api_webrtc_ice_candidate(request, session_id):
         return JsonResponse({'status': 'success'})
     except Exception as e:
         return JsonResponse({'status': 'error', 'message': str(e)}, status=400)
+
+
+@login_required
+def api_student_session_webrtc(request, session_id):
+    try:
+        student = request.user.student_profile
+    except Student.DoesNotExist:
+        return JsonResponse({'error': 'Not a student'}, status=400)
+    
+    session = get_object_or_404(LabSession, id=session_id, student=student)
+    return JsonResponse({
+        'webrtc_answer': session.webrtc_answer,
+        'webrtc_ice_candidates_admin': session.webrtc_ice_candidates_admin,
+    })
