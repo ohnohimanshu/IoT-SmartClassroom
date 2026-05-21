@@ -10,14 +10,12 @@ from django.core.files.base import ContentFile
 from datetime import date, timedelta
 import json
 import base64
-from io import BytesIO
 
 from .models import Student, Camera, AttendanceLog
 from .forms import StudentForm, CameraForm
 
 
 def csrf_failure(request, reason=""):
-    """Handle CSRF failures and redirect to login with error message."""
     messages.error(request, 'Session expired or invalid. Please login again.')
     return redirect('login')
 
@@ -25,7 +23,7 @@ def csrf_failure(request, reason=""):
 def login_view(request):
     if request.user.is_authenticated:
         try:
-            student = request.user.student_profile
+            request.user.student_profile  # noqa
             return redirect('student_dashboard')
         except Student.DoesNotExist:
             pass
@@ -37,7 +35,7 @@ def login_view(request):
         if user:
             login(request, user)
             try:
-                student = user.student_profile
+                user.student_profile  # noqa
                 return redirect('student_dashboard')
             except Student.DoesNotExist:
                 pass
@@ -54,21 +52,21 @@ def logout_view(request):
 @login_required
 def dashboard(request):
     try:
-        student = request.user.student_profile
+        request.user.student_profile  # noqa
         return redirect('student_dashboard')
     except Student.DoesNotExist:
         pass
-    
+
     today = date.today()
     total_students = Student.objects.filter(is_active=True).count()
     total_cameras = Camera.objects.filter(is_active=True).count()
     today_attendance = AttendanceLog.objects.filter(date=today).count()
-    currently_inside = AttendanceLog.objects.filter(date=today, entry_time__isnull=False, exit_time__isnull=True).count()
+    currently_inside = AttendanceLog.objects.filter(
+        date=today, entry_time__isnull=False, exit_time__isnull=True
+    ).count()
 
-    # Emotion distribution today
     emotions_today = AttendanceLog.objects.filter(date=today).values('entry_emotion').annotate(count=Count('id'))
 
-    # Last 7 days attendance
     week_data = []
     for i in range(6, -1, -1):
         d = today - timedelta(days=i)
@@ -90,13 +88,15 @@ def dashboard(request):
     return render(request, 'entrance_cam/dashboard.html', context)
 
 
-# ── Students ──────────────────────────────────────────────
+# ── Students ──────────────────────────────────────────────────────────────────
 @login_required
 def student_list(request):
     q = request.GET.get('q', '')
     students = Student.objects.all()
     if q:
-        students = students.filter(Q(name__icontains=q) | Q(roll_no__icontains=q) | Q(email__icontains=q))
+        students = students.filter(
+            Q(name__icontains=q) | Q(roll_no__icontains=q) | Q(email__icontains=q)
+        )
     return render(request, 'entrance_cam/student_list.html', {'students': students, 'q': q})
 
 
@@ -124,7 +124,8 @@ def student_edit(request, pk):
             return redirect('student_list')
     else:
         form = StudentForm(instance=student)
-    return render(request, 'entrance_cam/student_form.html', {'form': form, 'action': 'Edit Student', 'student': student})
+    return render(request, 'entrance_cam/student_form.html',
+                  {'form': form, 'action': 'Edit Student', 'student': student})
 
 
 @login_required
@@ -144,7 +145,7 @@ def student_detail(request, pk):
     return render(request, 'entrance_cam/student_detail.html', {'student': student, 'logs': logs})
 
 
-# ── Cameras ───────────────────────────────────────────────
+# ── Cameras ───────────────────────────────────────────────────────────────────
 @login_required
 def camera_list(request):
     cameras = Camera.objects.all()
@@ -175,7 +176,8 @@ def camera_edit(request, pk):
             return redirect('camera_list')
     else:
         form = CameraForm(instance=camera)
-    return render(request, 'entrance_cam/camera_form.html', {'form': form, 'action': 'Edit Camera', 'camera': camera})
+    return render(request, 'entrance_cam/camera_form.html',
+                  {'form': form, 'action': 'Edit Camera', 'camera': camera})
 
 
 @login_required
@@ -200,7 +202,7 @@ def camera_test(request, pk):
         return JsonResponse({'status': 'offline', 'error': str(e)})
 
 
-# ── Attendance ────────────────────────────────────────────
+# ── Attendance ────────────────────────────────────────────────────────────────
 @login_required
 def attendance_list(request):
     selected_date = request.GET.get('date', str(date.today()))
@@ -209,7 +211,10 @@ def attendance_list(request):
     except ValueError:
         filter_date = date.today()
 
-    logs = AttendanceLog.objects.filter(date=filter_date).select_related('student', 'camera').order_by('-entry_time')
+    logs = (AttendanceLog.objects
+            .filter(date=filter_date)
+            .select_related('student', 'camera')
+            .order_by('-entry_time'))
     return render(request, 'entrance_cam/attendance_list.html', {
         'logs': logs,
         'filter_date': filter_date,
@@ -217,64 +222,144 @@ def attendance_list(request):
     })
 
 
-# ── API: Camera feed trigger (called by the detection script) ──
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+def _decode_snapshot(b64_str, roll_no, suffix):
+    """Decode a base64 snapshot string into a ContentFile, or return None."""
+    if not b64_str:
+        return None
+    try:
+        data_img = base64.b64decode(b64_str)
+        filename = f"snapshot_{roll_no}_{suffix}_{timezone.now().strftime('%Y%m%d_%H%M%S')}.jpg"
+        return ContentFile(data_img, name=filename)
+    except Exception:
+        return None
+
+
+# Emotions considered "positive" for the mood-comparison field
+_POSITIVE_EMOTIONS = {'happy', 'surprise'}
+_NEGATIVE_EMOTIONS = {'sad', 'angry', 'fear', 'disgust'}
+
+
+def _mood_comparison(entry_emotion, exit_emotion):
+    """
+    Returns a simple label comparing entry vs exit mood.
+    Values: 'improved', 'declined', 'stable', 'unknown'
+    """
+    e_in = (entry_emotion or '').lower()
+    e_out = (exit_emotion or '').lower()
+
+    if not e_in or not e_out or e_in == 'unknown' or e_out == 'unknown':
+        return 'unknown'
+    if e_in == e_out:
+        return 'stable'
+
+    in_pos = e_in in _POSITIVE_EMOTIONS
+    in_neg = e_in in _NEGATIVE_EMOTIONS
+    out_pos = e_out in _POSITIVE_EMOTIONS
+    out_neg = e_out in _NEGATIVE_EMOTIONS
+
+    if in_neg and out_pos:
+        return 'improved'
+    if in_pos and out_neg:
+        return 'declined'
+    if in_neg and out_neg:
+        return 'stable'
+    if in_pos and out_pos:
+        return 'stable'
+    return 'stable'
+
+
+# ── API: Camera feed trigger (called by the detection script) ─────────────────
 @csrf_exempt
 def api_log_entry(request):
-    """POST: { student_id, camera_id, emotion, score, snapshot }"""
+    """
+    POST { student_id, camera_id, emotion, score, snapshot }
+
+    Logic:
+    - Find the *most recent* log for this student today that has an entry but
+      NO exit yet  →  this is an exit event.
+    - If no such log exists  →  create a new entry record.
+
+    This correctly handles multiple in/out visits per day.
+    """
     if request.method != 'POST':
         return JsonResponse({'error': 'POST only'}, status=405)
+
     try:
         data = json.loads(request.body)
         student = Student.objects.get(pk=data['student_id'])
-        camera = Camera.objects.get(pk=data['camera_id'])
-        today = date.today()
+        camera  = Camera.objects.get(pk=data['camera_id'])
+        today   = date.today()
+        emotion = data.get('emotion', 'unknown')
+        score   = float(data.get('score', 0.0))
+        snapshot_b64 = data.get('snapshot')
 
-        log, created = AttendanceLog.objects.get_or_create(
-            student=student, date=today,
-            defaults={'camera': camera}
-        )
-        
-        snapshot_b64 = data.get('snapshot', None)
-        snapshot_file = None
-        
-        if snapshot_b64:
-            try:
-                data_img = base64.b64decode(snapshot_b64)
-                snapshot_file = ContentFile(data_img, name=f"snapshot_{student.roll_no}_{timezone.now().strftime('%Y%m%d_%H%M%S')}.jpg")
-            except Exception:
-                pass
-        
-        if created or not log.entry_time:
-            log.entry_time = timezone.now()
-            log.entry_emotion = data.get('emotion', 'unknown')
-            log.entry_emotion_score = data.get('score', 0.0)
-            log.camera = camera
+        # Is there an open (entry logged, no exit) record for today?
+        open_log = (AttendanceLog.objects
+                    .filter(student=student, date=today,
+                            entry_time__isnull=False, exit_time__isnull=True)
+                    .order_by('-entry_time')
+                    .first())
+
+        if open_log:
+            # ── EXIT ──────────────────────────────────────────────────────────
+            open_log.exit_time         = timezone.now()
+            open_log.exit_emotion      = emotion
+            open_log.exit_emotion_score = score
+
+            snapshot_file = _decode_snapshot(snapshot_b64, student.roll_no, 'exit')
+            if snapshot_file:
+                open_log.exit_snapshot = snapshot_file
+
+            # Mood comparison
+            open_log.mood_comparison = _mood_comparison(open_log.entry_emotion, emotion)
+
+            # Duration
+            if open_log.entry_time:
+                delta = open_log.exit_time - open_log.entry_time
+                open_log.duration_minutes = int(delta.total_seconds() // 60)
+
+            open_log.save()
+            return JsonResponse({
+                'status': 'exit_logged',
+                'duration': open_log.duration_minutes,
+                'mood_comparison': open_log.mood_comparison,
+            })
+
+        else:
+            # ── ENTRY ─────────────────────────────────────────────────────────
+            log = AttendanceLog(
+                student=student,
+                camera=camera,
+                date=today,
+                entry_time=timezone.now(),
+                entry_emotion=emotion,
+                entry_emotion_score=score,
+            )
+            snapshot_file = _decode_snapshot(snapshot_b64, student.roll_no, 'entry')
             if snapshot_file:
                 log.entry_snapshot = snapshot_file
             log.save()
             return JsonResponse({'status': 'entry_logged'})
-        else:
-            log.exit_time = timezone.now()
-            log.exit_emotion = data.get('emotion', 'unknown')
-            log.exit_emotion_score = data.get('score', 0.0)
-            if snapshot_file:
-                log.exit_snapshot = snapshot_file
-            log.calculate_duration()
-            return JsonResponse({'status': 'exit_logged', 'duration': log.duration_minutes})
+
+    except Student.DoesNotExist:
+        return JsonResponse({'error': 'Student not found'}, status=404)
+    except Camera.DoesNotExist:
+        return JsonResponse({'error': 'Camera not found'}, status=404)
     except Exception as e:
         return JsonResponse({'error': str(e)}, status=400)
 
 
-# ── API: Get student face encodings (called by detection script) ──
+# ── API: Get student face encodings (called by detection script) ──────────────
 @csrf_exempt
 def api_students_encodings(request):
     """GET: Return list of students with face encodings for recognition."""
     if request.method != 'GET':
         return JsonResponse({'error': 'GET only'}, status=405)
-    
-    students = Student.objects.filter(is_active=True, face_encoding__isnull=False).exclude(face_encoding='')
-    data = [
-        {'id': s.id, 'name': s.name, 'encoding': s.face_encoding}
-        for s in students
-    ]
+
+    students = (Student.objects
+                .filter(is_active=True, face_encoding__isnull=False)
+                .exclude(face_encoding=''))
+    data = [{'id': s.id, 'name': s.name, 'encoding': s.face_encoding} for s in students]
     return JsonResponse(data, safe=False)

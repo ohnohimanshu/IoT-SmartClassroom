@@ -68,22 +68,21 @@ def detect_emotion(frame):
     """Run DeepFace on a BGR frame. Returns (emotion_label, confidence)."""
     if not DEEPFACE_AVAILABLE:
         return "unknown", 0.0
-    
+
     try:
         # Convert BGR to RGB for DeepFace
         rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        
-        # DeepFace analyze
+
         result = DeepFace.analyze(rgb_frame, actions=['emotion'], enforce_detection=False, silent=True)
-        
+
         if isinstance(result, list):
             result = result[0]
-        
+
         emotion = result.get('dominant_emotion', 'unknown')
         score = result.get('emotion', {}).get(emotion, 0.0)
-        
+
         return emotion, round(float(score), 2)
-        
+
     except Exception as e:
         print(f"[WARN] Emotion detection failed: {e}")
         return "unknown", 0.0
@@ -119,12 +118,19 @@ def log_to_server(server_url, student_id, camera_id, emotion, score, snapshot_b6
 def run_detection(camera_url, camera_id, server_url, cooldown_seconds=30):
     """
     Main detection loop.
-    cooldown_seconds: minimum time between logging the same student (unused, using frame-based detection instead)
+
+    Entry/exit logic:
+    - ENTRY: student recognised for the first time (or after cooldown from last exit).
+    - EXIT:  student absent from frame for EXIT_ABSENCE_FRAMES consecutive frames.
+             We keep the last known face crop so we can send a real exit-emotion snapshot.
     """
     print("[INFO] Initializing face detection...")
 
-    # DNN face detector — far more robust than Haar cascade for IP cameras
-    # Uses OpenCV's built-in res10_300x300 SSD model (no extra download needed)
+    # ── How many consecutive absent frames before we treat it as an exit ──────
+    # At ~30 fps, 90 frames ≈ 3 seconds.  Tweak to taste.
+    EXIT_ABSENCE_FRAMES = 90
+
+    # ── DNN face detector ─────────────────────────────────────────────────────
     dnn_model = os.path.join(cv2.data.haarcascades,
                              '..', 'dnn', 'face_detector',
                              'opencv_face_detector_uint8.pb')
@@ -137,50 +143,41 @@ def run_detection(camera_url, camera_id, server_url, cooldown_seconds=30):
         face_net = cv2.dnn.readNetFromTensorflow(dnn_model, dnn_config)
         print("[INFO] Using DNN face detector")
     else:
-        # Fallback: Haar cascade with relaxed params
         face_cascade = cv2.CascadeClassifier(
             cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
         print("[INFO] Using Haar cascade face detector (DNN model not found)")
 
-    # Try to open camera with timeout
+    # ── Open camera ───────────────────────────────────────────────────────────
     print(f"[INFO] Attempting to open camera: {camera_url}")
     try:
-        src = int(camera_url)  # webcam index
+        src = int(camera_url)
         print(f"[INFO] Camera is a webcam (index: {src})")
     except ValueError:
-        src = camera_url       # IP stream URL
+        src = camera_url
         print(f"[INFO] Camera is an IP stream: {camera_url}")
 
     cap = cv2.VideoCapture(src)
-    
-    # Set timeout for camera opening attempt
     cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-    
-    # Try to read a frame with timeout
+
     start_time = time.time()
-    timeout = 5  # 5 second timeout
     frame_read = False
-    
-    while (time.time() - start_time) < timeout:
+    while (time.time() - start_time) < 10:
         ret, frame = cap.read()
         if ret:
             frame_read = True
             break
         time.sleep(0.1)
-    
+
     if not frame_read:
         print(f"[FATAL] Cannot open camera or no frames available: {camera_url}")
-        print(f"[FATAL] If using IP camera, verify it is accessible and online")
-        print(f"[FATAL] If using webcam, try camera index 0")
         cap.release()
         sys.exit(1)
-    
+
     print("[OK] Camera opened successfully!")
-    
+
     known_students = load_known_faces(server_url)
     print(f"[INFO] Loaded {len(known_students)} student profiles")
 
-    # Retry loading encodings if server was unreachable at startup
     if not known_students:
         print("[WARN] No encodings loaded — retrying every 10s for up to 2 minutes...")
         for _ in range(12):
@@ -192,11 +189,20 @@ def run_detection(camera_url, camera_id, server_url, cooldown_seconds=30):
         else:
             print("[ERROR] Could not load student encodings after retries. Attendance will not be marked.")
 
-    print(f"[INFO] Camera stream opened. Starting detection loop…")
-    last_logged = {}  # student_id -> timestamp of last log
-    currently_visible = set()  # students currently visible in frame
+    print("[INFO] Camera stream opened. Starting detection loop…")
+
+    # ── Tracking state ────────────────────────────────────────────────────────
+    # student_id -> timestamp when entry was logged
+    last_entry_logged: dict[int, float] = {}
+    # student_id -> count of consecutive frames absent since last seen
+    absence_counter: dict[int, int] = {}
+    # student_id -> last known face crop (BGR numpy array) for exit snapshot/emotion
+    last_face_crop: dict[int, np.ndarray] = {}
+    # student_id -> set of states: 'inside' means entry logged, exit not yet
+    currently_inside: set = set()
+
     frame_count = 0
-    detected_faces = 0
+    detected_faces_total = 0
 
     while True:
         ret, frame = cap.read()
@@ -209,7 +215,7 @@ def run_detection(camera_url, camera_id, server_url, cooldown_seconds=30):
         frame_count += 1
 
         # ── Face detection ────────────────────────────────────────────────────
-        faces = []  # list of (x, y, w, h)
+        faces = []
         h_frame, w_frame = frame.shape[:2]
 
         if face_net is not None:
@@ -229,32 +235,26 @@ def run_detection(camera_url, camera_id, server_url, cooldown_seconds=30):
                         faces.append((x1, y1, x2 - x1, y2 - y1))
         else:
             gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-            # Relaxed params: smaller minSize, lower minNeighbors
             detected = face_cascade.detectMultiScale(
                 gray, scaleFactor=1.05, minNeighbors=3, minSize=(40, 40))
             if len(detected) > 0:
                 faces = list(detected)
 
-        # Reload student encodings every 5 minutes, or immediately if still empty
+        # ── Reload student encodings periodically ─────────────────────────────
         if frame_count % 9000 == 0 or (not known_students and frame_count % 300 == 0):
             fresh = load_known_faces(server_url)
             if fresh:
                 known_students = fresh
-                print(f"[INFO] Loaded {len(known_students)} student profiles")
-            elif not known_students and frame_count % 300 == 0:
-                print(f"[WARN] Still no student encodings — retrying...")
+                print(f"[INFO] Refreshed {len(known_students)} student profiles")
 
-        # Print stats every 30 frames
+        # ── Print stats every 30 frames ───────────────────────────────────────
         if frame_count % 30 == 0:
-            print(f"[DEBUG] Processed {frame_count} frames, detected {detected_faces} faces so far")
+            print(f"[DEBUG] Frame {frame_count} | Faces detected so far: {detected_faces_total} "
+                  f"| Currently inside: {len(currently_inside)}")
 
-        # ── Batch encode all faces in this frame at once ─────────────────────
-        # Pass the full RGB frame + known locations to face_recognition.
-        # face_recognition expects locations as (top, right, bottom, left) — CSS order.
+        # ── Batch face-recognition encoding ───────────────────────────────────
         rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        face_locations_css = []  # (top, right, bottom, left)
-        for (x, y, w, h) in faces:
-            face_locations_css.append((y, x + w, y + h, x))
+        face_locations_css = [(y, x + w, y + h, x) for (x, y, w, h) in faces]
 
         frame_encodings = []
         if FACE_RECOGNITION_AVAILABLE and known_students and face_locations_css:
@@ -264,14 +264,14 @@ def run_detection(camera_url, camera_id, server_url, cooldown_seconds=30):
             except Exception as e:
                 print(f"[ERROR] Batch encoding failed: {e}")
 
-        # Track detected faces in this frame
-        detected_in_this_frame = set()
+        # ── Process each detected face ────────────────────────────────────────
+        detected_in_this_frame: set = set()
 
         for idx, (x, y, w, h) in enumerate(faces):
-            detected_faces += 1
-            face_roi = frame[y:y+h, x:x+w]
+            detected_faces_total += 1
+            face_roi = frame[y:y + h, x:x + w]
 
-            # Match face to student
+            # ── Match to student ──────────────────────────────────────────────
             matched_student_id = None
             matched_distance = 1.0
 
@@ -298,80 +298,91 @@ def run_detection(camera_url, camera_id, server_url, cooldown_seconds=30):
                 continue
 
             if matched_student_id is None:
-                # Draw unrecognised box
-                cv2.rectangle(frame, (x, y), (x+w, y+h), (0, 165, 255), 2)
-                cv2.putText(frame, f"Unknown ({matched_distance:.2f})", (x, y-8), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,165,255), 2)
+                cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 165, 255), 2)
+                cv2.putText(frame, f"Unknown ({matched_distance:.2f})", (x, y - 8),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 165, 255), 2)
                 continue
 
-            # Track this student as visible in current frame
+            # ── Student recognised ────────────────────────────────────────────
             detected_in_this_frame.add(matched_student_id)
 
-            # Check if we should log entry (first time seeing this student)
-            now = time.time()
-            if matched_student_id not in last_logged:
-                # Detect emotion on a larger region around face for better accuracy
-                padding = 20
-                x1 = max(0, x - padding)
-                y1 = max(0, y - padding)
-                x2 = min(frame.shape[1], x + w + padding)
-                y2 = min(frame.shape[0], y + h + padding)
-                face_region_padded = frame[y1:y2, x1:x2]
-                
-                emotion, score = detect_emotion(face_region_padded)
+            # Reset absence counter now that they're visible
+            absence_counter[matched_student_id] = 0
 
-                # Snapshot (use original face_roi for cleaner snapshot)
+            # Save a fresh face crop for later exit snapshot / emotion
+            padding = 20
+            x1 = max(0, x - padding)
+            y1 = max(0, y - padding)
+            x2 = min(w_frame, x + w + padding)
+            y2 = min(h_frame, y + h + padding)
+            last_face_crop[matched_student_id] = frame[y1:y2, x1:x2].copy()
+
+            now = time.time()
+
+            if matched_student_id not in currently_inside:
+                # ── ENTRY ─────────────────────────────────────────────────────
+                # Respect cooldown: don't re-log entry too quickly after exit
+                last_time = last_entry_logged.get(matched_student_id, 0)
+                if (now - last_time) < cooldown_seconds:
+                    # Still in cooldown — skip, but draw box
+                    cv2.rectangle(frame, (x, y), (x + w, y + h), (100, 100, 100), 2)
+                    cv2.putText(frame, "COOLDOWN", (x, y - 8),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (100, 100, 100), 2)
+                    continue
+
+                emotion, score = detect_emotion(last_face_crop[matched_student_id])
                 snapshot = frame_to_base64(face_roi)
 
-                # Log entry to server
                 result = log_to_server(server_url, matched_student_id, camera_id, emotion, score, snapshot)
-                last_logged[matched_student_id] = now
-                
-                print(f"[ENTRY] Logged for student {matched_student_id} - emotion: {emotion} ({score}%)")
+                last_entry_logged[matched_student_id] = now
+                currently_inside.add(matched_student_id)
 
-                # Draw recognised box
-                label = f"ENTRY | {emotion} ({score}%)"
-                cv2.rectangle(frame, (x, y), (x+w, y+h), (0, 200, 100), 2)
-                cv2.putText(frame, label, (x, y-8), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,200,100), 2)
+                print(f"[ENTRY] Student {matched_student_id} — emotion: {emotion} ({score}%)")
+
+                label = f"ENTRY | {emotion} ({score:.0f}%)"
+                cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 200, 100), 2)
+                cv2.putText(frame, label, (x, y - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 200, 100), 2)
+
             else:
-                # Already logged entry, just track visibility
-                cv2.rectangle(frame, (x, y), (x+w, y+h), (100, 100, 100), 2)
-                cv2.putText(frame, "IN_FRAME", (x, y-8), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (100,100,100), 2)
+                # Already inside — just draw tracking box
+                cv2.rectangle(frame, (x, y), (x + w, y + h), (255, 200, 0), 2)
+                cv2.putText(frame, "INSIDE", (x, y - 8),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 200, 0), 2)
 
-        # Detect students who left the frame (log exit)
-        students_who_left = currently_visible - detected_in_this_frame
-        for student_id in students_who_left:
-            # Detect emotion and take snapshot from frame (if available)
-            emotion = "unknown"
-            score = 0.0
-            snapshot = frame_to_base64(frame[max(0, frame.shape[0]//3):min(frame.shape[0], 2*frame.shape[0]//3),
-                                           max(0, frame.shape[1]//3):min(frame.shape[1], 2*frame.shape[1]//3)])
-            
-            # Log exit to server
-            result = log_to_server(server_url, student_id, camera_id, emotion, score, snapshot)
-            print(f"[EXIT] Logged for student {student_id} - {result.get('status', 'logged')}")
-            
-            # Remove from tracking
-            if student_id in last_logged:
-                del last_logged[student_id]
+        # ── Absence counter & EXIT detection ─────────────────────────────────
+        for student_id in list(currently_inside):
+            if student_id not in detected_in_this_frame:
+                # Increment absence counter
+                absence_counter[student_id] = absence_counter.get(student_id, 0) + 1
 
-        # Update currently visible students for next frame
-        currently_visible = detected_in_this_frame
+                if absence_counter[student_id] >= EXIT_ABSENCE_FRAMES:
+                    # ── EXIT ──────────────────────────────────────────────────
+                    # Use the saved face crop for a real exit emotion/snapshot
+                    exit_crop = last_face_crop.get(student_id)
+                    if exit_crop is not None and exit_crop.size > 0:
+                        emotion, score = detect_emotion(exit_crop)
+                        snapshot = frame_to_base64(exit_crop)
+                    else:
+                        emotion, score = "unknown", 0.0
+                        snapshot = frame_to_base64(frame)
 
-        # Optional: show preview window (disabled for headless systems)
-        # Uncomment below if running on a system with GUI support
+                    result = log_to_server(server_url, student_id, camera_id, emotion, score, snapshot)
+                    print(f"[EXIT] Student {student_id} — emotion: {emotion} ({score}%) | "
+                          f"status: {result.get('status', 'logged')}")
+
+                    currently_inside.discard(student_id)
+                    absence_counter.pop(student_id, None)
+                    # Keep last_face_crop a little longer in case they come back
+
+        # ── Optional preview (comment out on headless) ────────────────────────
         # try:
         #     cv2.imshow("Entrance Detection", frame)
         #     if cv2.waitKey(1) & 0xFF == ord('q'):
         #         break
-        # except:
-        #     pass  # GUI not available on headless systems
+        # except Exception:
+        #     pass
 
     cap.release()
-    # Don't call cv2.destroyAllWindows() on headless systems
-    # try:
-    #     cv2.destroyAllWindows()
-    # except:
-    #     pass
 
 
 if __name__ == '__main__':
@@ -380,15 +391,17 @@ if __name__ == '__main__':
         parser.add_argument('--camera-url', default='0', help='Camera URL or webcam index')
         parser.add_argument('--camera-id', type=int, required=True, help='Camera DB ID from admin')
         parser.add_argument('--server', default='http://localhost:8000', help='Django server URL')
-        parser.add_argument('--cooldown', type=int, default=30, help='Seconds between re-logging same student')
+        parser.add_argument('--cooldown', type=int, default=30,
+                            help='Seconds between re-logging the same student after an exit')
         args = parser.parse_args()
 
         print(f"[INFO] Starting detection for camera {args.camera_id}")
         print(f"[INFO] Camera URL: {args.camera_url}")
         print(f"[INFO] Server: {args.server}")
+        print(f"[INFO] Cooldown: {args.cooldown}s")
         print(f"[INFO] face_recognition available: {FACE_RECOGNITION_AVAILABLE}")
         print(f"[INFO] DeepFace available: {DEEPFACE_AVAILABLE}")
-        
+
         run_detection(args.camera_url, args.camera_id, args.server, args.cooldown)
     except Exception as e:
         print(f"[FATAL] {e}", file=sys.stderr)
