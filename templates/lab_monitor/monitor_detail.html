@@ -4,6 +4,34 @@
 {% block page_title %}Session Detail: {{ session.student.name }}{% endblock %}
 
 {% block content %}
+<style>
+  #screen-placeholder, #camera-placeholder {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    padding: 3rem 2rem;
+    background: #f8fafc;
+    border: 2px dashed #cbd5e1;
+    border-radius: 8px;
+  }
+  #screen-placeholder i, #camera-placeholder i {
+    font-size: 3.5rem;
+    color: #cbd5e1;
+    margin-bottom: 1rem;
+  }
+  #screen-placeholder p, #camera-placeholder p {
+    font-size: 0.95rem;
+    color: #64748b;
+    font-weight: 500;
+    margin: 0;
+  }
+  #screen-placeholder small, #camera-placeholder small {
+    font-size: 0.8rem;
+    color: #94a3b8;
+    margin-top: 0.25rem;
+  }
+</style>
 <div class="row g-4 mb-4">
   <div class="col-12">
     <div class="stat-card">
@@ -28,8 +56,14 @@
       <div class="section-hdr">
         <h5><i class="bi bi-images me-2" style="color:#4f46e5"></i> Live Screen</h5>
       </div>
-      <video id="live-screen" autoplay playsinline class="w-100 rounded" style="max-height:500px;object-fit:contain;background:#000;display:none;"></video>
-      <img id="fallback-screen" class="w-100 rounded" style="max-height:500px;object-fit:contain;background:#000;">
+      <div style="position:relative;background:#111;border-radius:8px;overflow:hidden;min-height:300px;">
+        <img id="fallback-screen" class="w-100 d-block" style="max-height:500px;object-fit:contain;">
+        <div id="screen-placeholder" style="position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;color:#aaa;font-size:0.9rem;">
+          <i class="bi bi-projector" style="font-size:3rem;margin-bottom:1rem;opacity:0.4"></i>
+          <p class="mb-0">Waiting for screen capture...</p>
+          <small style="opacity:0.6">Updates every 3 seconds once student starts session</small>
+        </div>
+      </div>
     </div>
     
     <div class="stat-card mb-4">
@@ -43,9 +77,14 @@
       <div class="section-hdr">
         <h5><i class="bi bi-camera-video me-2" style="color:#10b981"></i> Live Camera</h5>
       </div>
-      <video id="live-camera" autoplay playsinline class="w-100 rounded" style="max-height:400px;object-fit:contain;background:#000;display:none;"></video>
-      <img id="fallback-camera" class="w-100 rounded" style="max-height:400px;object-fit:contain;background:#000;">
-      <div class="d-flex gap-2 mt-2">
+      <div style="position:relative;background:#111;border-radius:8px;overflow:hidden;margin-bottom:1rem;min-height:240px;">
+        <img id="fallback-camera" class="w-100 d-block" style="max-height:400px;object-fit:contain;">
+        <div id="camera-placeholder" style="position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;color:#aaa;font-size:0.9rem;">
+          <i class="bi bi-camera" style="font-size:3rem;margin-bottom:1rem;opacity:0.4"></i>
+          <p class="mb-0">Waiting for camera feed...</p>
+        </div>
+      </div>
+      <div class="d-flex gap-2">
         <span id="emotion-display" class="emotion-badge badge-unknown">Emotion: Unknown</span>
         <span id="pose-display" class="emotion-badge badge-neutral">Pose: Unknown</span>
       </div>
@@ -104,9 +143,13 @@ function getCookie(name) {
     }
     return cookieValue;
 }
-const csrftoken = getCookie('csrftoken');
+const csrftoken = document.querySelector('meta[name="csrf-token"]')?.content || getCookie('csrftoken');
 
 document.addEventListener('DOMContentLoaded', function() {
+    console.log('=== Monitor Detail Page Loaded ===');
+    console.log('Session ID:', {{ session.id }});
+    console.log('Session Active:', {{ session.is_active|lower }});
+    
     const ctx = document.getElementById('emotion-chart').getContext('2d');
     
     const initialSnapshots = [
@@ -155,52 +198,71 @@ document.addEventListener('DOMContentLoaded', function() {
     const emotionDisplay = document.getElementById('emotion-display');
     const poseDisplay = document.getElementById('pose-display');
     
+    let screenStreamId = null;
+    let cameraStreamId = null;
+
     async function startWebRTC() {
         try {
+            console.log('Starting WebRTC connection...');
             peerConnection = new RTCPeerConnection({
-                iceServers: [
-                    { urls: 'stun:stun.l.google.com:19302' }
-                ]
+                iceServers: [{ urls: 'stun:stun.l.google.com:19302' }]
             });
-            
+
             peerConnection.ontrack = (event) => {
-                const track = event.track;
                 const stream = event.streams[0];
-                console.log('Received track:', track.id);
-                
-                if (track.id.startsWith('screen-')) {
+                if (!stream) return;
+                console.log('Received track, stream id:', stream.id,
+                    '| screen:', screenStreamId, '| camera:', cameraStreamId);
+
+                if (screenStreamId && stream.id === screenStreamId) {
                     liveScreen.srcObject = stream;
                     liveScreen.style.display = 'block';
                     fallbackScreen.style.display = 'none';
-                    console.log('Screen stream received');
-                } else if (track.id.startsWith('camera-')) {
+                    document.getElementById('screen-placeholder').style.display = 'none';
+                    console.log('Screen stream attached');
+                } else if (cameraStreamId && stream.id === cameraStreamId) {
                     liveCamera.srcObject = stream;
                     liveCamera.style.display = 'block';
                     fallbackCamera.style.display = 'none';
-                    console.log('Camera stream received');
+                    document.getElementById('camera-placeholder').style.display = 'none';
+                    console.log('Camera stream attached');
+                } else {
+                    // Stream IDs not yet known — attach by arrival order
+                    if (!liveScreen.srcObject) {
+                        liveScreen.srcObject = stream;
+                        liveScreen.style.display = 'block';
+                        fallbackScreen.style.display = 'none';
+                        document.getElementById('screen-placeholder').style.display = 'none';
+                        console.log('Screen stream attached (by order)');
+                    } else if (!liveCamera.srcObject) {
+                        liveCamera.srcObject = stream;
+                        liveCamera.style.display = 'block';
+                        fallbackCamera.style.display = 'none';
+                        document.getElementById('camera-placeholder').style.display = 'none';
+                        console.log('Camera stream attached (by order)');
+                    }
                 }
             };
-            
+
             peerConnection.onicecandidate = async (event) => {
                 if (event.candidate) {
                     try {
                         await fetch(`/lab/api/session/${sessionId}/webrtc/ice/`, {
                             method: 'POST',
-                            headers: {
-                                'X-CSRFToken': csrftoken,
-                                'Content-Type': 'application/json'
-                            },
-                            body: JSON.stringify({
-                                candidate: event.candidate,
-                                role: 'admin'
-                            })
+                            headers: { 'X-CSRFToken': csrftoken, 'Content-Type': 'application/json' },
+                            body: JSON.stringify({ candidate: event.candidate, role: 'admin' })
                         });
                     } catch (e) {
                         console.error('Error sending ICE candidate:', e);
                     }
                 }
             };
-            
+
+            peerConnection.onconnectionstatechange = () =>
+                console.log('Connection State:', peerConnection.connectionState);
+            peerConnection.oniceconnectionstatechange = () =>
+                console.log('ICE State:', peerConnection.iceConnectionState);
+
             pollingInterval = setInterval(pollForOffer, 2000);
         } catch (e) {
             console.error('WebRTC setup failed:', e);
@@ -210,9 +272,25 @@ document.addEventListener('DOMContentLoaded', function() {
     async function pollForOffer() {
         try {
             const response = await fetch(`/lab/api/session/${sessionId}/`);
+            if (!response.ok) {
+                console.error('❌ API error:', response.status, response.statusText);
+                return;
+            }
             const data = await response.json();
+            console.log('📡 Poll response:', {
+                has_offer: !!data.webrtc_offer,
+                has_answer: !!data.webrtc_answer,
+                has_screenshot: !!data.latest_screenshot,
+                has_camera: !!data.latest_camera,
+                emotion: data.latest_emotion,
+                pose: data.latest_pose
+            });
             
+            if (data.webrtc_screen_stream_id) screenStreamId = data.webrtc_screen_stream_id;
+            if (data.webrtc_camera_stream_id) cameraStreamId = data.webrtc_camera_stream_id;
+
             if (data.webrtc_offer && !peerConnection.remoteDescription) {
+                console.log('📥 Received WebRTC offer from student');
                 await peerConnection.setRemoteDescription(new RTCSessionDescription(data.webrtc_offer));
                 const answer = await peerConnection.createAnswer();
                 await peerConnection.setLocalDescription(answer);
@@ -226,16 +304,16 @@ document.addEventListener('DOMContentLoaded', function() {
                     body: JSON.stringify({ answer: peerConnection.localDescription })
                 });
                 
-                console.log('WebRTC answer sent');
+                console.log('📤 WebRTC answer sent to student');
             }
             
-            if (data.webrtc_ice_candidates_student) {
+            if (data.webrtc_ice_candidates_student && Array.isArray(data.webrtc_ice_candidates_student)) {
                 for (const candidate of data.webrtc_ice_candidates_student) {
                     if (!candidate || !peerConnection.remoteDescription) continue;
                     try {
                         await peerConnection.addIceCandidate(new RTCIceCandidate(candidate));
                     } catch (e) {
-                        console.error('Error adding student ICE candidate:', e);
+                        console.error('❌ Error adding student ICE candidate:', e);
                     }
                 }
             }
@@ -244,46 +322,56 @@ document.addEventListener('DOMContentLoaded', function() {
                 emotionDisplay.className = `emotion-badge badge-${data.latest_emotion}`;
                 emotionDisplay.textContent = `Emotion: ${data.latest_emotion.charAt(0).toUpperCase() + data.latest_emotion.slice(1)}`;
             }
-            
+
             if (data.latest_pose) {
-                poseDisplay.textContent = `Pose: ${data.latest_pose.charAt(0).toUpperCase() + data.latest_pose.slice(1)}`;
+                const poseLabel = data.latest_pose.replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase());
+                const poseColor = data.latest_pose === 'focused' ? '#22c55e'
+                    : data.latest_pose === 'looking_away' ? '#f59e0b'
+                    : data.latest_pose === 'head_down' ? '#ef4444' : '#94a3b8';
+                poseDisplay.style.background = poseColor + '22';
+                poseDisplay.style.color = poseColor;
+                poseDisplay.textContent = `Pose: ${poseLabel}`;
             }
-            
+
+            const ts = new Date().getTime();
             if (data.latest_screenshot) {
+                fallbackScreen.src = data.latest_screenshot + '?t=' + ts;
                 fallbackScreen.style.display = 'block';
-                const timestamp = new Date().getTime();
-                fallbackScreen.src = data.latest_screenshot + '?t=' + timestamp;
+                document.getElementById('screen-placeholder').style.display = 'none';
             }
-            
+
             if (data.latest_camera) {
+                fallbackCamera.src = data.latest_camera + '?t=' + ts;
                 fallbackCamera.style.display = 'block';
-                const timestamp = new Date().getTime();
-                fallbackCamera.src = data.latest_camera + '?t=' + timestamp;
-                
-                const now = new Date();
-                const timeStr = now.toLocaleTimeString('en-US', { hour12: false });
-                
+                document.getElementById('camera-placeholder').style.display = 'none';
+
+                const timeStr = new Date().toLocaleTimeString('en-US', { hour12: false });
                 const lastLabel = emotionChart.data.labels[emotionChart.data.labels.length - 1];
                 if (lastLabel !== timeStr) {
                     emotionChart.data.labels.push(timeStr);
-                    emotionChart.data.datasets[0].data.push(data.latest_emotion === 'unknown' ? 0 : 50);
-                    
+                    emotionChart.data.datasets[0].data.push(
+                        data.latest_emotion_score != null ? data.latest_emotion_score : 0
+                    );
                     if (emotionChart.data.labels.length > 20) {
                         emotionChart.data.labels.shift();
                         emotionChart.data.datasets[0].data.shift();
                     }
-                    
                     emotionChart.update();
                 }
             }
         } catch (e) {
-            console.error('Error polling for offer:', e);
+            console.error('❌ Error polling for offer:', e);
         }
     }
     
     if ({{ session.is_active|lower }}) {
+        console.log('✅ Session is active - Starting WebRTC');
         startWebRTC();
+    } else {
+        console.log('⏸️  Session is not active');
     }
+    
+    console.log('=== Page initialization complete ===');
 });
 </script>
 {% endblock %}

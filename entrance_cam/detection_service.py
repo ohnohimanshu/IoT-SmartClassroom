@@ -67,12 +67,23 @@ class DetectionService:
     def _start_detection(self, camera):
         """Start detection for a camera."""
         try:
-            # Get Django base directory
             base_dir = settings.BASE_DIR
             script_path = os.path.join(base_dir, 'entrance_cam', 'detection_script.py')
-            
-            # Get server URL from environment or default to your server
-            server_url = os.getenv('DJANGO_SERVER_URL', 'https://192.168.1.5:8000')
+
+            # Auto-detect server URL: prefer env var, then derive from current machine IP
+            server_url = os.getenv('DJANGO_SERVER_URL')
+            if not server_url:
+                import socket
+                try:
+                    # Connect to an external address to find the outbound interface IP
+                    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                    s.connect(('8.8.8.8', 80))
+                    local_ip = s.getsockname()[0]
+                    s.close()
+                except Exception:
+                    local_ip = '127.0.0.1'
+                server_url = f'https://{local_ip}:8000'
+                print(f"[INFO] Auto-detected server URL: {server_url}")
             
             # Build command
             cmd = [

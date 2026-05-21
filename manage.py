@@ -8,6 +8,7 @@ def main():
     """Run administrative tasks."""
     os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'classroom_iot.settings')
     try:
+        import classroom_iot.wsgi_fix  # noqa: F401 - suppress SSL/broken pipe errors
         from django.core.management import execute_from_command_line
     except ImportError as exc:
         raise ImportError(

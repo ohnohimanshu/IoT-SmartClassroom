@@ -1,9 +1,21 @@
-django
-django-sslserver
-pillow
-opencv-python-headless
-deepface
-tf-keras
-requests
-face-recognition
-mediapipe
+# Core
+django==5.1.4
+django-sslserver==0.22
+
+# Image processing
+pillow==11.1.0
+opencv-python-headless==4.10.0.84
+numpy==1.26.4
+
+# Face recognition & emotion detection
+deepface==0.0.93
+tf-keras==2.18.0
+face-recognition==1.3.0
+
+# Pose / engagement detection
+mediapipe==0.10.35
+ultralytics==8.3.55
+
+# HTTP
+requests==2.32.3
+urllib3==2.3.0

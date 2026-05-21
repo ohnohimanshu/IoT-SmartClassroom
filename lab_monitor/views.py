@@ -16,19 +16,66 @@ from datetime import datetime
 from .models import LabSession, Screenshot, CameraSnapshot, ActivityLog
 from entrance_cam.models import Student, AttendanceLog
 
-try:
-    from deepface import DeepFace
-    DEEPFACE_AVAILABLE = True
-except ImportError:
-    DEEPFACE_AVAILABLE = False
+DEEPFACE_AVAILABLE = None  # None = not yet checked; True/False after first use
 
-try:
-    import mediapipe as mp
-    import cv2
-    import numpy as np
-    MEDIAPIPE_AVAILABLE = True
-except ImportError:
-    MEDIAPIPE_AVAILABLE = False
+
+def _get_deepface():
+    """Lazy-load DeepFace so TensorFlow doesn't block Django startup."""
+    global DEEPFACE_AVAILABLE
+    if DEEPFACE_AVAILABLE is None:
+        try:
+            from deepface import DeepFace as _DF
+            globals()['DeepFace'] = _DF
+            DEEPFACE_AVAILABLE = True
+        except ImportError:
+            DEEPFACE_AVAILABLE = False
+    return DEEPFACE_AVAILABLE
+
+
+# cv2 / mediapipe / numpy — lazy so they don't block Django startup
+_face_landmarker = None
+_cv2 = None
+_np = None
+_mp = None
+
+
+def _get_face_mesh():
+    """Lazy-load mediapipe Tasks API FaceLandmarker (mediapipe >= 0.10)."""
+    global _face_landmarker, _cv2, _np, _mp
+    if _cv2 is None:
+        try:
+            import cv2 as _cv2_mod
+            import numpy as _np_mod
+            import mediapipe as _mp_mod
+            _cv2, _np, _mp = _cv2_mod, _np_mod, _mp_mod
+            globals().update({'cv2': _cv2, 'np': _np, 'mp': _mp})
+        except ImportError as e:
+            print(f"[FACE_MESH] Import failed: {e}")
+            return None
+    if _face_landmarker is None:
+        try:
+            from mediapipe.tasks import python as _mp_python
+            from mediapipe.tasks.python import vision as _mp_vision
+            import os
+            model_path = os.path.join(
+                os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                'face_landmarker.task'
+            )
+            base_options = _mp_python.BaseOptions(model_asset_path=model_path)
+            options = _mp_vision.FaceLandmarkerOptions(
+                base_options=base_options,
+                running_mode=_mp_vision.RunningMode.IMAGE,
+                num_faces=1,
+                min_face_detection_confidence=0.3,
+                min_face_presence_confidence=0.3,
+                output_face_blendshapes=False,
+                output_facial_transformation_matrixes=False,
+            )
+            _face_landmarker = _mp_vision.FaceLandmarker.create_from_options(options)
+            print("[FACE_MESH] FaceLandmarker (Tasks API) initialized successfully")
+        except Exception as e:
+            print(f"[FACE_MESH] Init failed: {e}")
+    return _face_landmarker
 
 
 @login_required(login_url='login')
@@ -115,8 +162,9 @@ def session_list(request):
 
 
 @require_POST
-@login_required
 def session_start(request):
+    if not request.user.is_authenticated:
+        return JsonResponse({'status': 'error', 'message': 'Not authenticated'}, status=401)
     try:
         student = request.user.student_profile
     except Student.DoesNotExist:
@@ -135,8 +183,9 @@ def session_start(request):
 
 
 @require_POST
-@login_required
 def session_end(request):
+    if not request.user.is_authenticated:
+        return JsonResponse({'status': 'error', 'message': 'Not authenticated'}, status=401)
     try:
         data = json.loads(request.body)
         session_id = data.get('session_id')
@@ -156,8 +205,9 @@ def session_end(request):
 
 
 @require_POST
-@login_required
 def receive_screenshot(request):
+    if not request.user.is_authenticated:
+        return JsonResponse({'status': 'error', 'message': 'Not authenticated'}, status=401)
     try:
         data = json.loads(request.body)
         session_id = data.get('session_id')
@@ -187,8 +237,9 @@ def receive_screenshot(request):
 
 
 @require_POST
-@login_required
 def receive_camera_frame(request):
+    if not request.user.is_authenticated:
+        return JsonResponse({'status': 'error', 'message': 'Not authenticated'}, status=401)
     try:
         data = json.loads(request.body)
         session_id = data.get('session_id')
@@ -215,68 +266,106 @@ def receive_camera_frame(request):
                 ext = format.split('/')[-1]
                 data_img = base64.b64decode(imgstr)
                 
-                image = Image.open(BytesIO(data_img))
-                np_image = np.array(image)
-                if len(np_image.shape) == 2:
-                    np_image = cv2.cvtColor(np_image, cv2.COLOR_GRAY2RGB)
-                elif np_image.shape[2] == 4:
-                    np_image = cv2.cvtColor(np_image, cv2.COLOR_RGBA2RGB)
-                
-                if DEEPFACE_AVAILABLE:
+                image = Image.open(BytesIO(data_img)).convert('RGB')
+                import numpy as _np_local
+                import math as _math
+                # ascontiguousarray ensures mediapipe gets a proper C-contiguous buffer
+                np_image = _np_local.ascontiguousarray(_np_local.array(image))
+
+                print(f"[CAM] shape={np_image.shape} dtype={np_image.dtype}")
+
+                # ── Run mediapipe ONCE (needs read-only array) ────────────────────
+                landmarker = _get_face_mesh()
+                if landmarker is not None:
+                    np_image.flags.writeable = False
                     try:
-                        analysis = DeepFace.analyze(np_image, actions=['emotion'], enforce_detection=False, silent=True)
-                        if analysis:
-                            if isinstance(analysis, list):
-                                analysis = analysis[0]
-                            emotion = analysis.get('dominant_emotion', 'neutral')
-                            emotion_score = analysis.get('emotion', {}).get(emotion, 0.5)
+                        mp_image = _mp.Image(image_format=_mp.ImageFormat.SRGB, data=np_image)
+                        mesh_results = landmarker.detect(mp_image)
+                    except Exception as e:
+                        print(f"[MESH ERROR] {e}")
+                        mesh_results = None
+                    np_image.flags.writeable = True
+                else:
+                    mesh_results = None
+
+                # New Tasks API: .face_landmarks is a list of NormalizedLandmark lists
+                face_lm = (mesh_results.face_landmarks[0]
+                           if mesh_results and mesh_results.face_landmarks else None)
+                print(f"[MESH] face detected: {face_lm is not None}")
+
+                # ── Emotion ───────────────────────────────────────────────────────
+                if _get_deepface():
+                    try:
+                        analysis = DeepFace.analyze(np_image, actions=['emotion'],
+                                                    enforce_detection=False, silent=True)
+                        if isinstance(analysis, list):
+                            analysis = analysis[0]
+                        emotion = analysis.get('dominant_emotion', 'neutral')
+                        emotion_score = float(analysis.get('emotion', {}).get(emotion, 0.5))
                     except Exception:
                         emotion = 'neutral'
                         emotion_score = 0.5
+                elif face_lm is not None:
+                    upper = face_lm[13]; lower = face_lm[14]
+                    left_m = face_lm[78]; right_m = face_lm[308]
+                    mar_v = _math.hypot(upper.x - lower.x, upper.y - lower.y)
+                    mar_h = _math.hypot(left_m.x - right_m.x, left_m.y - right_m.y) + 1e-6
+                    mar = mar_v / mar_h
+                    left_brow = face_lm[107]; right_brow = face_lm[336]
+                    left_eye_lm = face_lm[33]; right_eye_lm = face_lm[263]
+                    brow_raise = ((left_brow.y - left_eye_lm.y) + (right_brow.y - right_eye_lm.y)) / 2
+                    if mar > 0.25:
+                        emotion = 'happy'
+                        emotion_score = min(float(mar * 200), 95.0)
+                    elif brow_raise < -0.03:
+                        emotion = 'surprise'
+                        emotion_score = 60.0
+                    else:
+                        emotion = 'neutral'
+                        emotion_score = 70.0
                 else:
-                    emotion = 'neutral'
-                    emotion_score = 0.5
-                
-                if MEDIAPIPE_AVAILABLE:
-                    try:
-                        mp_face_mesh = mp.solutions.face_mesh
-                        face_mesh = mp_face_mesh.FaceMesh(
-                            static_image_mode=True, 
-                            max_num_faces=1, 
-                            refine_landmarks=True, 
-                            min_detection_confidence=0.5
-                        )
-                        results = face_mesh.process(np_image)
-                        if results.multi_face_landmarks:
-                            landmarks = results.multi_face_landmarks[0].landmark
-                            
-                            nose_tip = landmarks[1]
-                            left_eye = landmarks[33]
-                            right_eye = landmarks[263]
-                            
-                            eye_center_x = (left_eye.x + right_eye.x) / 2
-                            eye_center_y = (left_eye.y + right_eye.y) / 2
-                            
-                            yaw = (nose_tip.x - eye_center_x) * 100
-                            pitch = (nose_tip.y - eye_center_y) * 100
-                            
-                            if yaw > 20 or yaw < -20:
-                                pose = 'looking_away'
-                            elif pitch > 15:
-                                pose = 'head_down'
-                            else:
-                                pose = 'focused'
-                    except Exception:
+                    emotion = 'unknown'
+                    emotion_score = 0.0
+
+                # ── Pose (head direction) ─────────────────────────────────────────
+                if face_lm is not None:
+                    h, w = np_image.shape[:2]
+
+                    def pt(idx):
+                        return _np_local.array([face_lm[idx].x * w, face_lm[idx].y * h])
+
+                    nose      = pt(1)
+                    left_eye  = pt(33)
+                    right_eye = pt(263)
+                    chin      = pt(152)
+                    forehead  = pt(10)
+
+                    eye_center  = (left_eye + right_eye) / 2
+                    eye_width   = _np_local.linalg.norm(right_eye - left_eye) + 1e-6
+                    face_height = _np_local.linalg.norm(chin - forehead) + 1e-6
+
+                    yaw   = ((nose[0] - eye_center[0]) / eye_width) * 90
+                    pitch = ((nose[1] - eye_center[1]) / face_height) * 180
+
+                    print(f"[POSE] yaw={yaw:.1f} pitch={pitch:.1f} eye_w={eye_width:.1f}")
+
+                    if yaw < -18 or yaw > 18:
+                        pose = 'looking_away'
+                    elif pitch < -12:
+                        pose = 'head_down'
+                    else:
                         pose = 'focused'
                 else:
-                    pose = 'focused'
-                
+                    print("[POSE] No face landmarks detected")
+                    pose = 'unknown'
+
                 snapshot = CameraSnapshot(session=session, emotion=emotion, emotion_score=emotion_score, pose=pose)
                 filename = f"camera_{session.id}_{timezone.now().strftime('%Y%m%d_%H%M%S')}.{ext}"
                 snapshot.image.save(filename, BytesIO(data_img), save=True)
-            
-            except Exception:
-                pass
+
+            except Exception as e:
+                print(f"[CAMERA FRAME ERROR] {e}")
+                import traceback; traceback.print_exc()
         
         return JsonResponse({'status': 'success', 'emotion': emotion, 'emotion_score': emotion_score, 'pose': pose})
     except Exception:
@@ -284,8 +373,9 @@ def receive_camera_frame(request):
 
 
 @require_POST
-@login_required
 def receive_activity(request):
+    if not request.user.is_authenticated:
+        return JsonResponse({'status': 'error', 'message': 'Not authenticated'}, status=401)
     try:
         data = json.loads(request.body)
         session_id = data.get('session_id')
@@ -354,17 +444,21 @@ def api_session_detail(request, session_id):
         'latest_camera_timestamp': latest_camera.timestamp.isoformat() if latest_camera else None,
         'latest_emotion': latest_camera.emotion if latest_camera else 'unknown',
         'latest_pose': latest_camera.pose if latest_camera else 'unknown',
+        'latest_emotion_score': latest_camera.emotion_score if latest_camera else 0,
         'is_active': session.is_active,
         'webrtc_offer': session.webrtc_offer,
         'webrtc_answer': session.webrtc_answer,
         'webrtc_ice_candidates_student': session.webrtc_ice_candidates_student,
         'webrtc_ice_candidates_admin': session.webrtc_ice_candidates_admin,
+        'webrtc_screen_stream_id': session.webrtc_screen_stream_id,
+        'webrtc_camera_stream_id': session.webrtc_camera_stream_id,
     })
 
 
 @require_POST
-@login_required
 def api_webrtc_offer(request, session_id):
+    if not request.user.is_authenticated:
+        return JsonResponse({'status': 'error', 'message': 'Not authenticated'}, status=401)
     try:
         data = json.loads(request.body)
         try:
@@ -375,6 +469,8 @@ def api_webrtc_offer(request, session_id):
         session = get_object_or_404(LabSession, id=session_id, student=student)
         session.webrtc_offer = data.get('offer')
         session.webrtc_ice_candidates_student = []
+        session.webrtc_screen_stream_id = data.get('screen_stream_id', '')
+        session.webrtc_camera_stream_id = data.get('camera_stream_id', '')
         session.save()
         
         return JsonResponse({'status': 'success'})
@@ -383,8 +479,9 @@ def api_webrtc_offer(request, session_id):
 
 
 @require_POST
-@login_required
 def api_webrtc_answer(request, session_id):
+    if not request.user.is_authenticated:
+        return JsonResponse({'status': 'error', 'message': 'Not authenticated'}, status=401)
     if not request.user.is_staff and not request.user.is_superuser:
         return JsonResponse({'error': 'Unauthorized'}, status=403)
     
@@ -400,8 +497,9 @@ def api_webrtc_answer(request, session_id):
 
 
 @require_POST
-@login_required
 def api_webrtc_ice_candidate(request, session_id):
+    if not request.user.is_authenticated:
+        return JsonResponse({'status': 'error', 'message': 'Not authenticated'}, status=401)
     try:
         data = json.loads(request.body)
         candidate = data.get('candidate')

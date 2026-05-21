@@ -51,7 +51,8 @@ function getCookie(name) {
     }
     return cookieValue;
 }
-const csrftoken = getCookie('csrftoken');
+// Prefer meta tag (always available server-side) over cookie (blocked by HttpOnly in some configs)
+const csrftoken = document.querySelector('meta[name="csrf-token"]')?.content || getCookie('csrftoken');
 
 let sessionId = null;
 let sessionStartTime = null;
@@ -135,7 +136,7 @@ async function startSharing() {
         cameraStream = await navigator.mediaDevices.getUserMedia({ video: true });
         cameraPreview.srcObject = cameraStream;
         await new Promise(resolve => setTimeout(resolve, 1000));
-        cameraInterval = setInterval(captureCamera, 2000);
+        cameraInterval = setInterval(captureCamera, 3000);  // every 3s — gives server time to process
     } catch (e) {
         console.error('Camera access failed:', e);
         showError('Camera access failed: ' + e.message);
@@ -178,57 +179,57 @@ async function pollForStudentWebrtc() {
 async function startWebRTC() {
     try {
         peerConnection = new RTCPeerConnection({
-            iceServers: [
-                { urls: 'stun:stun.l.google.com:19302' }
-            ]
+            iceServers: [{ urls: 'stun:stun.l.google.com:19302' }]
         });
-        
+
+        // Use separate named streams so the admin side can tell them apart.
+        // stream.id is set by us and IS readable on the remote side via event.streams[0].id
+        const screenMediaStream = new MediaStream();
+        screenMediaStream._label = 'screen'; // local hint only
+        const cameraMediaStream = new MediaStream();
+        cameraMediaStream._label = 'camera';
+
         if (screenStream) {
             screenStream.getTracks().forEach(track => {
-                track.id = 'screen-' + track.id;
-                peerConnection.addTrack(track, screenStream);
+                peerConnection.addTrack(track, screenMediaStream);
             });
         }
-        
+
         if (cameraStream) {
             cameraStream.getTracks().forEach(track => {
-                track.id = 'camera-' + track.id;
-                peerConnection.addTrack(track, cameraStream);
+                peerConnection.addTrack(track, cameraMediaStream);
             });
         }
-        
+
         peerConnection.onicecandidate = async (event) => {
             if (event.candidate) {
                 try {
                     await fetch(`/lab/api/session/${sessionId}/webrtc/ice/`, {
                         method: 'POST',
-                        headers: {
-                            'X-CSRFToken': csrftoken,
-                            'Content-Type': 'application/json'
-                        },
-                        body: JSON.stringify({
-                            candidate: event.candidate,
-                            role: 'student'
-                        })
+                        headers: { 'X-CSRFToken': csrftoken, 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ candidate: event.candidate, role: 'student' })
                     });
                 } catch (e) {
                     console.error('Error sending ICE candidate:', e);
                 }
             }
         };
-        
+
         const offer = await peerConnection.createOffer();
         await peerConnection.setLocalDescription(offer);
-        
+
+        // Embed stream labels in the SDP so the admin side knows which is which.
+        // We pass them as metadata alongside the offer.
         await fetch(`/lab/api/session/${sessionId}/webrtc/offer/`, {
             method: 'POST',
-            headers: {
-                'X-CSRFToken': csrftoken,
-                'Content-Type': 'application/json'
-            },
-            body: JSON.stringify({ offer: peerConnection.localDescription })
+            headers: { 'X-CSRFToken': csrftoken, 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                offer: peerConnection.localDescription,
+                screen_stream_id: screenMediaStream.id,
+                camera_stream_id: cameraMediaStream.id,
+            })
         });
-        
+
         console.log('WebRTC offer sent');
     } catch (e) {
         console.error('WebRTC setup failed:', e);
@@ -275,17 +276,16 @@ async function captureScreen() {
 }
 
 async function captureCamera() {
-    if (!cameraStream || !sessionId) {
-        console.log('Skipping camera capture: missing stream or sessionId');
-        return;
-    }
+    if (!cameraStream || !sessionId) return;
+    // Don't capture if video hasn't loaded yet
+    if (!cameraPreview.videoWidth || cameraPreview.videoWidth === 0) return;
     try {
         const canvas = document.createElement('canvas');
         canvas.width = 640;
         canvas.height = 480;
         const ctx = canvas.getContext('2d');
         ctx.drawImage(cameraPreview, 0, 0, canvas.width, canvas.height);
-        const imageB64 = canvas.toDataURL('image/jpeg', 0.6);
+        const imageB64 = canvas.toDataURL('image/jpeg', 0.8);  // higher quality for better detection
         
         console.log('Capturing camera frame');
         

@@ -16,6 +16,12 @@ from .models import Student, Camera, AttendanceLog
 from .forms import StudentForm, CameraForm
 
 
+def csrf_failure(request, reason=""):
+    """Handle CSRF failures and redirect to login with error message."""
+    messages.error(request, 'Session expired or invalid. Please login again.')
+    return redirect('login')
+
+
 def login_view(request):
     if request.user.is_authenticated:
         try:

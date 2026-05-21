@@ -12,6 +12,8 @@ class LabSession(models.Model):
     webrtc_answer = models.JSONField(null=True, blank=True)
     webrtc_ice_candidates_student = models.JSONField(default=list, blank=True)
     webrtc_ice_candidates_admin = models.JSONField(default=list, blank=True)
+    webrtc_screen_stream_id = models.CharField(max_length=100, blank=True, default='')
+    webrtc_camera_stream_id = models.CharField(max_length=100, blank=True, default='')
 
     class Meta:
         ordering = ['-start_time']

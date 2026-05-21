@@ -25,8 +25,19 @@ from datetime import datetime
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-# Suppress TensorFlow warnings
-os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
+# ── GPU / TensorFlow configuration ────────────────────────────────────────────
+os.environ.setdefault('TF_FORCE_GPU_ALLOW_GROWTH', 'true')
+os.environ.setdefault('TF_CPP_MIN_LOG_LEVEL', '2')
+os.environ.setdefault('TF_ENABLE_ONEDNN_OPTS', '0')
+
+# Report GPU availability at startup
+try:
+    if cv2.cuda.getCudaEnabledDeviceCount() > 0:
+        print(f"[GPU] OpenCV CUDA enabled — {cv2.cuda.getCudaEnabledDeviceCount()} device(s)")
+    else:
+        print("[GPU] No CUDA GPU for OpenCV, using CPU")
+except Exception:
+    pass
 
 try:
     from deepface import DeepFace
@@ -111,8 +122,25 @@ def run_detection(camera_url, camera_id, server_url, cooldown_seconds=30):
     cooldown_seconds: minimum time between logging the same student (unused, using frame-based detection instead)
     """
     print("[INFO] Initializing face detection...")
-    
-    face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
+
+    # DNN face detector — far more robust than Haar cascade for IP cameras
+    # Uses OpenCV's built-in res10_300x300 SSD model (no extra download needed)
+    dnn_model = os.path.join(cv2.data.haarcascades,
+                             '..', 'dnn', 'face_detector',
+                             'opencv_face_detector_uint8.pb')
+    dnn_config = os.path.join(cv2.data.haarcascades,
+                              '..', 'dnn', 'face_detector',
+                              'opencv_face_detector.pbtxt')
+
+    face_net = None
+    if os.path.exists(dnn_model) and os.path.exists(dnn_config):
+        face_net = cv2.dnn.readNetFromTensorflow(dnn_model, dnn_config)
+        print("[INFO] Using DNN face detector")
+    else:
+        # Fallback: Haar cascade with relaxed params
+        face_cascade = cv2.CascadeClassifier(
+            cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
+        print("[INFO] Using Haar cascade face detector (DNN model not found)")
 
     # Try to open camera with timeout
     print(f"[INFO] Attempting to open camera: {camera_url}")
@@ -151,13 +179,18 @@ def run_detection(camera_url, camera_id, server_url, cooldown_seconds=30):
     
     known_students = load_known_faces(server_url)
     print(f"[INFO] Loaded {len(known_students)} student profiles")
-    
-    # Debug: Show which students have encodings
-    if known_students:
-        for s in known_students[:3]:  # Show first 3
-            print(f"  - {s['name']} (ID: {s['id']}, encoding length: {len(json.loads(s['encoding']))})")
-    else:
-        print("[WARN] No students with face encodings found! Did you upload photos and run generate_face_encodings?")
+
+    # Retry loading encodings if server was unreachable at startup
+    if not known_students:
+        print("[WARN] No encodings loaded — retrying every 10s for up to 2 minutes...")
+        for _ in range(12):
+            time.sleep(10)
+            known_students = load_known_faces(server_url)
+            if known_students:
+                print(f"[INFO] Loaded {len(known_students)} student profiles on retry")
+                break
+        else:
+            print("[ERROR] Could not load student encodings after retries. Attendance will not be marked.")
 
     print(f"[INFO] Camera stream opened. Starting detection loop…")
     last_logged = {}  # student_id -> timestamp of last log
@@ -174,58 +207,94 @@ def run_detection(camera_url, camera_id, server_url, cooldown_seconds=30):
             continue
 
         frame_count += 1
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        faces = face_cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(80, 80))
+
+        # ── Face detection ────────────────────────────────────────────────────
+        faces = []  # list of (x, y, w, h)
+        h_frame, w_frame = frame.shape[:2]
+
+        if face_net is not None:
+            blob = cv2.dnn.blobFromImage(frame, 1.0, (300, 300),
+                                         (104.0, 177.0, 123.0), swapRB=False)
+            face_net.setInput(blob)
+            detections = face_net.forward()
+            for i in range(detections.shape[2]):
+                confidence = detections[0, 0, i, 2]
+                if confidence > 0.5:
+                    box = detections[0, 0, i, 3:7] * np.array(
+                        [w_frame, h_frame, w_frame, h_frame])
+                    x1, y1, x2, y2 = box.astype(int)
+                    x1, y1 = max(0, x1), max(0, y1)
+                    x2, y2 = min(w_frame, x2), min(h_frame, y2)
+                    if x2 > x1 and y2 > y1:
+                        faces.append((x1, y1, x2 - x1, y2 - y1))
+        else:
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            # Relaxed params: smaller minSize, lower minNeighbors
+            detected = face_cascade.detectMultiScale(
+                gray, scaleFactor=1.05, minNeighbors=3, minSize=(40, 40))
+            if len(detected) > 0:
+                faces = list(detected)
+
+        # Reload student encodings every 5 minutes, or immediately if still empty
+        if frame_count % 9000 == 0 or (not known_students and frame_count % 300 == 0):
+            fresh = load_known_faces(server_url)
+            if fresh:
+                known_students = fresh
+                print(f"[INFO] Loaded {len(known_students)} student profiles")
+            elif not known_students and frame_count % 300 == 0:
+                print(f"[WARN] Still no student encodings — retrying...")
 
         # Print stats every 30 frames
         if frame_count % 30 == 0:
             print(f"[DEBUG] Processed {frame_count} frames, detected {detected_faces} faces so far")
 
+        # ── Batch encode all faces in this frame at once ─────────────────────
+        # Pass the full RGB frame + known locations to face_recognition.
+        # face_recognition expects locations as (top, right, bottom, left) — CSS order.
+        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        face_locations_css = []  # (top, right, bottom, left)
+        for (x, y, w, h) in faces:
+            face_locations_css.append((y, x + w, y + h, x))
+
+        frame_encodings = []
+        if FACE_RECOGNITION_AVAILABLE and known_students and face_locations_css:
+            try:
+                frame_encodings = face_recognition.face_encodings(
+                    rgb_frame, known_face_locations=face_locations_css, num_jitters=1)
+            except Exception as e:
+                print(f"[ERROR] Batch encoding failed: {e}")
+
         # Track detected faces in this frame
         detected_in_this_frame = set()
 
-        for (x, y, w, h) in faces:
+        for idx, (x, y, w, h) in enumerate(faces):
             detected_faces += 1
             face_roi = frame[y:y+h, x:x+w]
 
             # Match face to student
             matched_student_id = None
             matched_distance = 1.0
-            
+
             if FACE_RECOGNITION_AVAILABLE and known_students:
-                try:
-                    rgb_face = cv2.cvtColor(face_roi, cv2.COLOR_BGR2RGB)
-                    encodings = face_recognition.face_encodings(rgb_face)
-                    
-                    if encodings:
-                        query_enc = encodings[0]
-                        
-                        # Find closest match
-                        best_distance = 1.0
-                        best_student_id = None
-                        
-                        for student in known_students:
-                            try:
-                                known_enc = np.array(json.loads(student['encoding']))
-                                dist = face_recognition.face_distance([known_enc], query_enc)[0]
-                                
-                                if dist < best_distance:
-                                    best_distance = dist
-                                    best_student_id = student['id']
-                                    matched_distance = dist
-                            except Exception as e:
-                                print(f"[WARN] Error matching {student['name']}: {e}")
-                        
-                        # Use lower threshold (0.6 is more permissive than 0.5)
-                        if best_distance < 0.6:
-                            matched_student_id = best_student_id
-                    else:
-                        print(f"[WARN] No face encoding extracted from frame region")
-                        
-                except Exception as e:
-                    print(f"[ERROR] Face matching error: {e}")
+                query_enc = frame_encodings[idx] if idx < len(frame_encodings) else None
+                if query_enc is not None:
+                    best_distance = 1.0
+                    best_student_id = None
+                    for student in known_students:
+                        try:
+                            known_enc = np.array(json.loads(student['encoding']))
+                            dist = face_recognition.face_distance([known_enc], query_enc)[0]
+                            if dist < best_distance:
+                                best_distance = dist
+                                best_student_id = student['id']
+                                matched_distance = dist
+                        except Exception as e:
+                            print(f"[WARN] Error matching {student['name']}: {e}")
+                    if best_distance < 0.6:
+                        matched_student_id = best_student_id
+                else:
+                    print(f"[WARN] No encoding for face at ({x},{y})")
             elif not known_students:
-                print("[ERROR] No students with face encodings. Check admin panel.")
                 continue
 
             if matched_student_id is None:

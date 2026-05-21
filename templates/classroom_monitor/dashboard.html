@@ -1,0 +1,249 @@
+{% extends "entrance_cam/base.html" %}
+{% block title %}Classroom Dashboard{% endblock %}
+{% block page_title %}Classroom Engagement Monitor{% endblock %}
+{% block content %}
+<div class="row mb-4">
+  <div class="col-xl-8">
+    <div class="form-card">
+      <div class="section-hdr">
+        <h5><i class="bi bi-play-circle me-2" style="color:#0891b2"></i>Start New Session</h5>
+      </div>
+      <div class="row g-3">
+        <div class="col-md-4">
+          <select id="camera-select" class="form-select">
+            <option value="">Select Camera...</option>
+            {% for cam in cameras %}
+            <option value="{{ cam.pk }}">{{ cam.name }}</option>
+            {% endfor %}
+          </select>
+        </div>
+        <div class="col-md-3">
+          <input type="text" id="subject-input" class="form-control" placeholder="Subject">
+        </div>
+        <div class="col-md-3">
+          <input type="text" id="teacher-input" class="form-control" placeholder="Teacher">
+        </div>
+        <div class="col-md-2">
+          <button onclick="startSession()" class="btn w-100" style="background:#0891b2;color:#fff;border:none;border-radius:8px">
+            <i class="bi bi-play-fill me-1"></i>Start
+          </button>
+        </div>
+      </div>
+    </div>
+  </div>
+  <div class="col-xl-4">
+    <div class="stat-card h-100">
+      <div class="d-flex align-items-center justify-content-between">
+        <div>
+          <div class="stat-label mb-1">Active Sessions</div>
+          <div class="stat-val">{{ active_sessions.count }}</div>
+        </div>
+        <div class="stat-icon" style="background:#cffafe">
+          <i class="bi bi-easel2" style="color:#0891b2"></i>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="row g-3">
+  {% for session in active_sessions %}
+  <div class="col-xl-6">
+    <div class="stat-card" id="session-card-{{ session.pk }}">
+      <div class="d-flex align-items-start justify-content-between mb-3">
+        <div>
+          <h6 class="fw-700 mb-1" style="color:#1e293b">{{ session.camera.name }}</h6>
+          <div class="small text-muted mb-1">{{ session.subject|default:"No Subject" }} • {{ session.teacher|default:"No Teacher" }}</div>
+          <div class="small text-muted"><i class="bi bi-clock me-1"></i><span id="duration-{{ session.pk }}">0m</span></div>
+        </div>
+        <span class="emotion-badge" style="background:#dcfce7;color:#166534">
+          <span class="dot-online"></span>Live
+        </span>
+      </div>
+      
+      <div class="row align-items-center">
+        <div class="col-md-4 text-center">
+          <svg width="120" height="120" viewBox="0 0 120 120" class="mb-2">
+            <circle cx="60" cy="60" r="50" stroke="#e2e8f0" stroke-width="10" fill="none"/>
+            <circle id="ring-{{ session.pk }}" cx="60" cy="60" r="50" stroke="#22c55e" stroke-width="10" fill="none"
+                    stroke-linecap="round" transform="rotate(-90 60 60)"
+                    stroke-dasharray="314.16" stroke-dashoffset="314.16"/>
+          </svg>
+          <div class="fw-700" id="score-{{ session.pk }}" style="color:#1e293b">--%</div>
+          <div class="small text-muted">Engagement</div>
+        </div>
+        <div class="col-md-8">
+          {% if session.snapshots.first %}
+          <img id="snapshot-{{ session.pk }}" src="{{ session.snapshots.first.frame_image.url }}" 
+               class="img-fluid rounded" style="max-height:180px;object-fit:cover">
+          {% else %}
+          <div class="text-center py-4 text-muted" style="background:#f1f5f9;border-radius:12px">
+            <i class="bi bi-image fs-2 d-block mb-2 opacity-30"></i>
+            Waiting for first snapshot...
+          </div>
+          {% endif %}
+        </div>
+      </div>
+      
+      <div class="d-flex gap-2 mt-4 pt-3" style="border-top:1px solid #e2e8f0">
+        <button class="btn flex-fill" style="background:#f1f5f9;color:#475569;border:none;border-radius:8px"
+                data-bs-toggle="modal" data-bs-target="#liveModal{{ session.pk }}">
+          <i class="bi bi-broadcast-pin me-1"></i>Live Feed
+        </button>
+        <a href="{% url 'classroom_session_detail' session.pk %}" class="btn flex-fill" style="background:#cffafe;color:#0891b2;border:none;border-radius:8px">
+          <i class="bi bi-eye me-1"></i>Detail
+        </a>
+        <button onclick="endSession({{ session.pk }})" class="btn" style="background:#fee2e2;color:#dc2626;border:none;border-radius:8px">
+          <i class="bi bi-stop-fill"></i>
+        </button>
+      </div>
+    </div>
+    
+    <div class="modal fade" id="liveModal{{ session.pk }}" tabindex="-1">
+      <div class="modal-dialog modal-xl">
+        <div class="modal-content" style="background:#000">
+          <div class="modal-header" style="border:none">
+            <h5 class="modal-title text-white">
+              Live — {{ session.camera.name }} | {{ session.subject }}
+            </h5>
+            <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal"></button>
+          </div>
+          <div class="modal-body p-0">
+            <img src="{% url 'classroom_live_stream' session.camera.pk %}"
+                 style="width:100%;max-height:70vh;object-fit:contain"
+                 id="modal-feed-{{ session.pk }}">
+          </div>
+          <div class="modal-footer" style="border:none;background:#111">
+            <span class="text-white small">
+              Engagement: <strong id="modal-score-{{ session.pk }}">--</strong>%
+            </span>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+  {% empty %}
+  <div class="col-12">
+    <div class="form-card text-center py-5">
+      <i class="bi bi-easel2 fs-1 d-block mb-3 opacity-20"></i>
+      <h5 class="fw-700 text-muted">No Active Sessions</h5>
+      <p class="text-muted">Start a new session above to begin monitoring engagement.</p>
+    </div>
+  </div>
+  {% endfor %}
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+const startTimeMap = {};
+{% for session in active_sessions %}
+startTimeMap[{{ session.pk }}] = new Date("{{ session.start_time|date:'c' }}");
+{% endfor %}
+
+function updateDurations() {
+  Object.keys(startTimeMap).forEach(id => {
+    const start = startTimeMap[id];
+    const now = new Date();
+    const diff = Math.floor((now - start) / 60000);
+    const el = document.getElementById(`duration-${id}`);
+    if (el) {
+      if (diff < 60) {
+        el.textContent = `${diff}m`;
+      } else {
+        const h = Math.floor(diff / 60);
+        const m = diff % 60;
+        el.textContent = `${h}h ${m}m`;
+      }
+    }
+  });
+}
+
+function startSession() {
+  const cameraId = document.getElementById('camera-select').value;
+  const subject = document.getElementById('subject-input').value;
+  const teacher = document.getElementById('teacher-input').value;
+  if (!cameraId) { alert('Please select a camera'); return; }
+  fetch('/classroom/session/start/', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'X-CSRFToken': csrftoken },
+    body: JSON.stringify({ camera_id: parseInt(cameraId), subject, teacher })
+  })
+  .then(r => { if (!r.ok) return r.text().then(t => { throw new Error(t); }); return r.json(); })
+  .then(d => { location.reload(); })
+  .catch(e => { console.error('startSession error:', e); alert('Failed to start session. Check console for details.'); });
+}
+
+function endSession(sessionId) {
+  if (!confirm('End this session?')) return;
+  fetch('/classroom/session/end/', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'X-CSRFToken': csrftoken },
+    body: JSON.stringify({ session_id: sessionId })
+  })
+  .then(r => { if (!r.ok) return r.text().then(t => { throw new Error(t); }); return r.json(); })
+  .then(d => { location.reload(); })
+  .catch(e => { console.error('endSession error:', e); alert('Failed to end session. Check console for details.'); });
+}
+
+function updateSessionStats() {
+  {% for session in active_sessions %}
+  fetch(`/classroom/api/stats/{{ session.pk }}/`)
+    .then(r => r.json())
+    .then(d => {
+      if (d.stats.length > 0) {
+        const latest = d.stats[d.stats.length - 1];
+        const score = latest.engagement_score;
+        
+        const ring = document.getElementById(`ring-{{ session.pk }}`);
+        const scoreEl = document.getElementById(`score-{{ session.pk }}`);
+        const modalScoreEl = document.getElementById(`modal-score-{{ session.pk }}`);
+        
+        if (ring && scoreEl) {
+          const offset = 314.16 - (314.16 * score / 100);
+          ring.style.strokeDashoffset = offset;
+          if (score >= 70) ring.style.stroke = '#22c55e';
+          else if (score >= 40) ring.style.stroke = '#eab308';
+          else ring.style.stroke = '#ef4444';
+          
+          scoreEl.textContent = score.toFixed(0) + '%';
+          if (modalScoreEl) modalScoreEl.textContent = score.toFixed(0);
+        }
+      }
+    });
+  {% endfor %}
+}
+
+function getCookie(name) {
+  let cookieValue = null;
+  if (document.cookie && document.cookie !== '') {
+    const cookies = document.cookie.split(';');
+    for (let i = 0; i < cookies.length; i++) {
+      const cookie = cookies[i].trim();
+      if (cookie.substring(0, name.length + 1) === (name + '=')) {
+        cookieValue = decodeURIComponent(cookie.substring(name.length + 1));
+        break;
+      }
+    }
+  }
+  return cookieValue;
+}
+const csrftoken = document.querySelector('meta[name="csrf-token"]')?.content || getCookie('csrftoken');
+
+{% for session in active_sessions %}
+document.getElementById('liveModal{{ session.pk }}').addEventListener('hidden.bs.modal', function() {
+  const img = document.getElementById('modal-feed-{{ session.pk }}');
+  img.src = '';
+});
+document.getElementById('liveModal{{ session.pk }}').addEventListener('shown.bs.modal', function() {
+  const img = document.getElementById('modal-feed-{{ session.pk }}');
+  img.src = "{% url 'classroom_live_stream' session.camera.pk %}";
+});
+{% endfor %}
+
+setInterval(updateDurations, 1000);
+setInterval(updateSessionStats, 30000);
+updateDurations();
+setTimeout(updateSessionStats, 500);
+</script>
+{% endblock %}
