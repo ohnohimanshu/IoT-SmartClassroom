@@ -1,0 +1,154 @@
+{% extends "entrance_cam/base.html" %}
+{% block title %}Video Analysis - {{ video.title }}{% endblock %}
+{% block page_title %}Video Analysis{% endblock %}
+{% block content %}
+
+<!-- Header -->
+<div class="row mb-3"><div class="col-12"><div class="form-card">
+  <div class="d-flex align-items-center justify-content-between flex-wrap gap-2">
+    <div>
+      <h5 class="fw-700 mb-1" style="color:#1e293b">{{ video.title }}</h5>
+      <div class="text-muted small">
+        <i class="bi bi-calendar3 me-1"></i>{{ video.uploaded_at|date:"M d, Y H:i" }}
+        <span class="mx-2">|</span>
+        <i class="bi bi-clock me-1"></i>{{ video.duration_seconds|default:0 }}s
+        <span class="mx-2">|</span>
+        {% if video.status == "completed" %}<span class="text-success fw-600"><i class="bi bi-check-circle me-1"></i>Complete</span>
+        {% elif video.status == "processing" %}<span class="text-warning fw-600"><i class="bi bi-hourglass-split me-1"></i>Processing...</span>
+        {% else %}<span class="text-danger fw-600"><i class="bi bi-x-circle me-1"></i>Failed</span>{% endif %}
+      </div>
+    </div>
+    <div class="d-flex gap-2">
+      <button id="btn-live" onclick="startLive()" class="btn btn-sm" style="background:#0891b2;color:#fff;border:none;border-radius:8px">
+        <i class="bi bi-play-fill me-1"></i>Play Live
+      </button>
+      <button id="btn-stop" onclick="stopLive()" class="btn btn-sm d-none" style="background:#dc2626;color:#fff;border:none;border-radius:8px">
+        <i class="bi bi-stop-fill me-1"></i>Stop
+      </button>
+      <a href="{% url 'classroom_video_list' %}" class="btn btn-sm" style="background:#f1f5f9;color:#475569;border:none;border-radius:8px">
+        <i class="bi bi-arrow-left me-1"></i>Back
+      </a>
+    </div>
+  </div>
+</div></div></div>
+
+<div class="row g-3">
+
+  <!-- Live stream viewer -->
+  <div class="col-xl-8">
+    <div class="stat-card h-100">
+      <div class="d-flex align-items-center justify-content-between mb-3">
+        <h6 class="fw-700 mb-0" style="color:#1e293b"><i class="bi bi-camera-video me-2" style="color:#0891b2"></i>Live Engagement View</h6>
+        <span class="small text-muted">
+          <span class="d-inline-block me-1" style="width:12px;height:12px;background:#00dc50;border-radius:2px"></span>Focused
+          <span class="d-inline-block ms-2 me-1" style="width:12px;height:12px;background:#1e1edc;border-radius:2px"></span>Head Down
+          <span class="d-inline-block ms-2 me-1" style="width:12px;height:12px;background:#00b4ff;border-radius:2px"></span>Looking Away
+        </span>
+      </div>
+
+      <!-- Stream container -->
+      <div style="background:#0f172a;border-radius:12px;overflow:hidden;position:relative;min-height:320px">
+        <img id="live-img" src="" alt="" style="width:100%;display:none;max-height:460px;object-fit:contain">
+        <div id="live-placeholder" style="position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center">
+          <i class="bi bi-play-circle" style="font-size:3.5rem;color:#475569"></i>
+          <div class="mt-2" style="color:#94a3b8">Press Play Live to start the annotated stream</div>
+          <div class="mt-1 small" style="color:#64748b">Green = Focused &nbsp; Red = Head Down &nbsp; Yellow = Looking Away</div>
+        </div>
+        <div id="live-spinner" class="d-none" style="position:absolute;inset:0;display:flex;align-items:center;justify-content:center;background:rgba(15,23,42,0.7)">
+          <div class="spinner-border text-info" role="status"></div>
+          <span class="ms-3" style="color:#94a3b8">Loading detector...</span>
+        </div>
+      </div>
+
+      <div class="mt-3 p-3 rounded-3 small text-muted" style="background:#f8fafc">
+        <i class="bi bi-info-circle me-1"></i>
+        The stream runs YOLO11s + MediaPipe on every frame in real time.
+        First load takes ~5s while the model initialises.
+      </div>
+    </div>
+  </div>
+
+  <!-- Summary + chart -->
+  <div class="col-xl-4">
+    <div class="stat-card mb-3">
+      <h6 class="fw-700 mb-3" style="color:#1e293b"><i class="bi bi-bar-chart me-2"></i>Analysis Summary</h6>
+      <div class="row g-2 text-center">
+        <div class="col-6"><div class="p-3 rounded-3" style="background:#f0fdf4"><div class="fw-700 fs-5" style="color:#16a34a">{{ video.average_engagement_score|default:0|floatformat:1 }}%</div><div class="small text-muted">Avg Engagement</div></div></div>
+        <div class="col-6"><div class="p-3 rounded-3" style="background:#f0f9ff"><div class="fw-700 fs-5" style="color:#0891b2">{{ video.total_frames_analyzed }}</div><div class="small text-muted">Frames Analyzed</div></div></div>
+        <div class="col-6"><div class="p-3 rounded-3" style="background:#f0fdf4"><div class="fw-700 fs-5" style="color:#16a34a">{{ video.total_students_detected }}</div><div class="small text-muted">Avg Students</div></div></div>
+        <div class="col-6"><div class="p-3 rounded-3" style="background:#f8fafc"><div class="fw-700 fs-5" style="color:#64748b">{{ video.duration_seconds|default:0 }}s</div><div class="small text-muted">Duration</div></div></div>
+      </div>
+    </div>
+
+    <div class="stat-card">
+      <h6 class="fw-700 mb-1" style="color:#1e293b"><i class="bi bi-graph-up me-2"></i>Engagement Timeline</h6>
+      <p class="small text-muted mb-2">From the pre-processed analysis.</p>
+      <canvas id="engagementChart" style="max-height:220px"></canvas>
+      <div class="d-flex gap-3 mt-2 small text-muted justify-content-center">
+        <span><span style="display:inline-block;width:10px;height:10px;background:#22c55e;border-radius:50%;margin-right:4px"></span>High</span>
+        <span><span style="display:inline-block;width:10px;height:10px;background:#eab308;border-radius:50%;margin-right:4px"></span>Mid</span>
+        <span><span style="display:inline-block;width:10px;height:10px;background:#ef4444;border-radius:50%;margin-right:4px"></span>Low</span>
+      </div>
+    </div>
+  </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+<script>
+const VIDEO_PK = {{ video.pk }};
+const STREAM_URL = "{% url 'classroom_video_stream' video.pk %}";
+let chart = null;
+
+// ── Live stream controls ──────────────────────────────────────────────────
+function startLive() {
+  const img = document.getElementById("live-img");
+  const ph  = document.getElementById("live-placeholder");
+  const sp  = document.getElementById("live-spinner");
+  ph.style.display = "none";
+  sp.classList.remove("d-none"); sp.style.display = "flex";
+  img.onload = () => { sp.style.display = "none"; img.style.display = "block"; };
+  img.onerror = () => { sp.style.display = "none"; ph.style.display = "flex"; };
+  img.src = STREAM_URL;
+  document.getElementById("btn-live").classList.add("d-none");
+  document.getElementById("btn-stop").classList.remove("d-none");
+}
+
+function stopLive() {
+  const img = document.getElementById("live-img");
+  img.src = ""; img.style.display = "none";
+  document.getElementById("live-placeholder").style.display = "flex";
+  document.getElementById("live-spinner").style.display = "none";
+  document.getElementById("btn-live").classList.remove("d-none");
+  document.getElementById("btn-stop").classList.add("d-none");
+}
+
+// ── Engagement chart from pre-processed data ──────────────────────────────
+function loadChart() {
+  fetch(`/classroom/api/video/${VIDEO_PK}/`)
+    .then(r => r.json())
+    .then(d => {
+      const frames = d.frames || [];
+      if (!frames.length) return;
+      const labels = frames.map(f => f.timestamp.toFixed(0) + "s");
+      const scores = frames.map(f => f.engagement_score);
+      const colors = scores.map(s => s >= 70 ? "#22c55e" : s >= 40 ? "#eab308" : "#ef4444");
+      const ctx = document.getElementById("engagementChart").getContext("2d");
+      if (chart) chart.destroy();
+      chart = new Chart(ctx, {
+        type: "bar",
+        data: { labels, datasets: [{ label: "Engagement %", data: scores, backgroundColor: colors, borderRadius: 4, borderSkipped: false }] },
+        options: {
+          responsive: true,
+          plugins: { legend: { display: false }, tooltip: { callbacks: { label: c => " " + c.raw.toFixed(1) + "%" } } },
+          scales: { y: { min: 0, max: 100, ticks: { stepSize: 25 }, grid: { color: "#f1f5f9" } }, x: { ticks: { maxTicksLimit: 10 }, grid: { display: false } } }
+        }
+      });
+    })
+    .catch(e => console.error("loadChart:", e));
+}
+
+loadChart();
+</script>
+{% endblock %}

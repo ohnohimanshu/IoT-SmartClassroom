@@ -3,21 +3,16 @@ Entrance Camera Detection Script
 ---------------------------------
 Run this separately on the machine connected to the camera:
     python detection_script.py --camera-id 1 --server http://localhost:8000
-
-It will:
-1. Open the camera stream (IP URL or webcam index)
-2. Detect faces using OpenCV + DeepFace
-3. Match against known student face encodings
-4. POST entry/exit events to Django via /api/log/
 """
 
-import cv2
+# ── Lightweight imports only at module level ──────────────────────────────────
+# Heavy ML libs (deepface, face_recognition, cv2) are imported lazily inside
+# run_detection() so the StatReloader doesn't hang for 30+ seconds on startup.
 import json
 import time
 import base64
 import argparse
 import requests
-import numpy as np
 import sys
 import os
 import urllib3
@@ -25,33 +20,54 @@ from datetime import datetime
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-# ── GPU / TensorFlow configuration ────────────────────────────────────────────
+# GPU / TensorFlow env vars — set before any TF import
 os.environ.setdefault('TF_FORCE_GPU_ALLOW_GROWTH', 'true')
 os.environ.setdefault('TF_CPP_MIN_LOG_LEVEL', '2')
 os.environ.setdefault('TF_ENABLE_ONEDNN_OPTS', '0')
 
-# Report GPU availability at startup
-try:
-    if cv2.cuda.getCudaEnabledDeviceCount() > 0:
-        print(f"[GPU] OpenCV CUDA enabled — {cv2.cuda.getCudaEnabledDeviceCount()} device(s)")
-    else:
-        print("[GPU] No CUDA GPU for OpenCV, using CPU")
-except Exception:
-    pass
+# These are set to None here and populated lazily inside run_detection()
+cv2 = None
+np = None
+DeepFace = None
+face_recognition = None
+DEEPFACE_AVAILABLE = False
+FACE_RECOGNITION_AVAILABLE = False
 
-try:
-    from deepface import DeepFace
-    DEEPFACE_AVAILABLE = True
-except ImportError:
-    print("[WARN] DeepFace not installed. Emotion detection disabled.")
-    DEEPFACE_AVAILABLE = False
 
-try:
-    import face_recognition
-    FACE_RECOGNITION_AVAILABLE = True
-except ImportError:
-    print("[WARN] face_recognition not installed. Using OpenCV fallback.")
-    FACE_RECOGNITION_AVAILABLE = False
+def _load_heavy_deps():
+    """Import cv2, numpy, deepface, face_recognition — called once at detection start."""
+    global cv2, np, DeepFace, face_recognition, DEEPFACE_AVAILABLE, FACE_RECOGNITION_AVAILABLE
+
+    import cv2 as _cv2
+    import numpy as _np
+    cv2 = _cv2
+    np = _np
+
+    try:
+        if cv2.cuda.getCudaEnabledDeviceCount() > 0:
+            print(f"[GPU] OpenCV CUDA enabled — {cv2.cuda.getCudaEnabledDeviceCount()} device(s)")
+        else:
+            print("[GPU] No CUDA GPU for OpenCV, using CPU")
+    except Exception:
+        pass
+
+    try:
+        from deepface import DeepFace as _DF
+        DeepFace = _DF
+        DEEPFACE_AVAILABLE = True
+        print("[INFO] DeepFace available: True")
+    except ImportError:
+        print("[WARN] DeepFace not installed. Emotion detection disabled.")
+        DEEPFACE_AVAILABLE = False
+
+    try:
+        import face_recognition as _fr
+        face_recognition = _fr
+        FACE_RECOGNITION_AVAILABLE = True
+        print("[INFO] face_recognition available: True")
+    except ImportError:
+        print("[WARN] face_recognition not installed.")
+        FACE_RECOGNITION_AVAILABLE = False
 
 
 def load_known_faces(server_url):
@@ -124,6 +140,8 @@ def run_detection(camera_url, camera_id, server_url, cooldown_seconds=30):
     - EXIT:  student absent from frame for EXIT_ABSENCE_FRAMES consecutive frames.
              We keep the last known face crop so we can send a real exit-emotion snapshot.
     """
+    print("[INFO] Loading ML dependencies (cv2, DeepFace, face_recognition)...")
+    _load_heavy_deps()
     print("[INFO] Initializing face detection...")
 
     # ── How many consecutive absent frames before we treat it as an exit ──────

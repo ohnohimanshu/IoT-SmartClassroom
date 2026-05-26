@@ -21,18 +21,6 @@ def _quiet_excepthook(exc_type, exc_value, exc_tb):
 sys.excepthook = _quiet_excepthook
 
 
-_original_log_exception = WSGIRequestHandler.log_message.__func__ if hasattr(WSGIRequestHandler.log_message, '__func__') else None
-
-
-def _handle_request_noisy(self):
-    try:
-        self.handle_one_request()
-    except (BrokenPipeError, ConnectionResetError, ssl.SSLEOFError):
-        pass
-    except Exception:
-        raise
-
-
 # Patch the low-level handle() method from BaseHTTPRequestHandler
 import http.server as _http
 

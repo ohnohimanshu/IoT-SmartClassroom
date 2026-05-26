@@ -21,4 +21,12 @@ urlpatterns = [
 
     path('live/', views.live_monitor, name='classroom_live_monitor'),
     path('live/<int:camera_id>/', views.live_camera_detail, name='classroom_live_camera_detail'),
+    
+    # Video upload and analysis
+    path('videos/', views.video_list, name='classroom_video_list'),
+    path('videos/upload/', views.video_upload, name='classroom_video_upload'),
+    path('videos/<int:pk>/', views.video_detail, name='classroom_video_detail'),
+    path('videos/<int:pk>/delete/', views.video_delete, name='classroom_video_delete'),
+    path('videos/<int:pk>/stream/', views.video_live_stream, name='classroom_video_stream'),
+    path('api/video/<int:pk>/', views.api_video_analysis, name='classroom_api_video_analysis'),
 ]

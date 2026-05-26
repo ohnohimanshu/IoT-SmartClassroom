@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 from pathlib import Path
 import os
 import sys
@@ -110,6 +111,9 @@ CSRF_COOKIE_SECURE = _USE_SSL
 SESSION_COOKIE_HTTPONLY = True
 CSRF_COOKIE_HTTPONLY = False  # Must be False — JS needs to read this cookie for fetch/XHR requests
 CSRF_COOKIE_SAMESITE = 'Lax'
+
+# For runsslserver, use: python manage.py runsslserver 0.0.0.0:8000 --certificate cert.pem --key key.pem
+# Generate self-signed cert: openssl req -x509 -newkey rsa:4096 -keyout key.pem -out cert.pem -days 365 -nodes
 
 CSRF_TRUSTED_ORIGINS = [
     'http://127.0.0.1:8000',

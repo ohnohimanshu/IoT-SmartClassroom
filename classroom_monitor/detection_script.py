@@ -52,7 +52,10 @@ class EngagementDetector:
     def __init__(self):
         # YOLO — will automatically use GPU if CUDA is available
         from ultralytics import YOLO
-        self.yolo = YOLO("yolov8n.pt")
+        import os
+        # Use absolute path so the model is found whether called from views.py or CLI
+        model_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'yolo11s.pt')
+        self.yolo = YOLO(model_path)
 
         # Import here so mediapipe is accessed after full module load
         import mediapipe as mp
@@ -138,68 +141,194 @@ class EngagementDetector:
         horizontal = np.hypot(left_mouth.x - right_mouth.x, left_mouth.y - right_mouth.y)
         return vertical / (horizontal + 1e-6)
 
+    # COCO food & utensil class IDs
+    _FOOD_CLASSES = {
+        41: 'cup', 42: 'bowl', 43: 'fork', 44: 'knife', 45: 'spoon',
+        46: 'banana', 47: 'apple', 48: 'sandwich', 49: 'orange',
+        50: 'broccoli', 51: 'carrot', 52: 'hot dog', 53: 'pizza',
+        54: 'donut', 55: 'cake',
+    }
+
     def detect(self, frame):
         h, w = frame.shape[:2]
         results = []
 
-        yolo_results = self.yolo(frame, classes=[0], verbose=False)
+        # ── Single pass: persons + phones + food/utensils ─────────────────────
+        detect_classes = [0, 67] + list(self._FOOD_CLASSES.keys())
+        all_results = self.yolo(frame, classes=detect_classes, verbose=False, conf=0.15)
 
-        for result in yolo_results:
+        persons = []
+        phone_boxes = []
+        food_boxes = []
+
+        for result in all_results:
             for box in result.boxes:
+                cls = int(box.cls[0].cpu().numpy())
                 x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
-                confidence = float(box.conf[0].cpu().numpy())
+                conf = float(box.conf[0].cpu().numpy())
+                bbox = (int(x1), int(y1), int(x2), int(y2))
+                if cls == 0:
+                    persons.append({'bbox': bbox, 'confidence': conf})
+                elif cls == 67:
+                    phone_boxes.append(bbox)
+                    print(f"[PHONE] detected conf={conf:.2f}")
+                elif cls in self._FOOD_CLASSES:
+                    food_boxes.append(bbox)
+                    print(f"[FOOD] {self._FOOD_CLASSES[cls]} detected conf={conf:.2f}")
 
-                x_center = (x1 + x2) / 2
-                y_center = (y1 + y2) / 2
-                zone_id  = self.get_zone_id(x_center, y_center, w, h)
+        print(f"[DETECT] persons={len(persons)} phones={len(phone_boxes)} food={len(food_boxes)}")
 
-                crop = frame[int(y1):int(y2), int(x1):int(x2)]
-                if crop.size == 0:
-                    results.append({
-                        "zone_id": zone_id, "pose": "not_visible",
-                        "possibly_talking": False, "confidence": confidence,
-                        "bbox": (int(x1), int(y1), int(x2), int(y2)),
-                    })
-                    continue
+        # ── Helper: check if two boxes are "near" each other ─────────────────
+        def _boxes_near(b1, b2, expand=100):
+            """True if b2 is within `expand` pixels of b1 (expanded b1)."""
+            ax1, ay1, ax2, ay2 = b1
+            bx1, by1, bx2, by2 = b2
+            ax1e, ay1e = ax1 - expand, ay1 - expand
+            ax2e, ay2e = ax2 + expand, ay2 + expand
+            return not (bx2 < ax1e or bx1 > ax2e or by2 < ay1e or by1 > ay2e)
 
-                rgb_crop    = cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)
-                mp_img = self._mp.Image(image_format=self._mp.ImageFormat.SRGB,
-                                        data=np.ascontiguousarray(rgb_crop))
-                face_result = self.face_landmarker.detect(mp_img)
+        def _overlap_ratio(b1, b2):
+            """Fraction of b2 that overlaps with b1."""
+            ax1, ay1, ax2, ay2 = b1
+            bx1, by1, bx2, by2 = b2
+            ix1, iy1 = max(ax1, bx1), max(ay1, by1)
+            ix2, iy2 = min(ax2, bx2), min(ay2, by2)
+            if ix2 <= ix1 or iy2 <= iy1:
+                return 0.0
+            inter = (ix2 - ix1) * (iy2 - iy1)
+            b2_area = max(1, (bx2 - bx1) * (by2 - by1))
+            return inter / b2_area
 
-                if face_result.face_landmarks:
-                    lm   = face_result.face_landmarks[0]
-                    yaw, pitch = self.calculate_head_pose(lm, crop.shape)
-                    pose = self.classify_pose(yaw, pitch)
-                    mar  = self.calculate_mar(lm)
-                    results.append({
-                        "zone_id": zone_id, "pose": pose,
-                        "possibly_talking": mar > 0.3,
-                        "confidence": confidence,
-                        "bbox": (int(x1), int(y1), int(x2), int(y2)),
-                    })
-                else:
-                    results.append({
-                        "zone_id": zone_id, "pose": "not_visible",
-                        "possibly_talking": False, "confidence": confidence,
-                        "bbox": (int(x1), int(y1), int(x2), int(y2)),
-                    })
+        # ── Map phones to persons ─────────────────────────────────────────────
+        phone_person_indices = set()
+        for pb in phone_boxes:
+            for i, p in enumerate(persons):
+                bx1, by1, bx2, by2 = p['bbox']
+                expanded = (bx1, by1, bx2, by2 + 100)  # extend down for desk/lap
+                if _overlap_ratio(expanded, pb) > 0.30:
+                    phone_person_indices.add(i)
+                    print(f"[PHONE] mapped to person {i}")
+
+        # ── Map food to persons ───────────────────────────────────────────────
+        food_person_indices = set()
+        for fb in food_boxes:
+            for i, p in enumerate(persons):
+                if _boxes_near(p['bbox'], fb, expand=120):
+                    food_person_indices.add(i)
+                    print(f"[FOOD] mapped to person {i}")
+
+        # ── Fight detection: persons with high body overlap ───────────────────
+        # Two people "fighting" when their person boxes overlap significantly
+        # (bodies pressed together) — flag both
+        fight_person_indices = set()
+        for i in range(len(persons)):
+            for j in range(i + 1, len(persons)):
+                bi = persons[i]['bbox']
+                bj = persons[j]['bbox']
+                # Check overlap in both directions
+                ov_i = _overlap_ratio(bj, bi)
+                ov_j = _overlap_ratio(bi, bj)
+                if ov_i > 0.25 or ov_j > 0.25:
+                    fight_person_indices.add(i)
+                    fight_person_indices.add(j)
+                    print(f"[FIGHT] persons {i} and {j} overlap ov_i={ov_i:.2f} ov_j={ov_j:.2f}")
+
+        # ── Build results per person ──────────────────────────────────────────
+        # Priority: fight > phone > eating > head_pose
+        for i, person in enumerate(persons):
+            x1, y1, x2, y2 = person['bbox']
+            confidence = person['confidence']
+            x_center = (x1 + x2) / 2
+            y_center = (y1 + y2) / 2
+            zone_id = self.get_zone_id(x_center, y_center, w, h)
+
+            if i in fight_person_indices:
+                results.append({
+                    "zone_id": zone_id, "pose": "fighting",
+                    "possibly_talking": False, "confidence": confidence,
+                    "bbox": (x1, y1, x2, y2),
+                })
+                continue
+
+            if i in phone_person_indices:
+                results.append({
+                    "zone_id": zone_id, "pose": "using_phone",
+                    "possibly_talking": False, "confidence": confidence,
+                    "bbox": (x1, y1, x2, y2),
+                })
+                continue
+
+            if i in food_person_indices:
+                results.append({
+                    "zone_id": zone_id, "pose": "eating",
+                    "possibly_talking": False, "confidence": confidence,
+                    "bbox": (x1, y1, x2, y2),
+                })
+                continue
+
+            crop = frame[y1:y2, x1:x2]
+            if crop.size == 0:
+                results.append({
+                    "zone_id": zone_id, "pose": "not_visible",
+                    "possibly_talking": False, "confidence": confidence,
+                    "bbox": (x1, y1, x2, y2),
+                })
+                continue
+
+            rgb_crop = cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)
+            mp_img = self._mp.Image(image_format=self._mp.ImageFormat.SRGB,
+                                    data=np.ascontiguousarray(rgb_crop))
+            face_result = self.face_landmarker.detect(mp_img)
+
+            if face_result.face_landmarks:
+                lm = face_result.face_landmarks[0]
+                yaw, pitch = self.calculate_head_pose(lm, crop.shape)
+                pose = self.classify_pose(yaw, pitch)
+                mar = self.calculate_mar(lm)
+                results.append({
+                    "zone_id": zone_id, "pose": pose,
+                    "possibly_talking": mar > 0.3,
+                    "confidence": confidence,
+                    "bbox": (x1, y1, x2, y2),
+                })
+            else:
+                results.append({
+                    "zone_id": zone_id, "pose": "not_visible",
+                    "possibly_talking": False, "confidence": confidence,
+                    "bbox": (x1, y1, x2, y2),
+                })
 
         return results
 
     def draw_bboxes(self, frame, detections):
         COLOR_MAP = {
-            "focused":      (0, 255, 0),
-            "looking_away": (0, 255, 255),
-            "head_down":    (0, 0, 255),
-            "not_visible":  (128, 128, 128),
+            "focused":      (0, 255, 0),      # green
+            "looking_away": (0, 255, 255),    # yellow
+            "head_down":    (0, 165, 255),    # orange
+            "using_phone":  (0, 0, 255),      # red
+            "eating":       (255, 165, 0),    # blue
+            "fighting":     (0, 0, 180),      # dark red — flashing handled in UI
+            "not_visible":  (128, 128, 128),  # grey
+        }
+        LABEL_MAP = {
+            "focused":      "Focused",
+            "looking_away": "Looking Away",
+            "head_down":    "Head Down",
+            "using_phone":  "Using Phone",
+            "eating":       "Eating",
+            "fighting":     "FIGHT DETECTED",
+            "not_visible":  "Not Visible",
         }
         for det in detections:
             x1, y1, x2, y2 = det["bbox"]
-            color = COLOR_MAP.get(det["pose"], (128, 128, 128))
-            cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
-            cv2.putText(frame, f"Zone {det['zone_id']}: {det['pose']}",
-                        (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+            pose = det["pose"]
+            color = COLOR_MAP.get(pose, (128, 128, 128))
+            label = LABEL_MAP.get(pose, pose)
+            thickness = 3 if pose == "fighting" else 2
+            cv2.rectangle(frame, (x1, y1), (x2, y2), color, thickness)
+            label_y = y1 - 10 if y1 > 20 else y2 + 18
+            cv2.putText(frame, f"Zone {det['zone_id']}: {label}",
+                        (x1, label_y), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
             if det["possibly_talking"]:
                 cv2.circle(frame, (x1 + 20, y1 + 20), 8, (0, 165, 255), -1)
         return frame

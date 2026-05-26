@@ -48,6 +48,9 @@ class EngagementSnapshot(models.Model):
     focused_count = models.IntegerField(default=0)
     looking_away_count = models.IntegerField(default=0)
     head_down_count = models.IntegerField(default=0)
+    using_phone_count = models.IntegerField(default=0)
+    eating_count = models.IntegerField(default=0)
+    fighting_count = models.IntegerField(default=0)
     not_visible_count = models.IntegerField(default=0)
     talking_count = models.IntegerField(default=0)
     total_detected = models.IntegerField(default=0)
@@ -62,6 +65,9 @@ class StudentZoneLog(models.Model):
         ('focused', 'Focused'),
         ('looking_away', 'Looking Away'),
         ('head_down', 'Head Down'),
+        ('using_phone', 'Using Phone'),
+        ('eating', 'Eating'),
+        ('fighting', 'Fighting'),
         ('not_visible', 'Not Visible'),
     ]
 
@@ -73,3 +79,78 @@ class StudentZoneLog(models.Model):
 
     def __str__(self):
         return f"Zone {self.zone_id} - {self.pose} ({self.snapshot.pk})"
+
+
+class ClassroomVideo(models.Model):
+    STATUS_CHOICES = [
+        ('uploading', 'Uploading'),
+        ('processing', 'Processing'),
+        ('completed', 'Completed'),
+        ('failed', 'Failed'),
+    ]
+
+    title = models.CharField(max_length=200)
+    video_file = models.FileField(upload_to='classroom/videos/', help_text="Upload MP4 or AVI video")
+    uploaded_at = models.DateTimeField(auto_now_add=True)
+    status = models.CharField(
+        max_length=20,
+        choices=STATUS_CHOICES,
+        default='uploading'
+    )
+    processed_at = models.DateTimeField(null=True, blank=True)
+    duration_seconds = models.IntegerField(null=True, blank=True)
+    total_frames_analyzed = models.IntegerField(default=0)
+    total_students_detected = models.IntegerField(default=0)
+    average_engagement_score = models.FloatField(default=0.0)
+    notes = models.TextField(blank=True, help_text="Optional notes about this video")
+
+    def __str__(self):
+        return f"{self.title} ({self.uploaded_at.strftime('%Y-%m-%d')})"
+
+    def get_thumbnail_url(self):
+        if self.thumbnail:
+            return self.thumbnail.url
+        return '/static/classroom_monitor/images/video-placeholder.png'
+
+
+class VideoAnalysisFrame(models.Model):
+    video = models.ForeignKey(ClassroomVideo, on_delete=models.CASCADE, related_name='frames')
+    frame_number = models.IntegerField()
+    timestamp = models.FloatField()  # seconds from start
+    frame_image = models.ImageField(upload_to='classroom/video_frames/', blank=True, null=True)
+    focused_count = models.IntegerField(default=0)
+    looking_away_count = models.IntegerField(default=0)
+    head_down_count = models.IntegerField(default=0)
+    using_phone_count = models.IntegerField(default=0)
+    eating_count = models.IntegerField(default=0)
+    fighting_count = models.IntegerField(default=0)
+    not_visible_count = models.IntegerField(default=0)
+    total_detected = models.IntegerField(default=0)
+    engagement_score = models.FloatField(default=0.0)
+
+    class Meta:
+        ordering = ['frame_number']
+
+    def __str__(self):
+        return f"Frame {self.frame_number} ({self.timestamp:.1f}s) - {self.video.title}"
+
+
+class VideoStudentZone(models.Model):
+    FRAME_POSE_CHOICES = [
+        ('focused', 'Focused'),
+        ('looking_away', 'Looking Away'),
+        ('head_down', 'Head Down'),
+        ('using_phone', 'Using Phone'),
+        ('eating', 'Eating'),
+        ('fighting', 'Fighting'),
+        ('not_visible', 'Not Visible'),
+    ]
+
+    frame = models.ForeignKey(VideoAnalysisFrame, on_delete=models.CASCADE, related_name='zones')
+    zone_id = models.IntegerField()
+    pose = models.CharField(max_length=20, choices=FRAME_POSE_CHOICES, default='not_visible')
+    possibly_talking = models.BooleanField(default=False)
+    confidence = models.FloatField(default=0.0)
+
+    def __str__(self):
+        return f"Zone {self.zone_id} - {self.pose} (Frame {self.frame.frame_number})"
