@@ -1,0 +1,56 @@
+{% extends "entrance_cam/base.html" %}
+{% block title %}ESP32 Devices — ClassroomIoT{% endblock %}
+{% block page_title %}Fingerprint Devices{% endblock %}
+
+{% block content %}
+<div class="section-hdr mb-4">
+  <h5><i class="bi bi-fingerprint me-2" style="color:#4f46e5"></i>ESP32 Fingerprint Devices</h5>
+  <a href="{% url 'esp32_device_add' %}" class="btn btn-sm" style="background:#4f46e5;color:#fff;border:none;border-radius:10px">
+    <i class="bi bi-plus-lg me-1"></i>Add Device
+  </a>
+</div>
+
+{% if devices %}
+<div class="row g-3">
+  {% for device in devices %}
+  <div class="col-md-6 col-xl-4">
+    <div class="form-card">
+      <div class="d-flex align-items-center justify-content-between mb-3">
+        <h6 class="fw-700 mb-0">{{ device.name }}</h6>
+        <span class="badge {% if device.is_active %}bg-success{% else %}bg-secondary{% endif %}">
+          {% if device.is_active %}Active{% else %}Inactive{% endif %}
+        </span>
+      </div>
+      <div style="font-size:0.85rem;color:#64748b">
+        <div class="mb-2"><i class="bi bi-geo-alt me-2"></i> {{ device.location }}</div>
+        <div class="mb-2"><i class="bi bi-link-45deg me-2"></i> {{ device.ip_address }}</div>
+        <div class="mb-2">
+          <i class="bi bi-clock me-2"></i>
+          {% if device.last_seen %}Last seen: {{ device.last_seen|date:"H:i d M" }}{% else %}Never seen{% endif %}
+        </div>
+        <div class="mb-2"><i class="bi bi-key me-2"></i> API Key: <code class="text-truncate" style="max-width:200px;display:inline-block;vertical-align:bottom">{{ device.api_key }}</code></div>
+      </div>
+      <hr>
+      <div class="d-flex gap-2">
+        <a href="{% url 'esp32_device_edit' device.pk %}" class="btn btn-sm flex-fill" style="background:#ede9fe;color:#7c3aed;border:none;border-radius:8px">
+          <i class="bi bi-pencil me-1"></i>Edit
+        </a>
+        <a href="{% url 'esp32_device_delete' device.pk %}" class="btn btn-sm flex-fill" style="background:#fee2e2;color:#dc2626;border:none;border-radius:8px">
+          <i class="bi bi-trash me-1"></i>Delete
+        </a>
+      </div>
+    </div>
+  </div>
+  {% endfor %}
+</div>
+{% else %}
+<div class="form-card text-center py-5">
+  <i class="bi bi-fingerprint fs-1 d-block mb-3 opacity-30"></i>
+  <h6 class="text-muted">No fingerprint devices yet</h6>
+  <p class="text-muted small mb-3">Add your first ESP32 fingerprint device</p>
+  <a href="{% url 'esp32_device_add' %}" class="btn" style="background:#4f46e5;color:#fff;border:none;border-radius:10px">
+    <i class="bi bi-plus-lg me-1"></i>Add Device
+  </a>
+</div>
+{% endif %}
+{% endblock %}

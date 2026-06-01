@@ -1,0 +1,92 @@
+{% extends 'entrance_cam/base.html' %}
+
+{% block title %}All Sessions - ClassroomIoT{% endblock %}
+{% block page_title %}All Lab Sessions{% endblock %}
+
+{% block content %}
+<div class="stat-card mb-4">
+  <form method="get" class="row g-3 align-items-end">
+    <div class="col-md-3">
+      <label class="form-label small">Date</label>
+      <input type="date" name="date" class="form-control" value="{{ request.GET.date }}">
+    </div>
+    <div class="col-md-3">
+      <label class="form-label small">Student</label>
+      <select name="student" class="form-select">
+        <option value="">All Students</option>
+        {% for student in students %}
+        <option value="{{ student.id }}" {% if request.GET.student == student.id|stringformat:"i" %}selected{% endif %}>
+          {{ student.name }} ({{ student.roll_no }})
+        </option>
+        {% endfor %}
+      </select>
+    </div>
+    <div class="col-md-2">
+      <button type="submit" class="btn w-100" style="background:#4f46e5;color:#fff;border:none">
+        <i class="bi bi-filter me-2"></i> Filter
+      </button>
+    </div>
+    <div class="col-md-2">
+      <a href="{% url 'session_list' %}" class="btn w-100 btn-outline-secondary">
+        <i class="bi bi-x-circle me-2"></i> Clear
+      </a>
+    </div>
+  </form>
+</div>
+
+<div class="stat-card">
+  {% if sessions %}
+  <div class="data-table">
+    <table class="table">
+      <thead>
+        <tr>
+          <th>Student</th>
+          <th>Roll No</th>
+          <th>Date</th>
+          <th>Start</th>
+          <th>End</th>
+          <th>Duration</th>
+          <th>Status</th>
+          <th>Actions</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for session in sessions %}
+        <tr>
+          <td>
+            <div class="d-flex align-items-center gap-2">
+              {% if session.student.photo %}
+              <img src="{{ session.student.photo.url }}" class="student-avatar">
+              {% else %}
+              <div class="avatar-placeholder">{{ session.student.name.0|upper }}</div>
+              {% endif %}
+              {{ session.student.name }}
+            </div>
+          </td>
+          <td>{{ session.student.roll_no }}</td>
+          <td>{{ session.start_time|date:"Y-m-d" }}</td>
+          <td>{{ session.start_time|time:"H:i" }}</td>
+          <td>{{ session.end_time|time:"H:i"|default:"-" }}</td>
+          <td>{{ session.duration_minutes|default:"-" }} min</td>
+          <td>
+            {% if session.is_active %}
+            <span class="badge bg-success">Active</span>
+            {% else %}
+            <span class="badge bg-secondary">Completed</span>
+            {% endif %}
+          </td>
+          <td>
+            <a href="{% url 'monitor_detail' session.id %}" class="btn btn-sm" style="background:#4f46e5;color:#fff;border:none">
+              <i class="bi bi-eye"></i>
+            </a>
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% else %}
+  <p class="text-muted text-center py-5">No sessions found</p>
+  {% endif %}
+</div>
+{% endblock %}

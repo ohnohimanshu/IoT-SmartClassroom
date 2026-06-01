@@ -1,0 +1,197 @@
+{% extends 'base.html' %}
+
+{% block title %}Behavior Incidents{% endblock %}
+
+{% block content %}
+<div class="container mt-4">
+    <div class="row">
+        <div class="col-md-12">
+            <h2>🚨 Behavior Incidents</h2>
+            <hr>
+        </div>
+    </div>
+
+    <!-- Statistics Cards -->
+    <div class="row mb-4">
+        <div class="col-md-3">
+            <div class="card bg-info text-white">
+                <div class="card-body">
+                    <h5 class="card-title">Total Incidents</h5>
+                    <p class="display-4">{{ total_incidents }}</p>
+                </div>
+            </div>
+        </div>
+        <div class="col-md-3">
+            <div class="card bg-warning text-white">
+                <div class="card-body">
+                    <h5 class="card-title">Today</h5>
+                    <p class="display-4">{{ today_incidents }}</p>
+                </div>
+            </div>
+        </div>
+        <div class="col-md-3">
+            <div class="card bg-danger text-white">
+                <div class="card-body">
+                    <h5 class="card-title">Unreviewed</h5>
+                    <p class="display-4">{{ unreviewed }}</p>
+                </div>
+            </div>
+        </div>
+        <div class="col-md-3">
+            <div class="card bg-secondary text-white">
+                <div class="card-body">
+                    <h5 class="card-title">Not Alerted</h5>
+                    <p class="display-4">{{ not_alerted }}</p>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Incident Types Breakdown -->
+    <div class="row mb-4">
+        <div class="col-md-12">
+            <div class="card">
+                <div class="card-header">
+                    <h5>Incidents by Type</h5>
+                </div>
+                <div class="card-body">
+                    <div class="row">
+                        {% for item in type_breakdown %}
+                        <div class="col-md-3">
+                            <div class="alert alert-info mb-0">
+                                <strong>{{ item.incident_type|upper }}</strong>: {{ item.count }}
+                            </div>
+                        </div>
+                        {% endfor %}
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Filters -->
+    <div class="row mb-3">
+        <div class="col-md-12">
+            <form method="GET" class="form-inline">
+                <div class="form-group mr-3">
+                    <label for="type" class="mr-2">Type:</label>
+                    <select name="type" id="type" class="form-control">
+                        <option value="">All Types</option>
+                        <option value="phone_usage" {% if filter_type == 'phone_usage' %}selected{% endif %}>📱 Phone Usage</option>
+                        <option value="eating_food" {% if filter_type == 'eating_food' %}selected{% endif %}>🍔 Eating Food</option>
+                        <option value="fighting" {% if filter_type == 'fighting' %}selected{% endif %}>🥊 Fighting</option>
+                    </select>
+                </div>
+                <div class="form-group mr-3">
+                    <label for="severity" class="mr-2">Severity:</label>
+                    <select name="severity" id="severity" class="form-control">
+                        <option value="">All Severities</option>
+                        <option value="low" {% if filter_severity == 'low' %}selected{% endif %}>Low</option>
+                        <option value="medium" {% if filter_severity == 'medium' %}selected{% endif %}>Medium</option>
+                        <option value="high" {% if filter_severity == 'high' %}selected{% endif %}>High</option>
+                        <option value="critical" {% if filter_severity == 'critical' %}selected{% endif %}>Critical</option>
+                    </select>
+                </div>
+                <div class="form-group mr-3">
+                    <label for="reviewed" class="mr-2">Status:</label>
+                    <select name="reviewed" id="reviewed" class="form-control">
+                        <option value="">All</option>
+                        <option value="false" {% if filter_reviewed == 'false' %}selected{% endif %}>Unreviewed</option>
+                        <option value="true" {% if filter_reviewed == 'true' %}selected{% endif %}>Reviewed</option>
+                    </select>
+                </div>
+                <button type="submit" class="btn btn-primary">Filter</button>
+            </form>
+        </div>
+    </div>
+
+    <!-- Incidents Table -->
+    <div class="row">
+        <div class="col-md-12">
+            <div class="table-responsive">
+                <table class="table table-striped table-hover">
+                    <thead class="table-dark">
+                        <tr>
+                            <th>Student</th>
+                            <th>Roll No</th>
+                            <th>Incident Type</th>
+                            <th>Severity</th>
+                            <th>Confidence</th>
+                            <th>Time</th>
+                            <th>WhatsApp</th>
+                            <th>Reviewed</th>
+                            <th>Actions</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {% for incident in incidents %}
+                        <tr>
+                            <td>
+                                <a href="{% url 'student_detail' incident.student.id %}">
+                                    {{ incident.student.name }}
+                                </a>
+                            </td>
+                            <td>{{ incident.student.roll_no }}</td>
+                            <td>
+                                <span class="badge badge-pill" 
+                                    {% if incident.incident_type == 'phone_usage' %}badge-primary{% elif incident.incident_type == 'eating_food' %}badge-warning{% elif incident.incident_type == 'fighting' %}badge-danger{% else %}badge-secondary{% endif %}>
+                                    {{ incident.get_incident_emoji }} {{ incident.get_incident_type_display }}
+                                </span>
+                            </td>
+                            <td>
+                                {% if incident.severity == 'critical' %}
+                                    <span class="badge badge-danger">{{ incident.severity|upper }}</span>
+                                {% elif incident.severity == 'high' %}
+                                    <span class="badge badge-warning">{{ incident.severity|upper }}</span>
+                                {% elif incident.severity == 'medium' %}
+                                    <span class="badge badge-info">{{ incident.severity|upper }}</span>
+                                {% else %}
+                                    <span class="badge badge-secondary">{{ incident.severity|upper }}</span>
+                                {% endif %}
+                            </td>
+                            <td>
+                                <div class="progress" style="height: 20px;">
+                                    {% widthratio incident.confidence 1 100 as conf_percent %}
+                                    <div class="progress-bar" role="progressbar" 
+                                         style="width: {{ conf_percent }}%" 
+                                         aria-valuenow="{{ conf_percent }}" 
+                                         aria-valuemin="0" 
+                                         aria-valuemax="100">
+                                        {{ incident.confidence|floatformat:1 }}%
+                                    </div>
+                                </div>
+                            </td>
+                            <td>{{ incident.detected_at|date:"M d, H:i" }}</td>
+                            <td>
+                                {% if incident.whatsapp_sent %}
+                                    <span class="badge badge-success">✓ Sent</span>
+                                {% else %}
+                                    <span class="badge badge-secondary">✗ Not sent</span>
+                                {% endif %}
+                            </td>
+                            <td>
+                                {% if incident.is_reviewed %}
+                                    <span class="badge badge-success">✓ Reviewed</span>
+                                {% else %}
+                                    <span class="badge badge-warning">⚠ Pending</span>
+                                {% endif %}
+                            </td>
+                            <td>
+                                <a href="{% url 'incident_detail' incident.id %}" class="btn btn-sm btn-info">View</a>
+                                {% if not incident.is_reviewed %}
+                                    <a href="{% url 'incident_review' incident.id %}" class="btn btn-sm btn-primary">Review</a>
+                                {% endif %}
+                            </td>
+                        </tr>
+                        {% empty %}
+                        <tr>
+                            <td colspan="9" class="text-center text-muted">No incidents found</td>
+                        </tr>
+                        {% endfor %}
+                    </tbody>
+                </table>
+            </div>
+        </div>
+    </div>
+</div>
+{% endblock %}

@@ -1,0 +1,110 @@
+{% extends "camera_attendance/base.html" %}
+{% block title %}Camera Attendance Dashboard{% endblock %}
+{% block page_title %}Camera Attendance System{% endblock %}
+
+{% block content %}
+<div class="row g-4 mb-4">
+  <div class="col-md-3">
+    <div class="form-card">
+      <div class="d-flex align-items-center justify-content-between">
+        <div>
+          <div class="text-muted small">Total Students</div>
+          <div class="fs-3 fw-bold">{{ total_students }}</div>
+        </div>
+        <i class="bi bi-people fs-2 text-muted opacity-50"></i>
+      </div>
+    </div>
+  </div>
+  
+  <div class="col-md-3">
+    <div class="form-card">
+      <div class="d-flex align-items-center justify-content-between">
+        <div>
+          <div class="text-muted small">With Face Encoding</div>
+          <div class="fs-3 fw-bold">{{ students_with_encoding }}</div>
+        </div>
+        <i class="bi bi-camera-fill fs-2 text-success opacity-50"></i>
+      </div>
+    </div>
+  </div>
+  
+  <div class="col-md-3">
+    <div class="form-card">
+      <div class="d-flex align-items-center justify-content-between">
+        <div>
+          <div class="text-muted small">Today's Entries</div>
+          <div class="fs-3 fw-bold">{{ today_entries }}</div>
+        </div>
+        <i class="bi bi-box-arrow-in-right fs-2 text-info opacity-50"></i>
+      </div>
+    </div>
+  </div>
+  
+  <div class="col-md-3">
+    <div class="form-card">
+      <div class="d-flex align-items-center justify-content-between">
+        <div>
+          <div class="text-muted small">Currently Inside</div>
+          <div class="fs-3 fw-bold">{{ currently_inside }}</div>
+        </div>
+        <i class="bi bi-person-check-fill fs-2 text-warning opacity-50"></i>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="row g-4">
+  <div class="col-lg-6">
+    <div class="form-card">
+      <div class="section-hdr">
+        <h5><i class="bi bi-emoji-smile me-2" style="color:#4f46e5"></i>Emotion Distribution</h5>
+      </div>
+      <div class="table-responsive">
+        <table class="table table-sm mb-0">
+          <thead>
+            <tr><th>Emotion</th><th>Count</th></tr>
+          </thead>
+          <tbody>
+            {% for emotion in emotions_today %}
+            <tr>
+              <td>{{ emotion.entry_emotion|title }}</td>
+              <td><span class="badge bg-primary">{{ emotion.count }}</span></td>
+            </tr>
+            {% empty %}
+            <tr><td colspan="2" class="text-center text-muted">No data</td></tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+  
+  <div class="col-lg-6">
+    <div class="form-card">
+      <div class="section-hdr">
+        <h5><i class="bi bi-clock-history me-2" style="color:#4f46e5"></i>Recent Activity</h5>
+        <a href="{% url 'camera_attendance:attendance_list' %}" class="btn btn-sm" style="background:#ede9fe;color:#7c3aed;border:none;border-radius:8px">View All</a>
+      </div>
+      <div class="table-responsive">
+        <table class="table table-hover align-middle mb-0">
+          <thead>
+            <tr><th>Student</th><th>Camera</th><th>Entry</th><th>Emotion</th></tr>
+          </thead>
+          <tbody>
+            {% for log in recent_logs %}
+            <tr>
+              <td>{{ log.student.name }}</td>
+              <td>{{ log.camera.name }}</td>
+              <td>{{ log.entry_time|date:"H:i" }}</td>
+              <td><span class="emotion-badge badge-{{ log.entry_emotion }}">{{ log.entry_emotion|title }}</span></td>
+            </tr>
+            {% empty %}
+            <tr><td colspan="4" class="text-center text-muted">No activity today</td></tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+</div>
+{% endblock %}

@@ -1,0 +1,40 @@
+{% extends "entrance_cam/base.html" %}
+{% block title %}{{ action }} — ClassroomIoT{% endblock %}
+{% block page_title %}{{ action }}{% endblock %}
+
+{% block content %}
+<div class="row justify-content-center">
+  <div class="col-lg-6">
+    <div class="form-card">
+      <div class="section-hdr">
+        <h5><i class="bi bi-fingerprint me-2" style="color:#4f46e5"></i>{{ action }}</h5>
+      </div>
+      <form method="post">
+        {% csrf_token %}
+        <div class="mb-3">
+          <label class="form-label fw-500 small">Device Name</label>
+          {{ form.name }}
+        </div>
+        <div class="mb-3">
+          <label class="form-label fw-500 small">IP Address / Server URL</label>
+          {{ form.ip_address }}
+        </div>
+        <div class="mb-3">
+          <label class="form-label fw-500 small">Location</label>
+          {{ form.location }}
+        </div>
+        <div class="mb-4">
+          <div class="form-check">
+            {{ form.is_active }}
+            <label class="form-check-label small">Device is active</label>
+          </div>
+        </div>
+        <div class="d-flex gap-2">
+          <a href="{% url 'esp32_device_list' %}" class="btn flex-fill" style="background:#f1f5f9;color:#64748b;border:none;border-radius:10px">Cancel</a>
+          <button type="submit" class="btn flex-fill" style="background:#4f46e5;color:#fff;border:none;border-radius:10px">Save</button>
+        </div>
+      </form>
+    </div>
+  </div>
+</div>
+{% endblock %}

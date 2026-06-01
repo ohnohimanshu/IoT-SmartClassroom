@@ -1,0 +1,139 @@
+{% extends "entrance_cam/base.html" %}
+{% block title %}Attendance{% endblock %}
+{% block page_title %}Attendance Records{% endblock %}
+{% block content %}
+<div class="form-card">
+  <div class="section-hdr">
+    <h5><i class="bi bi-calendar-check me-2" style="color:#16a34a"></i>Attendance — {{ filter_date|date:"d F Y" }}</h5>
+    <div class="d-flex gap-2">
+      <button id="btnAll" class="btn btn-sm active" style="background:#4f46e5;color:#fff;border:none;border-radius:8px">All</button>
+      <button id="btnCamera" class="btn btn-sm" style="background:#f1f5f9;color:#64748b;border:none;border-radius:8px">Camera</button>
+      <button id="btnFingerprint" class="btn btn-sm" style="background:#f1f5f9;color:#64748b;border:none;border-radius:8px">Fingerprint</button>
+    </div>
+  </div>
+  <form method="get" class="d-flex align-items-center gap-2 mb-4">
+    <label class="small fw-500 text-muted">Select Date:</label>
+    <input type="date" name="date" value="{{ selected_date }}" class="form-control" style="max-width:200px;border-radius:10px">
+    <button class="btn btn-sm" style="background:#4f46e5;color:#fff;border:none;border-radius:10px">Go</button>
+  </form>
+
+  <div class="row g-3 mb-4">
+    <div class="col-sm-4">
+      <div class="stat-card">
+        <div class="stat-val" style="font-size:1.4rem">{{ camera_logs|length|add:fingerprint_logs|length }}</div>
+        <div class="stat-label">Total Entries</div>
+      </div>
+    </div>
+    <div class="col-sm-4">
+      <div class="stat-card">
+        <div class="stat-val" style="font-size:1.4rem;color:#7c3aed">{{ camera_logs|length }}</div>
+        <div class="stat-label">Camera Entries</div>
+      </div>
+    </div>
+    <div class="col-sm-4">
+      <div class="stat-card">
+        <div class="stat-val" style="font-size:1.4rem;color:#06b6d4">{{ fingerprint_logs|length }}</div>
+        <div class="stat-label">Fingerprint Entries</div>
+      </div>
+    </div>
+  </div>
+
+  {% if all_logs %}
+  <div class="table-responsive">
+    <table class="table table-hover align-middle mb-0">
+      <thead>
+        <tr>
+          <th>Type</th>
+          <th>Student</th>
+          <th>Device</th>
+          <th>Time</th>
+          <th>Action</th>
+          <th>Details</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for log in all_logs %}
+        <tr class="log-row" data-type="{{ log.type }}">
+          <td>
+            {% if log.type == 'camera' %}
+            <span class="badge" style="background:#ede9fe;color:#7c3aed"><i class="bi bi-camera-video me-1"></i>Camera</span>
+            {% else %}
+            <span class="badge" style="background:#cffafe;color:#0891b2"><i class="bi bi-fingerprint me-1"></i>Fingerprint</span>
+            {% endif %}
+          </td>
+          <td>
+            <div class="d-flex align-items-center gap-2">
+              {% if log.student.photo %}<img src="{{ log.student.photo.url }}" class="student-avatar">
+              {% else %}<span class="avatar-placeholder">{{ log.student.name.0 }}</span>{% endif %}
+              <div>
+                <div class="fw-500">{{ log.student.name }}</div>
+                <small class="text-muted">{{ log.student.roll_no }}</small>
+              </div>
+            </div>
+          </td>
+          <td>
+            {% if log.type == 'camera' %}
+            <small class="text-muted">{{ log.device.name|default:"—" }}</small>
+            {% else %}
+            <small class="text-muted">{{ log.device.name|default:"—" }}</small>
+            {% endif %}
+          </td>
+          <td>{{ log.timestamp|date:"H:i:s" }}</td>
+          <td>
+            <span class="emotion-badge {% if log.action == 'entry' %}badge-happy{% else %}badge-sad{% endif %}">
+              {{ log.action|title }}
+            </span>
+          </td>
+          <td>
+            {% if log.type == 'camera' %}
+            <span class="emotion-badge badge-{{ log.emotion }}">{{ log.emotion|title }}</span>
+            {% else %}
+            <span class="text-muted small">Confidence: {{ log.confidence|default:"—" }}</span>
+            {% endif %}
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% else %}
+  <div class="text-center py-5 text-muted">
+    <i class="bi bi-calendar-x fs-1 d-block mb-2 opacity-20"></i>
+    No attendance records for {{ filter_date|date:"d F Y" }}.
+  </div>
+  {% endif %}
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+const buttons = {
+  all: document.getElementById('btnAll'),
+  camera: document.getElementById('btnCamera'),
+  fingerprint: document.getElementById('btnFingerprint')
+};
+const rows = document.querySelectorAll('.log-row');
+
+function setActive(activeBtn) {
+  Object.values(buttons).forEach(btn => {
+    btn.style.background = btn === activeBtn ? '#4f46e5' : '#f1f5f9';
+    btn.style.color = btn === activeBtn ? '#fff' : '#64748b';
+  });
+}
+
+function filterLogs(type) {
+  rows.forEach(row => {
+    if (type === 'all' || row.dataset.type === type) {
+      row.style.display = '';
+    } else {
+      row.style.display = 'none';
+    }
+  });
+}
+
+buttons.all.addEventListener('click', () => { setActive(buttons.all); filterLogs('all'); });
+buttons.camera.addEventListener('click', () => { setActive(buttons.camera); filterLogs('camera'); });
+buttons.fingerprint.addEventListener('click', () => { setActive(buttons.fingerprint); filterLogs('fingerprint'); });
+</script>
+{% endblock %}
+

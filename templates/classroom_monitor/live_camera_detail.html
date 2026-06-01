@@ -1,0 +1,168 @@
+{% extends "entrance_cam/base.html" %}
+{% block title %}{{ camera.name }} — Live{% endblock %}
+{% block page_title %}{{ camera.name }} — Live Monitor{% endblock %}
+{% block content %}
+<div class="row g-3">
+  <div class="col-xl-8">
+    <div class="stat-card">
+      <img src="{% url 'classroom_live_stream' camera.pk %}" class="img-fluid rounded" style="width:100%;max-height:70vh;object-fit:contain">
+    </div>
+  </div>
+  <div class="col-xl-4">
+    <div class="stat-card mb-3">
+      <div class="section-hdr mb-3">
+        <h6 class="fw-700 mb-0" style="color:#1e293b"><i class="bi bi-info-circle me-2"></i>Session Info</h6>
+      </div>
+      {% if session %}
+      <div class="mb-3">
+        <div class="small text-muted mb-1">Subject</div>
+        <div class="fw-600">{{ session.subject|default:"—" }}</div>
+      </div>
+      <div class="mb-3">
+        <div class="small text-muted mb-1">Teacher</div>
+        <div class="fw-600">{{ session.teacher|default:"—" }}</div>
+      </div>
+      <div class="mb-3">
+        <div class="small text-muted mb-1">Duration</div>
+        <div class="fw-600" id="live-duration">0m</div>
+      </div>
+      <button onclick="endLiveSession({{ session.pk }})" class="btn w-100" style="background:#fee2e2;color:#dc2626;border:none;border-radius:8px">
+        <i class="bi bi-stop-fill me-1"></i>End Session
+      </button>
+      {% else %}
+      <div class="text-center py-4 text-muted">
+        <i class="bi bi-calendar-x fs-2 d-block mb-2 opacity-30"></i>
+        No active session for this camera.
+      </div>
+      <button onclick="location.href='{% url 'classroom_dashboard' %}'" class="btn w-100" style="background:#0891b2;color:#fff;border:none;border-radius:8px">
+        <i class="bi bi-play-fill me-1"></i>Start Session
+      </button>
+      {% endif %}
+    </div>
+    
+    {% if session %}
+    <div class="stat-card mb-3">
+      <div class="section-hdr mb-3">
+        <h6 class="fw-700 mb-0" style="color:#1e293b"><i class="bi bi-gauge me-2"></i>Engagement</h6>
+      </div>
+      <div class="text-center">
+        <svg width="140" height="140" viewBox="0 0 120 120" class="mb-2">
+          <circle cx="60" cy="60" r="50" stroke="#e2e8f0" stroke-width="10" fill="none"/>
+          <circle id="live-ring" cx="60" cy="60" r="50" stroke="#22c55e" stroke-width="10" fill="none"
+                  stroke-linecap="round" transform="rotate(-90 60 60)"
+                  stroke-dasharray="314.16" stroke-dashoffset="314.16"/>
+        </svg>
+        <div class="fw-700 fs-4" id="live-score" style="color:#1e293b">--%</div>
+      </div>
+    </div>
+    
+    <div class="stat-card">
+      <div class="section-hdr mb-3">
+        <h6 class="fw-700 mb-0" style="color:#1e293b"><i class="bi bi-grid-3x3-gap me-2"></i>Seating</h6>
+      </div>
+      <div class="row g-2" id="live-seating-grid">
+        {% for zone in 1|make_list|slice:":10" %}
+        <div class="col-4">
+          <div class="zone-cell" id="live-zone-{{ forloop.counter }}" style="background:#f1f5f9;border-radius:8px;padding:8px;text-align:center">
+            <div class="fw-700 small" style="color:#64748b">S{{ forloop.counter }}</div>
+          </div>
+        </div>
+        {% endfor %}
+      </div>
+    </div>
+    {% endif %}
+  </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+{% if session %}
+const liveStartTime = new Date("{{ session.start_time|date:'c' }}");
+
+function updateLiveDuration() {
+  const now = new Date();
+  const diff = Math.floor((now - liveStartTime) / 60000);
+  const el = document.getElementById('live-duration');
+  if (el) {
+    if (diff < 60) el.textContent = `${diff}m`;
+    else el.textContent = `${Math.floor(diff/60)}h ${diff%60}m`;
+  }
+}
+
+function updateLiveStats() {
+  fetch(`/classroom/api/stats/{{ session.pk }}/`)
+    .then(r => r.json())
+    .then(d => {
+      if (d.stats.length > 0) {
+        const latest = d.stats[d.stats.length - 1];
+        const score = latest.engagement_score;
+        
+        const ring = document.getElementById('live-ring');
+        const scoreEl = document.getElementById('live-score');
+        
+        if (ring && scoreEl) {
+          const offset = 314.16 - (314.16 * score / 100);
+          ring.style.strokeDashoffset = offset;
+          if (score >= 70) ring.style.stroke = '#22c55e';
+          else if (score >= 40) ring.style.stroke = '#eab308';
+          else ring.style.stroke = '#ef4444';
+          
+          scoreEl.textContent = score.toFixed(0) + '%';
+        }
+        
+        updateLiveSeating(d.zone_logs);
+      }
+    });
+}
+
+function updateLiveSeating(zoneLogs) {
+  for (let i = 1; i <= 10; i++) {
+    const cell = document.getElementById(`live-zone-${i}`);
+    const log = zoneLogs.find(z => z.zone_id === i);
+    let bg = '#f1f5f9';
+    
+    if (log) {
+      if (log.pose === 'focused') bg = '#dcfce7';
+      else if (log.pose === 'looking_away') bg = '#fef9c3';
+      else if (log.pose === 'head_down') bg = '#fee2e2';
+    }
+    
+    cell.style.background = bg;
+  }
+}
+
+function endLiveSession(sessionId) {
+  if (!confirm('End this session?')) return;
+  fetch('/classroom/session/end/', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'X-CSRFToken': csrftoken },
+    body: JSON.stringify({ session_id: sessionId })
+  })
+  .then(r => r.json())
+  .then(d => { location.reload(); });
+}
+
+function getCookie(name) {
+  let cookieValue = null;
+  if (document.cookie && document.cookie !== '') {
+    const cookies = document.cookie.split(';');
+    for (let i = 0; i < cookies.length; i++) {
+      const cookie = cookies[i].trim();
+      if (cookie.substring(0, name.length + 1) === (name + '=')) {
+        cookieValue = decodeURIComponent(cookie.substring(name.length + 1));
+        break;
+      }
+    }
+  }
+  return cookieValue;
+}
+const csrftoken = document.querySelector('meta[name="csrf-token"]')?.content || getCookie('csrftoken');
+
+setInterval(updateLiveDuration, 1000);
+setInterval(updateLiveStats, 30000);
+updateLiveDuration();
+setTimeout(updateLiveStats, 500);
+{% endif %}
+</script>
+{% endblock %}

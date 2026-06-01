@@ -1,0 +1,52 @@
+{% extends "entrance_cam/base.html" %}
+{% block title %}{{ action }}{% endblock %}
+{% block page_title %}{{ action }}{% endblock %}
+{% block content %}
+<div class="row justify-content-center">
+  <div class="col-lg-6">
+    <div class="form-card">
+      <div class="section-hdr">
+        <h5><i class="bi bi-camera-video-fill me-2" style="color:#0891b2"></i>{{ action }}</h5>
+        <a href="{% url 'classroom_camera_list' %}" class="btn btn-sm" style="background:#f1f5f9;color:#64748b;border:none;border-radius:8px"><i class="bi bi-arrow-left me-1"></i>Back</a>
+      </div>
+      <form method="post">
+        {% csrf_token %}
+        <div class="row g-3">
+          <div class="col-12">
+            <label class="form-label fw-500 small">Camera Name *</label>
+            {{ form.name }}
+          </div>
+          <div class="col-12">
+            <label class="form-label fw-500 small">Stream URL *</label>
+            {{ form.url }}
+          </div>
+          <div class="col-12">
+            <label class="form-label fw-500 small">Stream Type</label>
+            {{ form.stream_type }}
+          </div>
+          <div class="col-12">
+            <label class="form-label fw-500 small">Snapshot URL (optional)</label>
+            {{ form.snapshot_url }}
+          </div>
+          <div class="col-12">
+            <label class="form-label fw-500 small">Location</label>
+            {{ form.location }}
+          </div>
+          <div class="col-12">
+            <div class="form-check">
+              {{ form.is_active }}
+              <label class="form-check-label small fw-500">Camera is active</label>
+            </div>
+          </div>
+        </div>
+        <div class="d-flex gap-2 mt-4 pt-3" style="border-top:1px solid #e2e8f0">
+          <button type="submit" class="btn" style="background:#0891b2;color:#fff;border:none;border-radius:10px;padding:10px 24px;font-weight:600">
+            <i class="bi bi-check-lg me-1"></i>{{ action }}
+          </button>
+          <a href="{% url 'classroom_camera_list' %}" class="btn" style="background:#f1f5f9;color:#64748b;border:none;border-radius:10px;padding:10px 24px">Cancel</a>
+        </div>
+      </form>
+    </div>
+  </div>
+</div>
+{% endblock %}

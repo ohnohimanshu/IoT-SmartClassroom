@@ -1,0 +1,634 @@
+{% extends "entrance_cam/base.html" %}
+{% block title %}Cameras{% endblock %}
+{% block page_title %}Cameras{% endblock %}
+
+{% block content %}
+<div class="form-card">
+  <div class="section-hdr">
+    <h5><i class="bi bi-camera-video me-2" style="color:#0891b2"></i>Entrance Cameras</h5>
+    <a href="{% url 'camera_add' %}" class="btn btn-sm" style="background:#0891b2;color:#fff;border:none;border-radius:8px">
+      <i class="bi bi-plus-lg me-1"></i>Add Camera
+    </a>
+  </div>
+
+  {% if cameras %}
+  <div class="row g-3">
+    {% for cam in cameras %}
+    <div class="col-md-6 col-xl-4">
+      <div class="stat-card" style="border-radius:14px">
+        <div class="d-flex align-items-start justify-content-between mb-3">
+          <div class="stat-icon" style="background:{% if cam.is_active %}#cffafe{% else %}#fee2e2{% endif %}">
+            <i class="bi bi-camera-video{% if not cam.is_active %}-off{% endif %}-fill"
+               style="color:{% if cam.is_active %}#0891b2{% else %}#dc2626{% endif %}"></i>
+          </div>
+          <span class="emotion-badge"
+                style="background:{% if cam.is_active %}#dcfce7;color:#166534{% else %}#fee2e2;color:#991b1b{% endif %}">
+            {% if cam.is_active %}
+              <span class="dot-online"></span>Active
+            {% else %}
+              <span class="dot-offline"></span>Offline
+            {% endif %}
+          </span>
+        </div>
+
+        <div class="fw-700 mb-1" style="color:#1e293b">{{ cam.name }}</div>
+        <div class="small text-muted mb-1"><i class="bi bi-geo-alt me-1"></i>{{ cam.location }}</div>
+        <div class="small text-muted mb-3" style="word-break:break-all;font-size:0.75rem">
+          <i class="bi bi-link-45deg me-1"></i><code>{{ cam.url }}</code>
+          {% if cam.is_active and cam.url and not cam.url|lower|slice:":4" == "rtsp" %}
+            {% with url=cam.url|lower %}
+              {% if url|slice:":7" == "http://" or url|slice:":8" == "https://" %}
+                {% if "/stream" not in url and "/video" not in url %}
+                  <div class="mt-1 p-1 px-2" style="background:#fef3c7;border-radius:6px;font-size:0.7rem;color:#92400e">
+                    ⚠ ESP32-CAM URL should end with <strong>/stream</strong>
+                    — e.g. <code>{{ cam.url }}/stream</code>
+                  </div>
+                {% endif %}
+              {% endif %}
+            {% endwith %}
+          {% endif %}
+        </div>
+
+        <div class="d-flex gap-2">
+          <!-- Test button -->
+          <button onclick="testCamera({{ cam.pk }}, this)"
+                  class="btn btn-sm"
+                  style="background:#f1f5f9;color:#475569;border:none;border-radius:8px;flex:1">
+            <i class="bi bi-wifi me-1"></i>Test
+          </button>
+
+          <!-- Live button -->
+          <button onclick="openLive({{ cam.pk }}, '{{ cam.name|escapejs }}', '{{ cam.url|escapejs }}')"
+                  class="btn btn-sm live-btn"
+                  style="background:#0891b2;color:#fff;border:none;border-radius:8px;flex:1">
+            <i class="bi bi-play-circle-fill me-1"></i>Live
+          </button>
+
+          <a href="{% url 'camera_edit' cam.pk %}"
+             class="btn btn-sm" style="background:#cffafe;color:#0891b2;border:none;border-radius:8px">
+            <i class="bi bi-pencil"></i>
+          </a>
+          <a href="{% url 'camera_delete' cam.pk %}"
+             class="btn btn-sm" style="background:#fee2e2;color:#dc2626;border:none;border-radius:8px">
+            <i class="bi bi-trash"></i>
+          </a>
+        </div>
+      </div>
+    </div>
+    {% endfor %}
+  </div>
+
+  {% else %}
+  <div class="text-center py-5 text-muted">
+    <i class="bi bi-camera-video-off fs-1 d-block mb-2 opacity-20"></i>
+    No cameras added yet. <a href="{% url 'camera_add' %}">Add one</a>.
+  </div>
+  {% endif %}
+</div>
+
+
+<!-- ═══════════════════════════════════════════════════════════════
+     LIVE DETECTION MODAL
+════════════════════════════════════════════════════════════════ -->
+<div id="liveModal" style="
+  display:none; position:fixed; inset:0; z-index:9999;
+  background:rgba(0,0,0,0.82); backdrop-filter:blur(6px);
+  align-items:center; justify-content:center;
+">
+  <div style="
+    background:#0f172a; border-radius:20px;
+    width:min(96vw,960px); max-height:92vh;
+    display:flex; flex-direction:column;
+    box-shadow:0 30px 80px rgba(0,0,0,0.7);
+    overflow:hidden;
+    border:1px solid rgba(8,145,178,0.25);
+  ">
+
+    <!-- Modal header -->
+    <div style="
+      display:flex; align-items:center; justify-content:space-between;
+      padding:14px 20px;
+      background:linear-gradient(90deg,rgba(8,145,178,0.15),transparent);
+      border-bottom:1px solid rgba(255,255,255,0.06);
+    ">
+      <div style="display:flex;align-items:center;gap:10px">
+        <span id="liveDot" style="
+          width:10px;height:10px;border-radius:50%;
+          background:#22c55e;
+          box-shadow:0 0 8px #22c55e;
+          animation:pulse-dot 1.2s infinite;
+        "></span>
+        <span style="color:#e2e8f0;font-weight:700;font-size:1rem" id="modalCamName">Live Feed</span>
+        <span style="color:#64748b;font-size:0.78rem" id="modalCamLoc"></span>
+      </div>
+      <div style="display:flex;align-items:center;gap:10px">
+        <span id="fpsCounter" style="color:#0891b2;font-size:0.75rem;font-family:monospace">-- fps</span>
+        <button onclick="closeLive()"
+                style="background:rgba(255,255,255,0.08);border:none;color:#94a3b8;
+                       width:32px;height:32px;border-radius:8px;cursor:pointer;
+                       display:flex;align-items:center;justify-content:center;
+                       font-size:1.1rem;transition:background 0.2s"
+                onmouseover="this.style.background='rgba(220,38,38,0.3)';this.style.color='#f87171'"
+                onmouseout="this.style.background='rgba(255,255,255,0.08)';this.style.color='#94a3b8'">
+          ✕
+        </button>
+      </div>
+    </div>
+
+    <!-- Main content area -->
+    <div style="display:flex;flex:1;overflow:hidden;min-height:0">
+
+      <!-- Video + canvas wrapper -->
+      <div style="flex:1;position:relative;background:#000;min-height:300px;overflow:hidden">
+
+        <!-- Webcam video element (for local cameras) -->
+        <video id="liveVideo" autoplay playsinline muted
+               style="width:100%;height:100%;object-fit:contain;display:none"></video>
+
+        <!-- MJPEG img element (for IP cameras) -->
+        <img id="mjpegImg" alt="Camera Feed"
+             style="width:100%;height:100%;object-fit:contain;display:none;position:absolute;inset:0"/>
+
+        <!-- Overlay canvas for face boxes + labels -->
+        <canvas id="overlayCanvas"
+                style="position:absolute;inset:0;width:100%;height:100%;pointer-events:none"></canvas>
+
+        <!-- "Connecting…" placeholder -->
+        <div id="liveConnecting" style="
+          position:absolute;inset:0;display:flex;flex-direction:column;
+          align-items:center;justify-content:center;color:#64748b;gap:12px
+        ">
+          <div class="spinner-border" style="color:#0891b2;width:2.5rem;height:2.5rem"></div>
+          <div style="font-size:0.85rem">Connecting to camera…</div>
+        </div>
+
+        <!-- "No face / Unknown" toast -->
+        <div id="liveToast" style="
+          position:absolute;bottom:14px;left:50%;transform:translateX(-50%);
+          background:rgba(0,0,0,0.7);color:#cbd5e1;
+          font-size:0.75rem;padding:6px 16px;border-radius:20px;
+          display:none;white-space:nowrap;pointer-events:none
+        "></div>
+      </div>
+
+      <!-- Right panel: detections list -->
+      <div style="
+        width:260px;flex-shrink:0;
+        background:#0a1628;
+        border-left:1px solid rgba(255,255,255,0.06);
+        display:flex;flex-direction:column;overflow:hidden;
+      ">
+        <div style="padding:14px 16px 8px;color:#94a3b8;font-size:0.72rem;font-weight:700;letter-spacing:.08em;text-transform:uppercase">
+          Recent Detections
+        </div>
+        <div id="detectionsList" style="
+          flex:1;overflow-y:auto;padding:0 10px 10px;
+          display:flex;flex-direction:column;gap:6px;
+        ">
+          <div style="color:#334155;font-size:0.8rem;text-align:center;margin-top:30px">
+            No detections yet
+          </div>
+        </div>
+
+        <!-- Stats bar -->
+        <div style="
+          padding:12px 16px;
+          border-top:1px solid rgba(255,255,255,0.06);
+          display:grid;grid-template-columns:1fr 1fr;gap:8px
+        ">
+          <div style="text-align:center">
+            <div id="statTotal" style="color:#e2e8f0;font-size:1.2rem;font-weight:800">0</div>
+            <div style="color:#64748b;font-size:0.68rem">Total Today</div>
+          </div>
+          <div style="text-align:center">
+            <div id="statInside" style="color:#22c55e;font-size:1.2rem;font-weight:800">0</div>
+            <div style="color:#64748b;font-size:0.68rem">Inside Now</div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Bottom bar: instructions -->
+    <div style="
+      padding:10px 20px;
+      background:rgba(0,0,0,0.3);
+      border-top:1px solid rgba(255,255,255,0.04);
+      display:flex;align-items:center;justify-content:space-between;
+      flex-wrap:wrap;gap:8px
+    ">
+      <span style="color:#475569;font-size:0.72rem">
+        <i class="bi bi-info-circle me-1"></i>
+        Face detection runs <strong style="color:#0891b2">server-side</strong> via detection_script.py — this view shows the live feed &amp; logged results.
+      </span>
+      <span id="liveStatusText" style="color:#0891b2;font-size:0.72rem;font-family:monospace">Initialising…</span>
+    </div>
+  </div>
+</div>
+
+
+<!-- CSS keyframes -->
+<style>
+@keyframes pulse-dot {
+  0%,100% { opacity:1; transform:scale(1); }
+  50%      { opacity:.5; transform:scale(1.4); }
+}
+@keyframes slideInCard {
+  from { opacity:0; transform:translateY(-8px); }
+  to   { opacity:1; transform:translateY(0); }
+}
+.live-btn:hover { background:#0e7490 !important; transform:translateY(-1px); }
+.live-btn { transition:all .15s ease; }
+
+/* Emotion colour map */
+.emo-happy    { color:#fbbf24; }
+.emo-sad      { color:#60a5fa; }
+.emo-angry    { color:#f87171; }
+.emo-neutral  { color:#94a3b8; }
+.emo-surprise { color:#a78bfa; }
+.emo-fear     { color:#fb923c; }
+.emo-disgust  { color:#4ade80; }
+.emo-unknown  { color:#64748b; }
+</style>
+{% endblock %}
+
+
+{% block scripts %}
+<script>
+/* ═══════════════════════════════════════════════════
+   CAMERA TEST (unchanged)
+═══════════════════════════════════════════════════ */
+function testCamera(pk, btn) {
+  btn.disabled = true;
+  btn.innerHTML = '<span class="spinner-border spinner-border-sm me-1"></span>Testing…';
+  fetch(`/cameras/${pk}/test/`)
+    .then(r => r.json())
+    .then(d => {
+      btn.disabled = false;
+      if (d.status === 'online') {
+        btn.innerHTML = '<i class="bi bi-check-circle-fill me-1"></i>Online';
+        btn.style.background = '#dcfce7'; btn.style.color = '#166534';
+      } else {
+        btn.innerHTML = '<i class="bi bi-x-circle-fill me-1"></i>Offline';
+        btn.style.background = '#fee2e2'; btn.style.color = '#dc2626';
+      }
+      setTimeout(() => {
+        btn.innerHTML = '<i class="bi bi-wifi me-1"></i>Test';
+        btn.style.background = ''; btn.style.color = ''; btn.disabled = false;
+      }, 3000);
+    });
+}
+
+
+/* ═══════════════════════════════════════════════════
+   LIVE DETECTION
+═══════════════════════════════════════════════════ */
+let liveState = {
+  camId:       null,
+  camUrl:      null,
+  stream:      null,          // MediaStream for webcam
+  detectTimer: null,          // setInterval handle
+  fpsTimer:    null,
+  statsTimer:  null,          // FIX: track stats interval so it can be cleared
+  frameCount:  0,
+  students:    [],            // [{id, name, encoding}]
+  detections:  [],            // rolling list of logged detections
+  cooldowns:   {},            // studentId → last log timestamp (ms)
+  COOLDOWN_MS: 30000,         // 30 s between repeated logs
+  canvas:      null,
+  ctx:         null,
+  video:       null,
+  mjpegImg:    null,
+  isLocal:     false,         // true = webcam index, false = IP URL
+};
+
+const emojiMap = {
+  happy:'😊', sad:'😢', angry:'😠', neutral:'😐',
+  surprise:'😲', fear:'😨', disgust:'🤢', unknown:'❓'
+};
+
+/* ── Open modal ─────────────────────────────────── */
+async function openLive(camId, camName, camUrl) {
+  const s = liveState;
+  s.camId  = camId;
+  s.camUrl = camUrl;
+  s.canvas = document.getElementById('overlayCanvas');
+  s.ctx    = s.canvas.getContext('2d');
+  s.video  = document.getElementById('liveVideo');
+  s.mjpegImg = document.getElementById('mjpegImg');
+
+  document.getElementById('modalCamName').textContent = camName;
+  document.getElementById('liveModal').style.display  = 'flex';
+  document.getElementById('liveConnecting').style.display = 'flex';
+  document.getElementById('liveStatusText').textContent = 'Loading students…';
+
+  clearOverlay();
+
+  // Load student list
+  s.students = await fetchStudents();
+  setStatus(`${s.students.length} students loaded`);
+
+  // Determine if local webcam (numeric) or IP stream
+  s.isLocal = /^\d+$/.test(camUrl.trim());
+
+  if (s.isLocal) {
+    await startWebcam(parseInt(camUrl.trim()));
+  } else {
+    startMJPEG(camUrl);
+  }
+
+  // Start detection loop (every 2 s)
+  s.detectTimer = setInterval(runDetection, 2000);
+
+  // FPS counter (only meaningful for webcam)
+  s.fpsTimer = setInterval(() => {
+    document.getElementById('fpsCounter').textContent = s.frameCount + ' fps';
+    s.frameCount = 0;
+  }, 1000);
+
+  // Initial stats
+  fetchStats();
+  s.statsTimer = setInterval(fetchStats, 10000);  // FIX: store so closeLive() can clear it
+}
+
+/* ── Close modal ────────────────────────────────── */
+function closeLive() {
+  const s = liveState;
+  clearInterval(s.detectTimer);
+  clearInterval(s.fpsTimer);
+  clearInterval(s.statsTimer);   // FIX: was leaking on every modal open
+  if (s.stream) {
+    s.stream.getTracks().forEach(t => t.stop());
+    s.stream = null;
+  }
+  s.video.srcObject  = null;
+  s.video.style.display  = 'none';
+  s.mjpegImg.src     = '';
+  s.mjpegImg.style.display = 'none';
+  document.getElementById('liveModal').style.display  = 'none';
+  document.getElementById('liveConnecting').style.display = 'flex';
+  clearOverlay();
+}
+
+/* ── Start webcam stream ────────────────────────── */
+async function startWebcam(deviceIndex) {
+  const s = liveState;
+  try {
+    // Enumerate devices and pick by index
+    const devices = (await navigator.mediaDevices.enumerateDevices())
+      .filter(d => d.kind === 'videoinput');
+    const constraints = { video: devices[deviceIndex]
+      ? { deviceId: { exact: devices[deviceIndex].deviceId }, width:1280, height:720 }
+      : { width:1280, height:720 }
+    };
+    s.stream = await navigator.mediaDevices.getUserMedia(constraints);
+    s.video.srcObject = s.stream;
+    s.video.style.display = 'block';
+    s.mjpegImg.style.display = 'none';
+    await s.video.play();
+
+    s.video.addEventListener('loadedmetadata', () => {
+      document.getElementById('liveConnecting').style.display = 'none';
+      setStatus('Webcam connected — detecting…');
+      // Count frames for fps
+      function countFrame() { s.frameCount++; requestAnimationFrame(countFrame); }
+      requestAnimationFrame(countFrame);
+    });
+  } catch (err) {
+    setStatus('Webcam error: ' + err.message);
+    console.error(err);
+  }
+}
+
+/* ── Start MJPEG stream ─────────────────────────── */
+function startMJPEG(url) {
+  const s = liveState;
+
+  // Normalise URL — auto-append /stream for bare ESP32-CAM IP URLs.
+  let streamUrl = url.trim();
+  if (/^https?:\/\/[\d.]+\/?$/.test(streamUrl)) {
+    streamUrl = streamUrl.replace(/\/?$/, '/stream');
+    console.warn(`[LiveView] Auto-appended /stream → ${streamUrl}`);
+  }
+
+  // ── Mixed-Content fix ──────────────────────────────────────────────────────
+  // Django runs on HTTPS. Browsers BLOCK loading http:// content (images)
+  // from an https:// page — this is WHY the ESP32-CAM (HTTP) shows BLANK
+  // while the mobile camera (HTTPS) works. The fix: proxy the stream
+  // through Django so the browser only ever talks to the HTTPS origin.
+  const isHttp = streamUrl.toLowerCase().startsWith('http://');
+  let finalUrl = isHttp
+    ? `/cameras/${s.camId}/proxy-stream/`   // Django proxies HTTP→HTTPS
+    : streamUrl;
+
+  if (isHttp) {
+    console.log(`[LiveView] HTTP camera proxied via Django: ${finalUrl}`);
+    setStatus('Connecting via proxy (HTTP→HTTPS)…');
+  }
+
+  s.mjpegImg.crossOrigin = 'anonymous';
+  s.mjpegImg.src = finalUrl;
+  s.mjpegImg.style.display = 'block';
+  s.video.style.display = 'none';
+
+  const loadTimeout = setTimeout(() => {
+    setStatus('⚠ Camera not responding — check IP and WiFi');
+    document.getElementById('liveConnecting').style.display = 'flex';
+    document.getElementById('liveConnecting').innerHTML = `
+      <div style="color:#f87171;font-size:0.85rem;text-align:center;padding:20px">
+        <i class="bi bi-exclamation-triangle-fill d-block mb-2" style="font-size:2rem"></i>
+        Cannot connect to camera<br>
+        <code style="font-size:0.75rem;color:#94a3b8">${streamUrl}</code><br><br>
+        <small style="color:#64748b">Make sure:<br>
+        • ESP32-CAM is powered &amp; on same WiFi<br>
+        • URL ends with <strong>/stream</strong><br>
+        • No firewall blocking port 80</small>
+      </div>`;
+  }, 8000);
+
+  s.mjpegImg.onload = () => {
+    clearTimeout(loadTimeout);
+    document.getElementById('liveConnecting').style.display = 'none';
+    setStatus(isHttp
+      ? '✓ ESP32-CAM connected via proxy — detection running server-side…'
+      : '✓ Camera connected — detection running server-side…');
+  };
+  s.mjpegImg.onerror = () => {
+    clearTimeout(loadTimeout);
+    setStatus('✗ Cannot connect: ' + streamUrl);
+  };
+}
+
+/* ── Capture current frame as base64 JPEG ────────── */
+function captureFrame() {
+  const s = liveState;
+  const tmpCanvas = document.createElement('canvas');
+  let src = null;
+  if (s.isLocal && s.video.readyState >= 2) {
+    tmpCanvas.width  = s.video.videoWidth  || 640;
+    tmpCanvas.height = s.video.videoHeight || 480;
+    tmpCanvas.getContext('2d').drawImage(s.video, 0, 0);
+    src = tmpCanvas.toDataURL('image/jpeg', 0.75).split(',')[1];
+  } else if (!s.isLocal) {
+    // For MJPEG, draw the img element onto a canvas
+    // (only works if camera is same-origin or CORS-enabled)
+    try {
+      tmpCanvas.width  = s.mjpegImg.naturalWidth  || 640;
+      tmpCanvas.height = s.mjpegImg.naturalHeight || 480;
+      tmpCanvas.getContext('2d').drawImage(s.mjpegImg, 0, 0);
+      src = tmpCanvas.toDataURL('image/jpeg', 0.75).split(',')[1];
+    } catch (e) {
+      // Cross-origin — can't capture frame, send without snapshot
+      src = null;
+    }
+  }
+  return src;
+}
+
+/* ── Main detection cycle (every 2 s) ────────────── */
+async function runDetection() {
+  const s = liveState;
+  if (!s.students.length) return;
+
+  // Get frame snapshot for the server log
+  const snapshot = captureFrame();
+
+  // We can't run face_recognition in the browser, so we rely on
+  // the server-side detection script for actual recognition.
+  // What we DO here is:
+  //   1. Try browser face detection (just to draw boxes visually)
+  //   2. Ping /api/students/encodings/ to check who is currently inside
+  //   3. Show latest attendance logs for this camera in the panel
+
+  drawLiveBoxes();   // visual overlay from latest attendance
+  await refreshDetectionPanel();
+}
+
+/* ── Fetch students from server ─────────────────── */
+async function fetchStudents() {
+  try {
+    const r = await fetch('/api/students/encodings/');
+    return await r.json();
+  } catch { return []; }
+}
+
+/* ── Fetch today's attendance for this camera ────── */
+async function refreshDetectionPanel() {
+  try {
+    const r = await fetch(`/api/live-detections/?camera_id=${liveState.camId}`);
+    if (!r.ok) return;
+    const data = await r.json();
+    renderDetectionCards(data.logs || []);
+    document.getElementById('statTotal').textContent  = data.today_total  ?? 0;
+    document.getElementById('statInside').textContent = data.inside_now   ?? 0;
+  } catch (e) {
+    // API not yet added — fall back to attendance list data
+  }
+}
+
+async function fetchStats() {
+  try {
+    const r = await fetch(`/api/live-detections/?camera_id=${liveState.camId}`);
+    if (!r.ok) return;
+    const data = await r.json();
+    document.getElementById('statTotal').textContent  = data.today_total  ?? '--';
+    document.getElementById('statInside').textContent = data.inside_now   ?? '--';
+  } catch {}
+}
+
+/* ── Render detection cards in right panel ────────── */
+function renderDetectionCards(logs) {
+  const list = document.getElementById('detectionsList');
+  if (!logs.length) {
+    list.innerHTML = '<div style="color:#334155;font-size:0.8rem;text-align:center;margin-top:30px">No detections yet today</div>';
+    return;
+  }
+  list.innerHTML = logs.slice(0, 20).map(log => {
+    const emotion  = log.entry_emotion || 'unknown';
+    const emoji    = emojiMap[emotion] || '❓';
+    const isInside = !log.exit_time;
+    const time     = log.entry_time ? new Date(log.entry_time).toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'}) : '--:--';
+    const mood     = log.mood_comparison && log.mood_comparison !== 'unknown' ? log.mood_comparison : null;
+    return `
+    <div style="
+      background:rgba(255,255,255,0.04);border-radius:10px;padding:10px 12px;
+      border-left:3px solid ${isInside ? '#22c55e' : '#475569'};
+      animation:slideInCard .25s ease;
+    ">
+      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:4px">
+        <span style="color:#e2e8f0;font-weight:700;font-size:0.82rem;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:120px" title="${log.student_name}">${log.student_name}</span>
+        <span style="font-size:1rem">${emoji}</span>
+      </div>
+      <div style="display:flex;align-items:center;justify-content:space-between">
+        <span class="emo-${emotion}" style="font-size:0.72rem;text-transform:capitalize">${emotion}</span>
+        <span style="color:#475569;font-size:0.7rem">${time}</span>
+      </div>
+      ${mood ? `<div style="margin-top:4px">
+        <span style="
+          font-size:0.65rem;padding:2px 7px;border-radius:10px;
+          background:${mood==='improved'?'rgba(34,197,94,0.15)':mood==='declined'?'rgba(248,113,113,0.15)':'rgba(148,163,184,0.1)'};
+          color:${mood==='improved'?'#4ade80':mood==='declined'?'#f87171':'#94a3b8'}
+        ">${mood==='improved'?'↑ Mood improved':mood==='declined'?'↓ Mood declined':'→ Stable'}</span>
+      </div>` : ''}
+      <div style="margin-top:4px">
+        <span style="
+          font-size:0.65rem;padding:2px 7px;border-radius:10px;
+          background:${isInside?'rgba(34,197,94,0.15)':'rgba(100,116,139,0.15)'};
+          color:${isInside?'#4ade80':'#64748b'}
+        ">${isInside ? '● Inside' : '○ Left'}</span>
+      </div>
+    </div>`;
+  }).join('');
+}
+
+/* ── Draw boxes on overlay canvas from latest logs ── */
+function drawLiveBoxes() {
+  // This is a lightweight visual hint — actual boxes come from
+  // the detection script running server-side.
+  // Here we just show a "scanning" pulse on the canvas.
+  const canvas = liveState.canvas;
+  const ctx    = liveState.ctx;
+  const src    = liveState.isLocal ? liveState.video : liveState.mjpegImg;
+  if (!src) return;
+
+  const W = src.videoWidth  || src.naturalWidth  || canvas.offsetWidth;
+  const H = src.videoHeight || src.naturalHeight || canvas.offsetHeight;
+  canvas.width  = W;
+  canvas.height = H;
+
+  // Subtle scan-line effect
+  const scanY = ((Date.now() / 8) % H);
+  ctx.clearRect(0, 0, W, H);
+  const grad = ctx.createLinearGradient(0, scanY - 4, 0, scanY + 4);
+  grad.addColorStop(0,   'rgba(8,145,178,0)');
+  grad.addColorStop(0.5, 'rgba(8,145,178,0.25)');
+  grad.addColorStop(1,   'rgba(8,145,178,0)');
+  ctx.fillStyle = grad;
+  ctx.fillRect(0, scanY - 4, W, 8);
+}
+
+/* ── Overlay helpers ────────────────────────────── */
+function clearOverlay() {
+  const canvas = document.getElementById('overlayCanvas');
+  if (canvas) canvas.getContext('2d').clearRect(0, 0, canvas.width, canvas.height);
+}
+
+function setStatus(msg) {
+  document.getElementById('liveStatusText').textContent = msg;
+}
+
+function showToast(msg, duration = 2500) {
+  const el = document.getElementById('liveToast');
+  el.textContent = msg;
+  el.style.display = 'block';
+  setTimeout(() => el.style.display = 'none', duration);
+}
+
+/* Close modal on backdrop click */
+document.getElementById('liveModal').addEventListener('click', function(e) {
+  if (e.target === this) closeLive();
+});
+
+/* Close on Escape */
+document.addEventListener('keydown', e => { if (e.key === 'Escape') closeLive(); });
+</script>
+{% endblock %}

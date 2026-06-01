@@ -1,0 +1,26 @@
+{% extends 'entrance_cam/base.html' %}
+
+{% block title %}Error - ClassroomIoT{% endblock %}
+{% block page_title %}Access Denied{% endblock %}
+
+{% block content %}
+<div class="stat-card">
+  <div class="text-center py-5">
+    <i class="bi bi-exclamation-triangle" style="font-size:4rem;color:#ef4444"></i>
+    <h3 class="mt-3">{{ message }}</h3>
+    
+    <div class="mt-4 p-4 bg-light rounded text-start">
+      <h5>Current User Info:</h5>
+      <ul class="mb-0">
+        <li><strong>Username:</strong> {{ current_user }}</li>
+        <li><strong>Is Staff:</strong> {{ is_staff }}</li>
+        <li><strong>Is Superuser:</strong> {{ is_superuser }}</li>
+      </ul>
+    </div>
+    
+    <a href="{% url 'logout' %}" class="btn btn-danger mt-4">
+      <i class="bi bi-box-arrow-right me-2"></i> Log Out and Try Again
+    </a>
+  </div>
+</div>
+{% endblock %}

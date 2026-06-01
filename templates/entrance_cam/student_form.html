@@ -1,0 +1,68 @@
+{% extends "entrance_cam/base.html" %}
+{% block title %}{{ action }}{% endblock %}
+{% block page_title %}{{ action }}{% endblock %}
+{% block content %}
+<div class="row justify-content-center">
+  <div class="col-lg-8">
+    <div class="form-card">
+      <div class="section-hdr">
+        <h5><i class="bi bi-person-plus-fill me-2" style="color:#4f46e5"></i>{{ action }}</h5>
+        <a href="{% url 'student_list' %}" class="btn btn-sm" style="background:#f1f5f9;color:#64748b;border:none;border-radius:8px">
+          <i class="bi bi-arrow-left me-1"></i>Back
+        </a>
+      </div>
+      <form method="post" enctype="multipart/form-data">
+        {% csrf_token %}
+        <div class="row g-3">
+          <div class="col-md-6">
+            <label class="form-label fw-500 small">Full Name *</label>
+            {{ form.name }}
+            {% if form.name.errors %}<div class="text-danger small mt-1">{{ form.name.errors.0 }}</div>{% endif %}
+          </div>
+          <div class="col-md-6">
+            <label class="form-label fw-500 small">Roll Number *</label>
+            {{ form.roll_no }}
+            {% if form.roll_no.errors %}<div class="text-danger small mt-1">{{ form.roll_no.errors.0 }}</div>{% endif %}
+          </div>
+          <div class="col-md-6">
+            <label class="form-label fw-500 small">Email Address *</label>
+            {{ form.email }}
+            {% if form.email.errors %}<div class="text-danger small mt-1">{{ form.email.errors.0 }}</div>{% endif %}
+          </div>
+          <div class="col-md-6">
+            <label class="form-label fw-500 small">Branch *</label>
+            {{ form.branch }}
+          </div>
+          <div class="col-md-4">
+            <label class="form-label fw-500 small">Course *</label>
+            {{ form.course }}
+          </div>
+          <div class="col-md-4">
+            <label class="form-label fw-500 small">Year *</label>
+            {{ form.year }}
+          </div>
+          <div class="col-md-4">
+            <label class="form-label fw-500 small">Photo *</label>
+            {{ form.photo }}
+            <div class="form-text">Clear face photo for recognition</div>
+          </div>
+
+          {% if student and student.photo %}
+          <div class="col-12">
+            <label class="form-label fw-500 small">Current Photo</label><br>
+            <img src="{{ student.photo.url }}" style="width:80px;height:80px;object-fit:cover;border-radius:10px;border:2px solid #e2e8f0">
+          </div>
+          {% endif %}
+        </div>
+
+        <div class="d-flex gap-2 mt-4 pt-3" style="border-top:1px solid #e2e8f0">
+          <button type="submit" class="btn" style="background:#4f46e5;color:#fff;border:none;border-radius:10px;padding:10px 24px;font-weight:600">
+            <i class="bi bi-check-lg me-1"></i>{{ action }}
+          </button>
+          <a href="{% url 'student_list' %}" class="btn" style="background:#f1f5f9;color:#64748b;border:none;border-radius:10px;padding:10px 24px">Cancel</a>
+        </div>
+      </form>
+    </div>
+  </div>
+</div>
+{% endblock %}

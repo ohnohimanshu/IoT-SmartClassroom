@@ -1,0 +1,205 @@
+{% extends 'base.html' %}
+
+{% block title %}{{ incident.student.name }} - Incident Detail{% endblock %}
+
+{% block content %}
+<div class="container mt-4">
+    <div class="row">
+        <div class="col-md-8">
+            <h2>Incident Report</h2>
+            <hr>
+
+            <!-- Main Incident Card -->
+            <div class="card mb-4">
+                <div class="card-header bg-danger text-white">
+                    <h5>{{ incident.get_incident_emoji }} {{ incident.get_incident_type_display }}</h5>
+                </div>
+                <div class="card-body">
+                    <div class="row mb-3">
+                        <div class="col-md-6">
+                            <h6 class="text-muted">Student</h6>
+                            <p>
+                                <strong>{{ incident.student.name }}</strong> ({{ incident.student.roll_no }})<br>
+                                <small class="text-muted">{{ incident.student.email }}</small>
+                            </p>
+                        </div>
+                        <div class="col-md-6">
+                            <h6 class="text-muted">Camera</h6>
+                            <p><strong>{{ incident.camera.name }}</strong><br>
+                            <small class="text-muted">{{ incident.camera.location }}</small></p>
+                        </div>
+                    </div>
+
+                    <hr>
+
+                    <div class="row mb-3">
+                        <div class="col-md-3">
+                            <h6 class="text-muted">Severity</h6>
+                            {% if incident.severity == 'critical' %}
+                                <span class="badge badge-danger">{{ incident.severity|upper }}</span>
+                            {% elif incident.severity == 'high' %}
+                                <span class="badge badge-warning">{{ incident.severity|upper }}</span>
+                            {% elif incident.severity == 'medium' %}
+                                <span class="badge badge-info">{{ incident.severity|upper }}</span>
+                            {% else %}
+                                <span class="badge badge-secondary">{{ incident.severity|upper }}</span>
+                            {% endif %}
+                        </div>
+                        <div class="col-md-3">
+                            <h6 class="text-muted">Confidence</h6>
+                            <p><strong>{{ incident.confidence|floatformat:1 }}%</strong></p>
+                        </div>
+                        <div class="col-md-3">
+                            <h6 class="text-muted">Detected At</h6>
+                            <p><strong>{{ incident.detected_at|date:"M d, Y H:i" }}</strong></p>
+                        </div>
+                        <div class="col-md-3">
+                            <h6 class="text-muted">Time Ago</h6>
+                            <p><strong>{{ incident.detected_at|timesince }} ago</strong></p>
+                        </div>
+                    </div>
+
+                    <hr>
+
+                    <div class="row">
+                        <div class="col-md-6">
+                            <h6 class="text-muted">WhatsApp Alert</h6>
+                            {% if incident.whatsapp_sent %}
+                                <div class="alert alert-success mb-0">
+                                    ✓ Alert sent at {{ incident.whatsapp_sent_at|date:"M d, H:i" }}
+                                </div>
+                            {% else %}
+                                <div class="alert alert-secondary mb-0">
+                                    ✗ Alert not sent
+                                </div>
+                            {% endif %}
+                        </div>
+                        <div class="col-md-6">
+                            <h6 class="text-muted">Review Status</h6>
+                            {% if incident.is_reviewed %}
+                                <div class="alert alert-success mb-0">
+                                    ✓ Reviewed by {{ incident.reviewed_by.username }} on {{ incident.reviewed_at|date:"M d, H:i" }}
+                                </div>
+                            {% else %}
+                                <div class="alert alert-warning mb-0">
+                                    ⚠ Pending review
+                                </div>
+                            {% endif %}
+                        </div>
+                    </div>
+
+                    {% if incident.description %}
+                    <hr>
+                    <div>
+                        <h6 class="text-muted">Description</h6>
+                        <p>{{ incident.description }}</p>
+                    </div>
+                    {% endif %}
+
+                    {% if incident.admin_notes %}
+                    <hr>
+                    <div class="alert alert-info">
+                        <h6 class="text-muted">Admin Notes</h6>
+                        <p class="mb-0">{{ incident.admin_notes }}</p>
+                    </div>
+                    {% endif %}
+                </div>
+            </div>
+
+            <!-- Snapshot -->
+            {% if incident.snapshot %}
+            <div class="card mb-4">
+                <div class="card-header">
+                    <h5>Snapshot</h5>
+                </div>
+                <div class="card-body text-center">
+                    <img src="{{ incident.snapshot.url }}" alt="Incident Snapshot" class="img-fluid" style="max-height: 400px;">
+                </div>
+            </div>
+            {% endif %}
+
+            <!-- Review Section -->
+            {% if not incident.is_reviewed %}
+            <div class="card">
+                <div class="card-header bg-primary text-white">
+                    <h5>Review This Incident</h5>
+                </div>
+                <div class="card-body">
+                    <form method="POST" action="{% url 'incident_review' incident.id %}">
+                        {% csrf_token %}
+                        <div class="form-group">
+                            <label for="admin_notes">Admin Notes</label>
+                            <textarea class="form-control" id="admin_notes" name="admin_notes" rows="4" placeholder="Add your notes/action taken..."></textarea>
+                        </div>
+                        <button type="submit" class="btn btn-primary">Mark as Reviewed</button>
+                    </form>
+                </div>
+            </div>
+            {% endif %}
+        </div>
+
+        <!-- Sidebar -->
+        <div class="col-md-4">
+            <!-- Student Card -->
+            <div class="card mb-4">
+                <div class="card-header">
+                    <h5>Student Profile</h5>
+                </div>
+                <div class="card-body">
+                    {% if incident.student.photo %}
+                    <div class="text-center mb-3">
+                        <img src="{{ incident.student.photo.url }}" alt="{{ incident.student.name }}" class="img-fluid rounded" style="max-height: 150px;">
+                    </div>
+                    {% endif %}
+                    <dl class="row mb-0">
+                        <dt class="col-sm-6">Name:</dt>
+                        <dd class="col-sm-6">{{ incident.student.name }}</dd>
+                        
+                        <dt class="col-sm-6">Roll No:</dt>
+                        <dd class="col-sm-6">{{ incident.student.roll_no }}</dd>
+                        
+                        <dt class="col-sm-6">Email:</dt>
+                        <dd class="col-sm-6">
+                            <small>{{ incident.student.email }}</small>
+                        </dd>
+                        
+                        <dt class="col-sm-6">Course:</dt>
+                        <dd class="col-sm-6">{{ incident.student.course }}</dd>
+                        
+                        <dt class="col-sm-6">Year:</dt>
+                        <dd class="col-sm-6">{{ incident.student.year }}</dd>
+                    </dl>
+                    <a href="{% url 'student_detail' incident.student.id %}" class="btn btn-sm btn-outline-primary btn-block">View Profile</a>
+                </div>
+            </div>
+
+            <!-- Related Incidents -->
+            {% if related_incidents %}
+            <div class="card">
+                <div class="card-header">
+                    <h5>Related Incidents</h5>
+                </div>
+                <div class="list-group list-group-flush">
+                    {% for rel_incident in related_incidents %}
+                    <a href="{% url 'incident_detail' rel_incident.id %}" class="list-group-item list-group-item-action">
+                        <div class="d-flex w-100 justify-content-between">
+                            <h6 class="mb-1">{{ rel_incident.get_incident_emoji }} {{ rel_incident.get_incident_type_display }}</h6>
+                            <small>{{ rel_incident.detected_at|timesince }} ago</small>
+                        </div>
+                        <small class="text-muted">{{ rel_incident.detected_at|date:"M d, H:i" }}</small>
+                    </a>
+                    {% endfor %}
+                </div>
+            </div>
+            {% endif %}
+        </div>
+    </div>
+
+    <!-- Back Button -->
+    <div class="row mt-4">
+        <div class="col-md-12">
+            <a href="{% url 'incident_list' %}" class="btn btn-secondary">← Back to Incidents</a>
+        </div>
+    </div>
+</div>
+{% endblock %}
