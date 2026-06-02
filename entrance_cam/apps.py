@@ -47,6 +47,8 @@ class EntranceCamConfig(AppConfig):
 
         # Only start detection when running server (not migrations, shell, etc.)
         if 'runserver' in sys.argv or 'runsslserver' in sys.argv:
+            print("[INFO] Django runserver/runsslserver detected")
+            
             # Prevent double-start from Django's autoreloader.
             # When reloader is active, Django forks:
             #   - Parent process: RUN_MAIN is not set  → this is the watcher, skip
@@ -54,20 +56,27 @@ class EntranceCamConfig(AppConfig):
             # When --noreload is used, RUN_MAIN is never set, so we start directly.
             is_reloader_child = os.environ.get('RUN_MAIN') == 'true'
             no_reload = '--noreload' in sys.argv
+            
+            print(f"[DEBUG] RUN_MAIN={os.environ.get('RUN_MAIN')}, no_reload={no_reload}")
+            
             if is_reloader_child or no_reload:
+                print("[INFO] Starting detection script auto-start...")
                 # Register cleanup on exit
                 atexit.register(self._cleanup_all_processes)
                 
                 # Start detection scripts in background thread
                 threading.Thread(target=self._delayed_start, daemon=True).start()
+            else:
+                print("[INFO] Running in reloader parent process (autoreloader watch) - detection will start in child")
     
     def _delayed_start(self):
         """Wait a bit for Django to fully initialize, then start detection."""
-        # Wait 5 seconds for Django server to start accepting connections
-        print("[INFO] Waiting 5 seconds for Django server to fully start...")
-        time.sleep(5)
+        # Wait 3 seconds for Django server to start accepting connections
+        print("[INFO] Waiting 3 seconds for Django server to fully start...")
+        time.sleep(3)
         
         # Wait for server to actually be ready
+        print("[INFO] Checking if server is ready...")
         if not self._wait_for_server():
             print("[ERROR] Django server did not become ready. Detection not started.")
             return
@@ -98,6 +107,12 @@ class EntranceCamConfig(AppConfig):
         else:
             host = address
             port = 8000
+        
+        # If binding to 0.0.0.0 or ::, try to connect to localhost instead
+        if host == '0.0.0.0':
+            host = '127.0.0.1'
+        elif host == '::':
+            host = '::1'
         
         host = host.strip('[]')
         

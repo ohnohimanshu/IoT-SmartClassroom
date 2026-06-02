@@ -70,6 +70,14 @@ def api_log_camera_attendance(request):
             status=404
         )
     
+    # Check if student has face encoding for camera detection
+    if not student.face_encoding:
+        logger.warning(f"Student {student_id} ({student.name}) has no face encoding")
+        return JsonResponse(
+            {'error': f'Student {student.name} has no face encoding. Upload photo and regenerate encodings in admin.'},
+            status=400
+        )
+    
     # Get camera
     try:
         camera = Camera.objects.get(pk=camera_id, is_active=True)

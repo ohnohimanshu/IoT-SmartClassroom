@@ -209,11 +209,30 @@ def student_delete(request, pk):
 @login_required
 def student_detail(request, pk):
     student = get_object_or_404(Student, pk=pk)
-    logs = (AttendanceLog.objects
-            .filter(student=student)
-            .order_by('-date', '-entry_time')[:30])
+    
+    # Get both fingerprint and camera attendance logs
+    from camera_attendance.models import CameraAttendanceLog
+    from datetime import timedelta
+    from django.utils import timezone
+    
+    # Get last 30 days of logs
+    thirty_days_ago = timezone.now() - timedelta(days=30)
+    
+    # Combine both types of logs
+    fingerprint_logs = (AttendanceLog.objects
+                       .filter(student=student)
+                       .order_by('-date', '-entry_time')[:30])
+    
+    camera_logs = (CameraAttendanceLog.objects
+                  .filter(student=student, entry_time__gte=thirty_days_ago)
+                  .order_by('-entry_time')[:30])
+    
+    # Combine and sort by date
+    all_logs = list(fingerprint_logs) + list(camera_logs)
+    all_logs.sort(key=lambda x: x.entry_time if hasattr(x, 'entry_time') else x.date, reverse=True)
+    
     return render(request, 'entrance_cam/student_detail.html',
-                  {'student': student, 'logs': logs})
+                  {'student': student, 'logs': all_logs, 'camera_logs': camera_logs})
 
 
 # ── Cameras ───────────────────────────────────────────────────────────────────

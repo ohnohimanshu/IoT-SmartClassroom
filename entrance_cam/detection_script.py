@@ -103,76 +103,35 @@ def detect_faces(frame):
     Detect faces using Haar cascade.
     Returns list of (x, y, w, h) tuples, or empty list.
     """
-    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-    gray = cv2.equalizeHist(gray)          # improve detection in low light
-    faces = face_cascade.detectMultiScale(
-        gray,
-        scaleFactor=1.05,
-        minNeighbors=4,
-        minSize=(50, 50),
-        flags=cv2.CASCADE_SCALE_IMAGE
-    )
-    if len(faces) == 0:
+    try:
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        gray = cv2.equalizeHist(gray)          # improve detection in low light
+        faces = face_cascade.detectMultiScale(
+            gray,
+            scaleFactor=1.05,
+            minNeighbors=3,                     # Lowered from 4 to catch more faces
+            minSize=(40, 40),                   # Lowered from 50 for smaller faces
+            flags=cv2.CASCADE_SCALE_IMAGE
+        )
+        if len(faces) == 0:
+            return []
+        return faces
+    except Exception as e:
+        print(f"[ERROR] Face detection failed: {e}")
         return []
-    return faces
 
 
 # ── Mood / emotion detection ──────────────────────────────────────────────────
 
 def detect_emotion(frame, face_box):
     """
-    Detect emotion for a detected face region using DeepFace.
+    Detect emotion for a detected face region.
     Returns (emotion_str, confidence_float).
-    Falls back to ('neutral', 0.0) if DeepFace unavailable or fails.
+    
+    Disabled to reduce memory usage on Windows.
+    Always returns 'neutral'.
     """
-    if not DEEPFACE_AVAILABLE:
-        return 'neutral', 0.0
-
-    try:
-        x, y, w, h = face_box
-        # Add small padding around face for better emotion accuracy
-        pad = 20
-        fh, fw = frame.shape[:2]
-        x1 = max(0, x - pad)
-        y1 = max(0, y - pad)
-        x2 = min(fw, x + w + pad)
-        y2 = min(fh, y + h + pad)
-        face_crop = frame[y1:y2, x1:x2]
-
-        if face_crop.size == 0:
-            return 'neutral', 0.0
-
-        result = DeepFace.analyze(
-            face_crop,
-            actions=['emotion'],
-            enforce_detection=False,
-            silent=True
-        )
-
-        # DeepFace returns a list when multiple faces found
-        if isinstance(result, list):
-            result = result[0]
-
-        dominant = result.get('dominant_emotion', 'neutral').lower()
-        emotions = result.get('emotion', {})
-        score = float(emotions.get(dominant, 0.0)) / 100.0   # normalise 0-1
-
-        # Map DeepFace labels to our model's EMOTION_CHOICES
-        label_map = {
-            'happy':    'happy',
-            'sad':      'sad',
-            'angry':    'angry',
-            'neutral':  'neutral',
-            'surprise': 'surprise',
-            'fear':     'fear',
-            'disgust':  'disgust',
-        }
-        emotion = label_map.get(dominant, 'neutral')
-        return emotion, round(score, 4)
-
-    except Exception as e:
-        # Don't crash detection loop on emotion failure
-        return 'neutral', 0.0
+    return 'neutral', 0.0
 
 
 # ── Student face matching ─────────────────────────────────────────────────────
@@ -305,6 +264,13 @@ def run_detection(camera_url, camera_id, server_url, cooldown=30, no_gui=True):
     - Snapshot captured and sent with each log
     - Emotion detected per face via DeepFace
     """
+    print(f"\n{'='*70}")
+    print(f"[DETECTION] Starting detection script")
+    print(f"[DETECTION] Camera URL: {camera_url}")
+    print(f"[DETECTION] Camera ID: {camera_id}")
+    print(f"[DETECTION] Server URL: {server_url}")
+    print(f"{'='*70}\n")
+    
     STUDENT_REFRESH_FRAMES = 900   # ~30 s at 30 fps — refresh student list
 
     print("[INFO] Loading dependencies...")

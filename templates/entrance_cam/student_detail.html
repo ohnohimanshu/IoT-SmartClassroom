@@ -66,11 +66,11 @@
           <tbody>
             {% for log in logs %}
             <tr>
-              <td>{{ log.date|date:"d M Y" }}</td>
+              <td>{% if log.date %}{{ log.date|date:"d M Y" }}{% else %}{{ log.entry_time|date:"d M Y" }}{% endif %}</td>
               <td>{{ log.entry_time|date:"H:i" }}</td>
               <td>{% if log.exit_time %}{{ log.exit_time|date:"H:i" }}{% else %}<span class="text-warning fw-500">Inside</span>{% endif %}</td>
               <td><span class="emotion-badge badge-{{ log.entry_emotion }}">{{ log.entry_emotion|title }}</span></td>
-              <td>{% if log.exit_time %}<span class="emotion-badge badge-{{ log.exit_emotion }}">{{ log.exit_emotion|title }}</span>{% else %}—{% endif %}</td>
+              <td>{% if log.exit_emotion %}<span class="emotion-badge badge-{{ log.exit_emotion }}">{{ log.exit_emotion|title }}</span>{% else %}—{% endif %}</td>
               <td>{% if log.duration_minutes %}{{ log.duration_minutes }} min{% else %}—{% endif %}</td>
             </tr>
             {% endfor %}
