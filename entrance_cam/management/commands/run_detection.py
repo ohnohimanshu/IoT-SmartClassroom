@@ -51,10 +51,11 @@ class Command(BaseCommand):
             self.stdout.write(self.style.WARNING('No active cameras found'))
             return
 
-        # Path to detection_script.py
+        # Path to detection_script_v2.py (in camera_attendance app)
         script_path = os.path.join(
             os.path.dirname(os.path.dirname(os.path.dirname(__file__))),
-            'detection_script.py'
+            'camera_attendance',
+            'detection_script_v2.py'
         )
         script_path = os.path.normpath(script_path)
         if not os.path.exists(script_path):

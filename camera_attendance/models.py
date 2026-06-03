@@ -128,3 +128,4 @@ class CameraAttendanceLog(models.Model):
         if self.entry_time and self.exit_time:
             delta = self.exit_time - self.entry_time
             self.duration_minutes = int(delta.total_seconds() / 60)
+            self.save(update_fields=['duration_minutes'])

@@ -143,6 +143,9 @@
     <a href="{% url 'attendance_list' %}" class="sidebar-link {% if 'attendance' in request.resolver_match.url_name %}active{% endif %}">
       <i class="bi bi-calendar-check"></i> Attendance
     </a>
+    <a href="{% url 'camera_attendance:dashboard' %}" class="sidebar-link {% if 'camera_attendance' in request.resolver_match.app_name %}active{% endif %}">
+      <i class="bi bi-camera-video"></i> Camera Attendance
+    </a>
     <div class="nav-section">Lab Monitor</div>
     <a href="{% url 'lab_monitor' %}" class="sidebar-link {% if request.resolver_match.url_name == 'lab_monitor' %}active{% endif %}">
       <i class="bi bi-display"></i> Live Monitor

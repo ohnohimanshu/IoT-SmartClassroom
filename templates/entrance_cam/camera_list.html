@@ -6,7 +6,8 @@
 <div class="form-card">
   <div class="section-hdr">
     <h5><i class="bi bi-camera-video me-2" style="color:#0891b2"></i>Entrance Cameras</h5>
-    <a href="{% url 'camera_add' %}" class="btn btn-sm" style="background:#0891b2;color:#fff;border:none;border-radius:8px">
+    <a href="{% url 'camera_add' %}" class="btn btn-sm"
+       style="background:#0891b2;color:#fff;border:none;border-radius:8px">
       <i class="bi bi-plus-lg me-1"></i>Add Camera
     </a>
   </div>
@@ -16,8 +17,10 @@
     {% for cam in cameras %}
     <div class="col-md-6 col-xl-4">
       <div class="stat-card" style="border-radius:14px">
+
         <div class="d-flex align-items-start justify-content-between mb-3">
-          <div class="stat-icon" style="background:{% if cam.is_active %}#cffafe{% else %}#fee2e2{% endif %}">
+          <div class="stat-icon"
+               style="background:{% if cam.is_active %}#cffafe{% else %}#fee2e2{% endif %}">
             <i class="bi bi-camera-video{% if not cam.is_active %}-off{% endif %}-fill"
                style="color:{% if cam.is_active %}#0891b2{% else %}#dc2626{% endif %}"></i>
           </div>
@@ -33,13 +36,15 @@
 
         <div class="fw-700 mb-1" style="color:#1e293b">{{ cam.name }}</div>
         <div class="small text-muted mb-1"><i class="bi bi-geo-alt me-1"></i>{{ cam.location }}</div>
-        <div class="small text-muted mb-3" style="word-break:break-all;font-size:0.75rem">
+        <div class="small text-muted mb-3"
+             style="word-break:break-all;font-size:.75rem">
           <i class="bi bi-link-45deg me-1"></i><code>{{ cam.url }}</code>
-          {% if cam.is_active and cam.url and not cam.url|lower|slice:":4" == "rtsp" %}
+          {% if cam.is_active and cam.url %}
             {% with url=cam.url|lower %}
               {% if url|slice:":7" == "http://" or url|slice:":8" == "https://" %}
                 {% if "/stream" not in url and "/video" not in url %}
-                  <div class="mt-1 p-1 px-2" style="background:#fef3c7;border-radius:6px;font-size:0.7rem;color:#92400e">
+                  <div class="mt-1 p-1 px-2"
+                       style="background:#fef3c7;border-radius:6px;font-size:.7rem;color:#92400e">
                     ⚠ ESP32-CAM URL should end with <strong>/stream</strong>
                     — e.g. <code>{{ cam.url }}/stream</code>
                   </div>
@@ -50,14 +55,12 @@
         </div>
 
         <div class="d-flex gap-2">
-          <!-- Test button -->
           <button onclick="testCamera({{ cam.pk }}, this)"
                   class="btn btn-sm"
                   style="background:#f1f5f9;color:#475569;border:none;border-radius:8px;flex:1">
             <i class="bi bi-wifi me-1"></i>Test
           </button>
 
-          <!-- Live button -->
           <button onclick="openLive({{ cam.pk }}, '{{ cam.name|escapejs }}', '{{ cam.url|escapejs }}')"
                   class="btn btn-sm live-btn"
                   style="background:#0891b2;color:#fff;border:none;border-radius:8px;flex:1">
@@ -65,14 +68,17 @@
           </button>
 
           <a href="{% url 'camera_edit' cam.pk %}"
-             class="btn btn-sm" style="background:#cffafe;color:#0891b2;border:none;border-radius:8px">
+             class="btn btn-sm"
+             style="background:#cffafe;color:#0891b2;border:none;border-radius:8px">
             <i class="bi bi-pencil"></i>
           </a>
           <a href="{% url 'camera_delete' cam.pk %}"
-             class="btn btn-sm" style="background:#fee2e2;color:#dc2626;border:none;border-radius:8px">
+             class="btn btn-sm"
+             style="background:#fee2e2;color:#dc2626;border:none;border-radius:8px">
             <i class="bi bi-trash"></i>
           </a>
         </div>
+
       </div>
     </div>
     {% endfor %}
@@ -92,171 +98,222 @@
 ════════════════════════════════════════════════════════════════ -->
 <div id="liveModal" style="
   display:none; position:fixed; inset:0; z-index:9999;
-  background:rgba(0,0,0,0.82); backdrop-filter:blur(6px);
+  background:rgba(2,8,23,0.88); backdrop-filter:blur(8px);
   align-items:center; justify-content:center;
 ">
+<div style="
+  background:#0f172a; border-radius:20px;
+  width:min(98vw,1060px); max-height:94vh;
+  display:flex; flex-direction:column;
+  box-shadow:0 40px 100px rgba(0,0,0,.8);
+  border:1px solid rgba(8,145,178,0.22);
+  overflow:hidden;
+">
+
+  <!-- ── Header ── -->
   <div style="
-    background:#0f172a; border-radius:20px;
-    width:min(96vw,960px); max-height:92vh;
-    display:flex; flex-direction:column;
-    box-shadow:0 30px 80px rgba(0,0,0,0.7);
-    overflow:hidden;
-    border:1px solid rgba(8,145,178,0.25);
+    display:flex; align-items:center; justify-content:space-between;
+    padding:13px 20px;
+    background:linear-gradient(90deg,rgba(8,145,178,.18),transparent);
+    border-bottom:1px solid rgba(255,255,255,.06);
+    flex-shrink:0;
   ">
-
-    <!-- Modal header -->
-    <div style="
-      display:flex; align-items:center; justify-content:space-between;
-      padding:14px 20px;
-      background:linear-gradient(90deg,rgba(8,145,178,0.15),transparent);
-      border-bottom:1px solid rgba(255,255,255,0.06);
-    ">
-      <div style="display:flex;align-items:center;gap:10px">
-        <span id="liveDot" style="
-          width:10px;height:10px;border-radius:50%;
-          background:#22c55e;
-          box-shadow:0 0 8px #22c55e;
-          animation:pulse-dot 1.2s infinite;
-        "></span>
-        <span style="color:#e2e8f0;font-weight:700;font-size:1rem" id="modalCamName">Live Feed</span>
-        <span style="color:#64748b;font-size:0.78rem" id="modalCamLoc"></span>
-      </div>
-      <div style="display:flex;align-items:center;gap:10px">
-        <span id="fpsCounter" style="color:#0891b2;font-size:0.75rem;font-family:monospace">-- fps</span>
-        <button onclick="closeLive()"
-                style="background:rgba(255,255,255,0.08);border:none;color:#94a3b8;
-                       width:32px;height:32px;border-radius:8px;cursor:pointer;
-                       display:flex;align-items:center;justify-content:center;
-                       font-size:1.1rem;transition:background 0.2s"
-                onmouseover="this.style.background='rgba(220,38,38,0.3)';this.style.color='#f87171'"
-                onmouseout="this.style.background='rgba(255,255,255,0.08)';this.style.color='#94a3b8'">
-          ✕
-        </button>
-      </div>
+    <div style="display:flex;align-items:center;gap:10px">
+      <span id="liveDot" style="
+        width:10px;height:10px;border-radius:50%;background:#22c55e;
+        box-shadow:0 0 8px #22c55e;animation:pulseDot 1.4s infinite;
+      "></span>
+      <span id="modalCamName"
+            style="color:#e2e8f0;font-weight:700;font-size:.95rem">Live Feed</span>
+      <span id="modalCamLoc" style="color:#64748b;font-size:.75rem"></span>
+      <!-- detection mode badge -->
+      <span id="detModeBadge" style="
+        display:none;font-size:.65rem;padding:2px 8px;border-radius:10px;
+        background:rgba(8,145,178,.15);color:#38bdf8;
+        border:1px solid rgba(8,145,178,.3);
+      ">Browser Detection</span>
     </div>
-
-    <!-- Main content area -->
-    <div style="display:flex;flex:1;overflow:hidden;min-height:0">
-
-      <!-- Video + canvas wrapper -->
-      <div style="flex:1;position:relative;background:#000;min-height:300px;overflow:hidden">
-
-        <!-- Webcam video element (for local cameras) -->
-        <video id="liveVideo" autoplay playsinline muted
-               style="width:100%;height:100%;object-fit:contain;display:none"></video>
-
-        <!-- MJPEG img element (for IP cameras) -->
-        <img id="mjpegImg" alt="Camera Feed"
-             style="width:100%;height:100%;object-fit:contain;display:none;position:absolute;inset:0"/>
-
-        <!-- Overlay canvas for face boxes + labels -->
-        <canvas id="overlayCanvas"
-                style="position:absolute;inset:0;width:100%;height:100%;pointer-events:none"></canvas>
-
-        <!-- "Connecting…" placeholder -->
-        <div id="liveConnecting" style="
-          position:absolute;inset:0;display:flex;flex-direction:column;
-          align-items:center;justify-content:center;color:#64748b;gap:12px
-        ">
-          <div class="spinner-border" style="color:#0891b2;width:2.5rem;height:2.5rem"></div>
-          <div style="font-size:0.85rem">Connecting to camera…</div>
-        </div>
-
-        <!-- "No face / Unknown" toast -->
-        <div id="liveToast" style="
-          position:absolute;bottom:14px;left:50%;transform:translateX(-50%);
-          background:rgba(0,0,0,0.7);color:#cbd5e1;
-          font-size:0.75rem;padding:6px 16px;border-radius:20px;
-          display:none;white-space:nowrap;pointer-events:none
-        "></div>
-      </div>
-
-      <!-- Right panel: detections list -->
-      <div style="
-        width:260px;flex-shrink:0;
-        background:#0a1628;
-        border-left:1px solid rgba(255,255,255,0.06);
-        display:flex;flex-direction:column;overflow:hidden;
-      ">
-        <div style="padding:14px 16px 8px;color:#94a3b8;font-size:0.72rem;font-weight:700;letter-spacing:.08em;text-transform:uppercase">
-          Recent Detections
-        </div>
-        <div id="detectionsList" style="
-          flex:1;overflow-y:auto;padding:0 10px 10px;
-          display:flex;flex-direction:column;gap:6px;
-        ">
-          <div style="color:#334155;font-size:0.8rem;text-align:center;margin-top:30px">
-            No detections yet
-          </div>
-        </div>
-
-        <!-- Stats bar -->
-        <div style="
-          padding:12px 16px;
-          border-top:1px solid rgba(255,255,255,0.06);
-          display:grid;grid-template-columns:1fr 1fr;gap:8px
-        ">
-          <div style="text-align:center">
-            <div id="statTotal" style="color:#e2e8f0;font-size:1.2rem;font-weight:800">0</div>
-            <div style="color:#64748b;font-size:0.68rem">Total Today</div>
-          </div>
-          <div style="text-align:center">
-            <div id="statInside" style="color:#22c55e;font-size:1.2rem;font-weight:800">0</div>
-            <div style="color:#64748b;font-size:0.68rem">Inside Now</div>
-          </div>
-        </div>
-      </div>
-    </div>
-
-    <!-- Bottom bar: instructions -->
-    <div style="
-      padding:10px 20px;
-      background:rgba(0,0,0,0.3);
-      border-top:1px solid rgba(255,255,255,0.04);
-      display:flex;align-items:center;justify-content:space-between;
-      flex-wrap:wrap;gap:8px
-    ">
-      <span style="color:#475569;font-size:0.72rem">
-        <i class="bi bi-info-circle me-1"></i>
-        Face detection runs <strong style="color:#0891b2">server-side</strong> via detection_script.py — this view shows the live feed &amp; logged results.
-      </span>
-      <span id="liveStatusText" style="color:#0891b2;font-size:0.72rem;font-family:monospace">Initialising…</span>
+    <div style="display:flex;align-items:center;gap:12px">
+      <span id="fpsCounter"
+            style="color:#475569;font-size:.73rem;font-family:monospace">-- fps</span>
+      <button onclick="closeLive()"
+              title="Close (Esc)"
+              style="background:rgba(255,255,255,.07);border:none;color:#94a3b8;
+                     width:34px;height:34px;border-radius:9px;cursor:pointer;
+                     display:flex;align-items:center;justify-content:center;
+                     font-size:1.05rem;transition:all .18s"
+              onmouseover="this.style.background='rgba(220,38,38,.28)';this.style.color='#f87171'"
+              onmouseout="this.style.background='rgba(255,255,255,.07)';this.style.color='#94a3b8'">✕</button>
     </div>
   </div>
-</div>
+
+  <!-- ── Body ── -->
+  <div style="display:flex;flex:1;overflow:hidden;min-height:0">
+
+    <!-- ── Video area ── -->
+    <div style="flex:1;position:relative;background:#000;min-height:320px;overflow:hidden">
+
+      <!-- Webcam video -->
+      <video id="liveVideo" autoplay playsinline muted
+             style="width:100%;height:100%;object-fit:contain;display:none;position:absolute;inset:0"></video>
+
+      <!-- MJPEG img -->
+      <img id="mjpegImg" alt="Camera Feed"
+           style="width:100%;height:100%;object-fit:contain;display:none;position:absolute;inset:0"/>
+
+      <!-- Face-box overlay canvas -->
+      <canvas id="overlayCanvas"
+              style="position:absolute;inset:0;width:100%;height:100%;pointer-events:none;z-index:2"></canvas>
+
+      <!-- Scan-line animation canvas (underneath boxes) -->
+      <canvas id="scanCanvas"
+              style="position:absolute;inset:0;width:100%;height:100%;pointer-events:none;z-index:1"></canvas>
+
+      <!-- Connecting overlay -->
+      <div id="liveConnecting" style="
+        position:absolute;inset:0;display:flex;flex-direction:column;
+        align-items:center;justify-content:center;color:#64748b;gap:14px;z-index:5;
+        background:rgba(15,23,42,.9);
+      ">
+        <div class="spinner-border" style="color:#0891b2;width:2.8rem;height:2.8rem"></div>
+        <div style="font-size:.85rem" id="connectMsg">Connecting to camera…</div>
+      </div>
+
+      <!-- Last-detection badge (bottom-left) -->
+      <div id="lastDetectBadge" style="
+        position:absolute;bottom:14px;left:14px;z-index:3;
+        background:rgba(0,0,0,.72);backdrop-filter:blur(4px);
+        color:#e2e8f0;font-size:.75rem;padding:7px 14px;
+        border-radius:14px;display:none;
+        border:1px solid rgba(255,255,255,.08);
+        transition:opacity .3s;
+      "></div>
+
+      <!-- Toast (bottom-center) -->
+      <div id="liveToast" style="
+        position:absolute;bottom:14px;left:50%;transform:translateX(-50%);z-index:4;
+        background:rgba(0,0,0,.75);color:#cbd5e1;
+        font-size:.74rem;padding:6px 18px;border-radius:20px;
+        display:none;white-space:nowrap;pointer-events:none;
+        border:1px solid rgba(255,255,255,.07);
+      "></div>
+    </div>
+
+    <!-- ── Right panel ── -->
+    <div style="
+      width:270px;flex-shrink:0;
+      background:#080f1f;
+      border-left:1px solid rgba(255,255,255,.05);
+      display:flex;flex-direction:column;overflow:hidden;
+    ">
+      <!-- Panel header -->
+      <div style="
+        padding:13px 16px 8px;
+        color:#475569;font-size:.68rem;font-weight:700;
+        letter-spacing:.09em;text-transform:uppercase;
+        border-bottom:1px solid rgba(255,255,255,.04);
+        display:flex;justify-content:space-between;align-items:center;
+      ">
+        <span>Detections Today</span>
+        <span id="panelRefreshSpinner" style="display:none;font-size:.7rem;color:#0891b2">↻</span>
+      </div>
+
+      <!-- Detections list -->
+      <div id="detectionsList" style="
+        flex:1;overflow-y:auto;padding:8px 10px;
+        display:flex;flex-direction:column;gap:6px;
+      ">
+        <div class="no-detect-msg"
+             style="color:#2d3f58;font-size:.8rem;text-align:center;margin-top:24px">
+          No detections yet today
+        </div>
+      </div>
+
+      <!-- Stats bar -->
+      <div style="
+        padding:12px 16px;
+        border-top:1px solid rgba(255,255,255,.05);
+        display:grid;grid-template-columns:1fr 1fr 1fr;gap:6px;
+      ">
+        <div style="text-align:center">
+          <div id="statTotal"  style="color:#e2e8f0;font-size:1.15rem;font-weight:800">—</div>
+          <div style="color:#475569;font-size:.65rem">Total</div>
+        </div>
+        <div style="text-align:center">
+          <div id="statInside" style="color:#22c55e;font-size:1.15rem;font-weight:800">—</div>
+          <div style="color:#475569;font-size:.65rem">Inside</div>
+        </div>
+        <div style="text-align:center">
+          <div id="statMood"   style="font-size:1.05rem;font-weight:800">—</div>
+          <div style="color:#475569;font-size:.65rem">Mood ↑</div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ── Footer status bar ── -->
+  <div style="
+    padding:9px 20px;
+    background:rgba(0,0,0,.28);
+    border-top:1px solid rgba(255,255,255,.04);
+    display:flex;align-items:center;justify-content:space-between;
+    flex-wrap:wrap;gap:6px;flex-shrink:0;
+  ">
+    <span style="color:#334155;font-size:.7rem">
+      <i class="bi bi-info-circle me-1"></i>
+      Face detection runs <strong style="color:#0891b2">server-side</strong> via detection_script_v2.py
+      — this panel shows live feed &amp; logged results.
+    </span>
+    <span id="liveStatusText"
+          style="color:#0891b2;font-size:.7rem;font-family:monospace">Initialising…</span>
+  </div>
+
+</div><!-- /modal inner -->
+</div><!-- /liveModal -->
 
 
-<!-- CSS keyframes -->
+<!-- ═══════════════════════════════════════════════ STYLES ══ -->
 <style>
-@keyframes pulse-dot {
-  0%,100% { opacity:1; transform:scale(1); }
-  50%      { opacity:.5; transform:scale(1.4); }
+@keyframes pulseDot {
+  0%,100%{ opacity:1;transform:scale(1)   }
+  50%    { opacity:.4;transform:scale(1.5) }
 }
-@keyframes slideInCard {
-  from { opacity:0; transform:translateY(-8px); }
-  to   { opacity:1; transform:translateY(0); }
+@keyframes slideCard {
+  from{ opacity:0;transform:translateY(-6px) }
+  to  { opacity:1;transform:translateY(0)    }
 }
-.live-btn:hover { background:#0e7490 !important; transform:translateY(-1px); }
-.live-btn { transition:all .15s ease; }
+@keyframes faceBoxIn {
+  from{ opacity:0 }
+  to  { opacity:1 }
+}
 
-/* Emotion colour map */
-.emo-happy    { color:#fbbf24; }
-.emo-sad      { color:#60a5fa; }
-.emo-angry    { color:#f87171; }
-.emo-neutral  { color:#94a3b8; }
-.emo-surprise { color:#a78bfa; }
-.emo-fear     { color:#fb923c; }
-.emo-disgust  { color:#4ade80; }
-.emo-unknown  { color:#64748b; }
+.live-btn          { transition:all .15s ease }
+.live-btn:hover    { background:#0e7490 !important;transform:translateY(-1px) }
+
+/* Emotion text colours */
+.emo-happy   { color:#fbbf24 }
+.emo-sad     { color:#60a5fa }
+.emo-angry   { color:#f87171 }
+.emo-neutral { color:#94a3b8 }
+.emo-surprise{ color:#a78bfa }
+.emo-fear    { color:#fb923c }
+.emo-disgust { color:#4ade80 }
+.emo-unknown { color:#475569 }
+
+/* Scrollbar */
+#detectionsList::-webkit-scrollbar{ width:4px }
+#detectionsList::-webkit-scrollbar-track{ background:transparent }
+#detectionsList::-webkit-scrollbar-thumb{ background:#1e3a5f;border-radius:4px }
 </style>
 {% endblock %}
 
 
+<!-- ═══════════════════════════════════════════════ SCRIPTS ══ -->
 {% block scripts %}
 <script>
-/* ═══════════════════════════════════════════════════
-   CAMERA TEST (unchanged)
-═══════════════════════════════════════════════════ */
+/* ─────────────────────────────────────────────────────────────
+   CAMERA TEST
+───────────────────────────────────────────────────────────── */
 function testCamera(pk, btn) {
   btn.disabled = true;
   btn.innerHTML = '<span class="spinner-border spinner-border-sm me-1"></span>Testing…';
@@ -266,369 +323,502 @@ function testCamera(pk, btn) {
       btn.disabled = false;
       if (d.status === 'online') {
         btn.innerHTML = '<i class="bi bi-check-circle-fill me-1"></i>Online';
-        btn.style.background = '#dcfce7'; btn.style.color = '#166534';
+        btn.style.cssText += 'background:#dcfce7;color:#166534';
       } else {
         btn.innerHTML = '<i class="bi bi-x-circle-fill me-1"></i>Offline';
-        btn.style.background = '#fee2e2'; btn.style.color = '#dc2626';
+        btn.style.cssText += 'background:#fee2e2;color:#dc2626';
       }
       setTimeout(() => {
         btn.innerHTML = '<i class="bi bi-wifi me-1"></i>Test';
         btn.style.background = ''; btn.style.color = ''; btn.disabled = false;
       }, 3000);
-    });
+    })
+    .catch(() => { btn.disabled = false; btn.innerHTML = '<i class="bi bi-wifi me-1"></i>Test'; });
 }
 
 
-/* ═══════════════════════════════════════════════════
-   LIVE DETECTION
-═══════════════════════════════════════════════════ */
-let liveState = {
-  camId:       null,
-  camUrl:      null,
-  stream:      null,          // MediaStream for webcam
-  detectTimer: null,          // setInterval handle
-  fpsTimer:    null,
-  statsTimer:  null,          // FIX: track stats interval so it can be cleared
-  frameCount:  0,
-  students:    [],            // [{id, name, encoding}]
-  detections:  [],            // rolling list of logged detections
-  cooldowns:   {},            // studentId → last log timestamp (ms)
-  COOLDOWN_MS: 30000,         // 30 s between repeated logs
-  canvas:      null,
-  ctx:         null,
-  video:       null,
-  mjpegImg:    null,
-  isLocal:     false,         // true = webcam index, false = IP URL
-};
-
-const emojiMap = {
+/* ─────────────────────────────────────────────────────────────
+   LIVE DETECTION STATE
+───────────────────────────────────────────────────────────── */
+const EMOJI = {
   happy:'😊', sad:'😢', angry:'😠', neutral:'😐',
   surprise:'😲', fear:'😨', disgust:'🤢', unknown:'❓'
 };
+const MOOD_COLOUR = {
+  improved: { bg:'rgba(34,197,94,.14)', fg:'#4ade80', icon:'↑' },
+  declined: { bg:'rgba(248,113,113,.14)', fg:'#f87171', icon:'↓' },
+  stable:   { bg:'rgba(148,163,184,.1)', fg:'#94a3b8', icon:'→' },
+};
 
-/* ── Open modal ─────────────────────────────────── */
+/* Face-box colours per emotion */
+const BOX_COLOUR = {
+  happy:'#fbbf24', sad:'#60a5fa', angry:'#f87171', neutral:'#38bdf8',
+  surprise:'#a78bfa', fear:'#fb923c', disgust:'#4ade80', unknown:'#64748b',
+};
+
+let S = {
+  camId:      null,
+  camUrl:     null,
+  isLocal:    false,
+  stream:     null,       // MediaStream (webcam)
+  detectTimer:null,
+  fpsTimer:   null,
+  statsTimer: null,
+  frameCount: 0,
+  lastLogs:   [],         // cached logs from last API poll
+  /* elements */
+  video:      null,
+  mjpegImg:   null,
+  overlay:    null,       // face-box canvas
+  scan:       null,       // scan-line canvas
+  overlayCtx: null,
+  scanCtx:    null,
+  scanRAF:    null,       // requestAnimationFrame handle for scan
+  faceRAF:    null,       // requestAnimationFrame handle for face boxes
+};
+
+
+/* ─────────────────────────────────────────────────────────────
+   OPEN / CLOSE
+───────────────────────────────────────────────────────────── */
 async function openLive(camId, camName, camUrl) {
-  const s = liveState;
-  s.camId  = camId;
-  s.camUrl = camUrl;
-  s.canvas = document.getElementById('overlayCanvas');
-  s.ctx    = s.canvas.getContext('2d');
-  s.video  = document.getElementById('liveVideo');
-  s.mjpegImg = document.getElementById('mjpegImg');
+  Object.assign(S, {
+    camId, camUrl,
+    isLocal: /^\d+$/.test(camUrl.trim()),
+    frameCount: 0, lastLogs: [],
+  });
 
-  document.getElementById('modalCamName').textContent = camName;
-  document.getElementById('liveModal').style.display  = 'flex';
+  S.video      = document.getElementById('liveVideo');
+  S.mjpegImg   = document.getElementById('mjpegImg');
+  S.overlay    = document.getElementById('overlayCanvas');
+  S.scan       = document.getElementById('scanCanvas');
+  S.overlayCtx = S.overlay.getContext('2d');
+  S.scanCtx    = S.scan.getContext('2d');
+
+  document.getElementById('modalCamName').textContent  = camName;
+  document.getElementById('liveModal').style.display   = 'flex';
   document.getElementById('liveConnecting').style.display = 'flex';
-  document.getElementById('liveStatusText').textContent = 'Loading students…';
+  document.getElementById('connectMsg').textContent    = 'Loading…';
+  setStatus('Loading student list…');
 
-  clearOverlay();
+  // Start scan animation
+  startScanAnimation();
 
-  // Load student list
-  s.students = await fetchStudents();
-  setStatus(`${s.students.length} students loaded`);
-
-  // Determine if local webcam (numeric) or IP stream
-  s.isLocal = /^\d+$/.test(camUrl.trim());
-
-  if (s.isLocal) {
+  if (S.isLocal) {
+    document.getElementById('detModeBadge').style.display = 'inline';
     await startWebcam(parseInt(camUrl.trim()));
   } else {
     startMJPEG(camUrl);
   }
 
-  // Start detection loop (every 2 s)
-  s.detectTimer = setInterval(runDetection, 2000);
+  // Poll detections every 4 s (server-side script does real recognition)
+  await refreshPanel();
+  S.statsTimer  = setInterval(refreshPanel, 4000);
 
-  // FPS counter (only meaningful for webcam)
-  s.fpsTimer = setInterval(() => {
-    document.getElementById('fpsCounter').textContent = s.frameCount + ' fps';
-    s.frameCount = 0;
+  // FPS display
+  S.fpsTimer = setInterval(() => {
+    const el = document.getElementById('fpsCounter');
+    el.textContent = S.frameCount > 0 ? `${S.frameCount} fps` : '-- fps';
+    S.frameCount = 0;
   }, 1000);
-
-  // Initial stats
-  fetchStats();
-  s.statsTimer = setInterval(fetchStats, 10000);  // FIX: store so closeLive() can clear it
 }
 
-/* ── Close modal ────────────────────────────────── */
 function closeLive() {
-  const s = liveState;
-  clearInterval(s.detectTimer);
-  clearInterval(s.fpsTimer);
-  clearInterval(s.statsTimer);   // FIX: was leaking on every modal open
-  if (s.stream) {
-    s.stream.getTracks().forEach(t => t.stop());
-    s.stream = null;
-  }
-  s.video.srcObject  = null;
-  s.video.style.display  = 'none';
-  s.mjpegImg.src     = '';
-  s.mjpegImg.style.display = 'none';
-  document.getElementById('liveModal').style.display  = 'none';
+  clearInterval(S.detectTimer);
+  clearInterval(S.fpsTimer);
+  clearInterval(S.statsTimer);
+  cancelAnimationFrame(S.scanRAF);
+  cancelAnimationFrame(S.faceRAF);
+
+  if (S.stream) { S.stream.getTracks().forEach(t => t.stop()); S.stream = null; }
+  S.video.srcObject = null;
+  S.video.style.display = 'none';
+  S.mjpegImg.src = '';
+  S.mjpegImg.style.display = 'none';
+
+  document.getElementById('liveModal').style.display = 'none';
   document.getElementById('liveConnecting').style.display = 'flex';
-  clearOverlay();
+  document.getElementById('detModeBadge').style.display = 'none';
+  clearCanvas(S.overlayCtx, S.overlay);
+  clearCanvas(S.scanCtx, S.scan);
 }
 
-/* ── Start webcam stream ────────────────────────── */
-async function startWebcam(deviceIndex) {
-  const s = liveState;
+
+/* ─────────────────────────────────────────────────────────────
+   CAMERA SOURCES
+───────────────────────────────────────────────────────────── */
+async function startWebcam(idx) {
   try {
-    // Enumerate devices and pick by index
     const devices = (await navigator.mediaDevices.enumerateDevices())
       .filter(d => d.kind === 'videoinput');
-    const constraints = { video: devices[deviceIndex]
-      ? { deviceId: { exact: devices[deviceIndex].deviceId }, width:1280, height:720 }
-      : { width:1280, height:720 }
+    const constraints = {
+      video: devices[idx]
+        ? { deviceId:{ exact:devices[idx].deviceId }, width:1280, height:720 }
+        : { width:1280, height:720 }
     };
-    s.stream = await navigator.mediaDevices.getUserMedia(constraints);
-    s.video.srcObject = s.stream;
-    s.video.style.display = 'block';
-    s.mjpegImg.style.display = 'none';
-    await s.video.play();
+    S.stream = await navigator.mediaDevices.getUserMedia(constraints);
+    S.video.srcObject = S.stream;
+    S.video.style.display = 'block';
+    S.mjpegImg.style.display = 'none';
+    await S.video.play();
 
-    s.video.addEventListener('loadedmetadata', () => {
+    S.video.addEventListener('loadedmetadata', () => {
       document.getElementById('liveConnecting').style.display = 'none';
-      setStatus('Webcam connected — detecting…');
-      // Count frames for fps
-      function countFrame() { s.frameCount++; requestAnimationFrame(countFrame); }
-      requestAnimationFrame(countFrame);
+      setStatus('✓ Webcam active — detection running server-side');
+      // Frame counter
+      const count = () => { S.frameCount++; requestAnimationFrame(count); };
+      requestAnimationFrame(count);
     });
   } catch (err) {
-    setStatus('Webcam error: ' + err.message);
-    console.error(err);
+    setStatus('✗ Webcam: ' + err.message);
+    document.getElementById('connectMsg').textContent = 'Webcam access denied';
   }
 }
 
-/* ── Start MJPEG stream ─────────────────────────── */
 function startMJPEG(url) {
-  const s = liveState;
-
-  // Normalise URL — auto-append /stream for bare ESP32-CAM IP URLs.
   let streamUrl = url.trim();
-  if (/^https?:\/\/[\d.]+\/?$/.test(streamUrl)) {
+  // Auto-fix bare ESP32-CAM IP
+  if (/^https?:\/\/[\d.]+\/?$/.test(streamUrl))
     streamUrl = streamUrl.replace(/\/?$/, '/stream');
-    console.warn(`[LiveView] Auto-appended /stream → ${streamUrl}`);
-  }
 
-  // ── Mixed-Content fix ──────────────────────────────────────────────────────
-  // Django runs on HTTPS. Browsers BLOCK loading http:// content (images)
-  // from an https:// page — this is WHY the ESP32-CAM (HTTP) shows BLANK
-  // while the mobile camera (HTTPS) works. The fix: proxy the stream
-  // through Django so the browser only ever talks to the HTTPS origin.
+  // Proxy HTTP → HTTPS if page is HTTPS (mixed-content block prevention)
   const isHttp = streamUrl.toLowerCase().startsWith('http://');
-  let finalUrl = isHttp
-    ? `/cameras/${s.camId}/proxy-stream/`   // Django proxies HTTP→HTTPS
-    : streamUrl;
+  const finalUrl = isHttp ? `/cameras/${S.camId}/proxy-stream/` : streamUrl;
+  if (isHttp) setStatus('Connecting via proxy (HTTP→HTTPS)…');
 
-  if (isHttp) {
-    console.log(`[LiveView] HTTP camera proxied via Django: ${finalUrl}`);
-    setStatus('Connecting via proxy (HTTP→HTTPS)…');
-  }
+  S.mjpegImg.crossOrigin   = 'anonymous';
+  S.mjpegImg.style.display = 'block';
+  S.video.style.display    = 'none';
 
-  s.mjpegImg.crossOrigin = 'anonymous';
-  s.mjpegImg.src = finalUrl;
-  s.mjpegImg.style.display = 'block';
-  s.video.style.display = 'none';
-
-  const loadTimeout = setTimeout(() => {
-    setStatus('⚠ Camera not responding — check IP and WiFi');
-    document.getElementById('liveConnecting').style.display = 'flex';
+  const timeout = setTimeout(() => {
     document.getElementById('liveConnecting').innerHTML = `
-      <div style="color:#f87171;font-size:0.85rem;text-align:center;padding:20px">
+      <div style="color:#f87171;font-size:.85rem;text-align:center;padding:20px;max-width:320px">
         <i class="bi bi-exclamation-triangle-fill d-block mb-2" style="font-size:2rem"></i>
         Cannot connect to camera<br>
-        <code style="font-size:0.75rem;color:#94a3b8">${streamUrl}</code><br><br>
-        <small style="color:#64748b">Make sure:<br>
-        • ESP32-CAM is powered &amp; on same WiFi<br>
-        • URL ends with <strong>/stream</strong><br>
-        • No firewall blocking port 80</small>
+        <code style="font-size:.72rem;color:#94a3b8;word-break:break-all">${streamUrl}</code><br><br>
+        <small style="color:#64748b">
+          Check:<br>• Camera powered &amp; on same network<br>
+          • URL ends with <strong>/stream</strong><br>
+          • No firewall blocking port 80
+        </small>
       </div>`;
-  }, 8000);
+  }, 9000);
 
-  s.mjpegImg.onload = () => {
-    clearTimeout(loadTimeout);
+  S.mjpegImg.onload = () => {
+    clearTimeout(timeout);
     document.getElementById('liveConnecting').style.display = 'none';
-    setStatus(isHttp
-      ? '✓ ESP32-CAM connected via proxy — detection running server-side…'
-      : '✓ Camera connected — detection running server-side…');
+    setStatus('✓ Camera connected — detection running server-side');
   };
-  s.mjpegImg.onerror = () => {
-    clearTimeout(loadTimeout);
-    setStatus('✗ Cannot connect: ' + streamUrl);
+  S.mjpegImg.onerror = () => {
+    clearTimeout(timeout);
+    document.getElementById('liveConnecting').style.display = 'flex';
+    setStatus('✗ Stream error: ' + streamUrl);
   };
+
+  S.mjpegImg.src = finalUrl;
 }
 
-/* ── Capture current frame as base64 JPEG ────────── */
-function captureFrame() {
-  const s = liveState;
-  const tmpCanvas = document.createElement('canvas');
-  let src = null;
-  if (s.isLocal && s.video.readyState >= 2) {
-    tmpCanvas.width  = s.video.videoWidth  || 640;
-    tmpCanvas.height = s.video.videoHeight || 480;
-    tmpCanvas.getContext('2d').drawImage(s.video, 0, 0);
-    src = tmpCanvas.toDataURL('image/jpeg', 0.75).split(',')[1];
-  } else if (!s.isLocal) {
-    // For MJPEG, draw the img element onto a canvas
-    // (only works if camera is same-origin or CORS-enabled)
-    try {
-      tmpCanvas.width  = s.mjpegImg.naturalWidth  || 640;
-      tmpCanvas.height = s.mjpegImg.naturalHeight || 480;
-      tmpCanvas.getContext('2d').drawImage(s.mjpegImg, 0, 0);
-      src = tmpCanvas.toDataURL('image/jpeg', 0.75).split(',')[1];
-    } catch (e) {
-      // Cross-origin — can't capture frame, send without snapshot
-      src = null;
-    }
-  }
-  return src;
+
+/* ─────────────────────────────────────────────────────────────
+   SCAN-LINE ANIMATION  (subtle; runs on #scanCanvas)
+───────────────────────────────────────────────────────────── */
+function startScanAnimation() {
+  const draw = () => {
+    const cv = S.scan;
+    const ctx = S.scanCtx;
+    if (!cv || !ctx) return;
+    const W = cv.offsetWidth, H = cv.offsetHeight;
+    if (cv.width !== W) cv.width = W;
+    if (cv.height !== H) cv.height = H;
+    ctx.clearRect(0, 0, W, H);
+
+    // Scan line
+    const y = (Date.now() / 7) % H;
+    const g = ctx.createLinearGradient(0, y - 6, 0, y + 6);
+    g.addColorStop(0,   'rgba(8,145,178,0)');
+    g.addColorStop(0.5, 'rgba(8,145,178,0.18)');
+    g.addColorStop(1,   'rgba(8,145,178,0)');
+    ctx.fillStyle = g;
+    ctx.fillRect(0, y - 6, W, 12);
+
+    // Corner brackets (HUD look)
+    const bLen = 18, bW = 2, col = 'rgba(8,145,178,0.45)';
+    ctx.strokeStyle = col; ctx.lineWidth = bW;
+    const margin = 10;
+    [[margin,margin,1,1],[W-margin,margin,-1,1],
+     [margin,H-margin,1,-1],[W-margin,H-margin,-1,-1]].forEach(([x,yy,dx,dy]) => {
+      ctx.beginPath(); ctx.moveTo(x, yy+dy*bLen); ctx.lineTo(x, yy); ctx.lineTo(x+dx*bLen, yy); ctx.stroke();
+    });
+
+    S.scanRAF = requestAnimationFrame(draw);
+  };
+  S.scanRAF = requestAnimationFrame(draw);
 }
 
-/* ── Main detection cycle (every 2 s) ────────────── */
-async function runDetection() {
-  const s = liveState;
-  if (!s.students.length) return;
 
-  // Get frame snapshot for the server log
-  const snapshot = captureFrame();
+/* ─────────────────────────────────────────────────────────────
+   FACE-BOX DRAWING  (on #overlayCanvas, driven by API logs)
+   Server-side detection script logs names+emotions → we poll
+   /api/live-detections/ and draw a box per "inside" student.
+───────────────────────────────────────────────────────────── */
+function drawFaceBoxesFromLogs(logs) {
+  const cv  = S.overlay;
+  const ctx = S.overlayCtx;
 
-  // We can't run face_recognition in the browser, so we rely on
-  // the server-side detection script for actual recognition.
-  // What we DO here is:
-  //   1. Try browser face detection (just to draw boxes visually)
-  //   2. Ping /api/students/encodings/ to check who is currently inside
-  //   3. Show latest attendance logs for this camera in the panel
+  // Get the video/img element dimensions
+  const src = S.isLocal ? S.video : S.mjpegImg;
+  const W   = (S.isLocal ? src.videoWidth  : src.naturalWidth)  || cv.offsetWidth  || 640;
+  const H   = (S.isLocal ? src.videoHeight : src.naturalHeight) || cv.offsetHeight || 480;
 
-  drawLiveBoxes();   // visual overlay from latest attendance
-  await refreshDetectionPanel();
+  cv.width  = cv.offsetWidth;
+  cv.height = cv.offsetHeight;
+
+  const scaleX = cv.width  / W;
+  const scaleY = cv.height / H;
+
+  ctx.clearRect(0, 0, cv.width, cv.height);
+
+  // Only draw for students currently inside
+  const inside = logs.filter(l => !l.exit_time);
+  if (!inside.length) return;
+
+  // Distribute boxes evenly if no face position info available
+  // (the server doesn't stream coords — we draw representative boxes)
+  const boxW  = Math.min(120, cv.width / (inside.length + 1));
+  const boxH  = boxW * 1.2;
+  const gap   = cv.width / (inside.length + 1);
+
+  inside.forEach((log, i) => {
+    const emotion = log.entry_emotion || 'neutral';
+    const colour  = BOX_COLOUR[emotion] || '#38bdf8';
+    const cx      = gap * (i + 1);
+    const cy      = cv.height * 0.42;
+    const x       = cx - boxW / 2;
+    const y       = cy - boxH / 2;
+
+    // Shadow glow
+    ctx.shadowColor = colour;
+    ctx.shadowBlur  = 16;
+
+    // Box
+    ctx.strokeStyle = colour;
+    ctx.lineWidth   = 2;
+    ctx.strokeRect(x, y, boxW, boxH);
+
+    // Corner accents
+    ctx.shadowBlur = 0;
+    const cLen = 10;
+    ctx.lineWidth = 3;
+    [[x,y],[x+boxW,y],[x,y+boxH],[x+boxW,y+boxH]].forEach(([bx,by],ci) => {
+      const dx = ci%2===0 ? 1 : -1, dy = ci<2 ? 1 : -1;
+      ctx.beginPath();
+      ctx.moveTo(bx, by+dy*cLen); ctx.lineTo(bx, by); ctx.lineTo(bx+dx*cLen, by);
+      ctx.stroke();
+    });
+
+    // Name label (above box)
+    const label = log.student_name || 'Unknown';
+    const emoji = EMOJI[emotion] || '❓';
+    const tag   = `${emoji} ${label}`;
+    ctx.font    = 'bold 12px system-ui, sans-serif';
+    const tw    = ctx.measureText(tag).width + 16;
+    const lx    = Math.max(4, Math.min(cv.width - tw - 4, x + boxW/2 - tw/2));
+    const ly    = Math.max(20, y - 8);
+
+    // Tag background
+    ctx.fillStyle   = colour + '22';
+    ctx.shadowColor = colour;
+    ctx.shadowBlur  = 8;
+    roundRect(ctx, lx, ly - 16, tw, 20, 6);
+    ctx.fill();
+
+    // Tag border
+    ctx.strokeStyle = colour + 'bb';
+    ctx.lineWidth   = 1;
+    ctx.shadowBlur  = 0;
+    roundRect(ctx, lx, ly - 16, tw, 20, 6);
+    ctx.stroke();
+
+    // Tag text
+    ctx.fillStyle   = '#fff';
+    ctx.shadowColor = 'rgba(0,0,0,.6)';
+    ctx.shadowBlur  = 3;
+    ctx.fillText(tag, lx + 8, ly - 2);
+    ctx.shadowBlur  = 0;
+
+    // Emotion bar below box
+    const conf = log.entry_score || 0.7;
+    const barW = boxW * conf;
+    ctx.fillStyle = colour + '33';
+    ctx.fillRect(x, y + boxH + 4, boxW, 3);
+    ctx.fillStyle = colour;
+    ctx.fillRect(x, y + boxH + 4, barW, 3);
+  });
 }
 
-/* ── Fetch students from server ─────────────────── */
-async function fetchStudents() {
+function roundRect(ctx, x, y, w, h, r) {
+  ctx.beginPath();
+  ctx.moveTo(x+r, y);
+  ctx.lineTo(x+w-r, y); ctx.quadraticCurveTo(x+w, y, x+w, y+r);
+  ctx.lineTo(x+w, y+h-r); ctx.quadraticCurveTo(x+w, y+h, x+w-r, y+h);
+  ctx.lineTo(x+r, y+h); ctx.quadraticCurveTo(x, y+h, x, y+h-r);
+  ctx.lineTo(x, y+r); ctx.quadraticCurveTo(x, y, x+r, y);
+  ctx.closePath();
+}
+
+
+/* ─────────────────────────────────────────────────────────────
+   API POLLING
+───────────────────────────────────────────────────────────── */
+async function refreshPanel() {
+  const spinner = document.getElementById('panelRefreshSpinner');
+  spinner.style.display = 'inline';
   try {
-    const r = await fetch('/api/students/encodings/');
-    return await r.json();
-  } catch { return []; }
-}
-
-/* ── Fetch today's attendance for this camera ────── */
-async function refreshDetectionPanel() {
-  try {
-    const r = await fetch(`/api/live-detections/?camera_id=${liveState.camId}`);
+    const r = await fetch(`/camera-attendance/api/live-detections/?camera_id=${S.camId}`);
     if (!r.ok) return;
     const data = await r.json();
-    renderDetectionCards(data.logs || []);
-    document.getElementById('statTotal').textContent  = data.today_total  ?? 0;
-    document.getElementById('statInside').textContent = data.inside_now   ?? 0;
+
+    S.lastLogs = data.logs || [];
+
+    renderCards(S.lastLogs);
+    drawFaceBoxesFromLogs(S.lastLogs);
+    updateLastDetectBadge(S.lastLogs);
+
+    document.getElementById('statTotal').textContent  = data.today_total ?? '—';
+    document.getElementById('statInside').textContent = data.inside_now  ?? '—';
+
+    // Mood improved count
+    const improved = (data.logs || []).filter(l => l.mood_comparison === 'improved').length;
+    const moodEl   = document.getElementById('statMood');
+    moodEl.textContent = improved > 0 ? improved : '—';
+    moodEl.style.color = improved > 0 ? '#4ade80' : '#475569';
+
   } catch (e) {
-    // API not yet added — fall back to attendance list data
+    console.warn('Panel refresh error:', e);
+  } finally {
+    spinner.style.display = 'none';
   }
 }
 
-async function fetchStats() {
-  try {
-    const r = await fetch(`/api/live-detections/?camera_id=${liveState.camId}`);
-    if (!r.ok) return;
-    const data = await r.json();
-    document.getElementById('statTotal').textContent  = data.today_total  ?? '--';
-    document.getElementById('statInside').textContent = data.inside_now   ?? '--';
-  } catch {}
-}
 
-/* ── Render detection cards in right panel ────────── */
-function renderDetectionCards(logs) {
+/* ─────────────────────────────────────────────────────────────
+   DETECTION CARDS
+───────────────────────────────────────────────────────────── */
+function renderCards(logs) {
   const list = document.getElementById('detectionsList');
   if (!logs.length) {
-    list.innerHTML = '<div style="color:#334155;font-size:0.8rem;text-align:center;margin-top:30px">No detections yet today</div>';
+    list.innerHTML = '<div class="no-detect-msg" style="color:#2d3f58;font-size:.8rem;text-align:center;margin-top:24px">No detections yet today</div>';
     return;
   }
-  list.innerHTML = logs.slice(0, 20).map(log => {
-    const emotion  = log.entry_emotion || 'unknown';
-    const emoji    = emojiMap[emotion] || '❓';
-    const isInside = !log.exit_time;
-    const time     = log.entry_time ? new Date(log.entry_time).toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'}) : '--:--';
-    const mood     = log.mood_comparison && log.mood_comparison !== 'unknown' ? log.mood_comparison : null;
+
+  list.innerHTML = logs.slice(0, 25).map(log => {
+    const emotion   = log.entry_emotion || 'unknown';
+    const emoji     = EMOJI[emotion]    || '❓';
+    const isInside  = !log.exit_time;
+    const entryTime = log.entry_time
+      ? new Date(log.entry_time).toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'})
+      : '--:--';
+    const exitTime  = log.exit_time
+      ? new Date(log.exit_time).toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'})
+      : null;
+    const mood      = log.mood_comparison && log.mood_comparison !== 'unknown'
+                      ? log.mood_comparison : null;
+    const mc        = mood ? (MOOD_COLOUR[mood] || MOOD_COLOUR.stable) : null;
+    const dur       = log.duration != null ? `${log.duration}m` : null;
+    const exitEmoji = log.exit_emotion ? EMOJI[log.exit_emotion] || '❓' : null;
+    const conf      = log.entry_score  ? Math.round(log.entry_score * 100) : null;
+
     return `
     <div style="
-      background:rgba(255,255,255,0.04);border-radius:10px;padding:10px 12px;
-      border-left:3px solid ${isInside ? '#22c55e' : '#475569'};
-      animation:slideInCard .25s ease;
+      background:rgba(255,255,255,.035);border-radius:11px;padding:10px 12px;
+      border-left:3px solid ${isInside ? '#22c55e' : '#334155'};
+      animation:slideCard .22s ease;
     ">
-      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:4px">
-        <span style="color:#e2e8f0;font-weight:700;font-size:0.82rem;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:120px" title="${log.student_name}">${log.student_name}</span>
-        <span style="font-size:1rem">${emoji}</span>
+      <!-- Row 1: name + emoji -->
+      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:5px">
+        <span style="color:#e2e8f0;font-weight:700;font-size:.82rem;
+                     white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:140px"
+              title="${log.student_name}">${log.student_name}</span>
+        <span style="font-size:1rem;line-height:1" title="${emotion}">${emoji}</span>
       </div>
-      <div style="display:flex;align-items:center;justify-content:space-between">
-        <span class="emo-${emotion}" style="font-size:0.72rem;text-transform:capitalize">${emotion}</span>
-        <span style="color:#475569;font-size:0.7rem">${time}</span>
+
+      <!-- Row 2: emotion label + confidence -->
+      <div style="display:flex;align-items:center;gap:6px;margin-bottom:5px">
+        <span class="emo-${emotion}"
+              style="font-size:.7rem;text-transform:capitalize;font-weight:600">${emotion}</span>
+        ${conf != null
+          ? `<span style="font-size:.65rem;color:#334155">${conf}%</span>`
+          : ''}
+        ${exitEmoji && exitEmoji !== emoji
+          ? `<span style="font-size:.65rem;color:#475569">→ ${exitEmoji}</span>`
+          : ''}
       </div>
-      ${mood ? `<div style="margin-top:4px">
-        <span style="
-          font-size:0.65rem;padding:2px 7px;border-radius:10px;
-          background:${mood==='improved'?'rgba(34,197,94,0.15)':mood==='declined'?'rgba(248,113,113,0.15)':'rgba(148,163,184,0.1)'};
-          color:${mood==='improved'?'#4ade80':mood==='declined'?'#f87171':'#94a3b8'}
-        ">${mood==='improved'?'↑ Mood improved':mood==='declined'?'↓ Mood declined':'→ Stable'}</span>
-      </div>` : ''}
-      <div style="margin-top:4px">
-        <span style="
-          font-size:0.65rem;padding:2px 7px;border-radius:10px;
-          background:${isInside?'rgba(34,197,94,0.15)':'rgba(100,116,139,0.15)'};
-          color:${isInside?'#4ade80':'#64748b'}
-        ">${isInside ? '● Inside' : '○ Left'}</span>
+
+      <!-- Row 3: time info -->
+      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:5px">
+        <span style="color:#475569;font-size:.68rem">
+          ${isInside
+            ? `<span style="color:#22c55e">● In</span> ${entryTime}`
+            : `${entryTime} → ${exitTime || '?'}`}
+          ${dur ? `<span style="color:#334155;margin-left:4px">(${dur})</span>` : ''}
+        </span>
       </div>
+
+      <!-- Mood badge (only if exit recorded) -->
+      ${mc
+        ? `<div><span style="
+              font-size:.63rem;padding:2px 8px;border-radius:10px;
+              background:${mc.bg};color:${mc.fg};font-weight:600
+            ">${mc.icon} Mood ${mood}</span></div>`
+        : ''}
     </div>`;
   }).join('');
 }
 
-/* ── Draw boxes on overlay canvas from latest logs ── */
-function drawLiveBoxes() {
-  // This is a lightweight visual hint — actual boxes come from
-  // the detection script running server-side.
-  // Here we just show a "scanning" pulse on the canvas.
-  const canvas = liveState.canvas;
-  const ctx    = liveState.ctx;
-  const src    = liveState.isLocal ? liveState.video : liveState.mjpegImg;
-  if (!src) return;
 
-  const W = src.videoWidth  || src.naturalWidth  || canvas.offsetWidth;
-  const H = src.videoHeight || src.naturalHeight || canvas.offsetHeight;
-  canvas.width  = W;
-  canvas.height = H;
-
-  // Subtle scan-line effect
-  const scanY = ((Date.now() / 8) % H);
-  ctx.clearRect(0, 0, W, H);
-  const grad = ctx.createLinearGradient(0, scanY - 4, 0, scanY + 4);
-  grad.addColorStop(0,   'rgba(8,145,178,0)');
-  grad.addColorStop(0.5, 'rgba(8,145,178,0.25)');
-  grad.addColorStop(1,   'rgba(8,145,178,0)');
-  ctx.fillStyle = grad;
-  ctx.fillRect(0, scanY - 4, W, 8);
+/* ─────────────────────────────────────────────────────────────
+   LAST-DETECT BADGE  (bottom-left of video)
+───────────────────────────────────────────────────────────── */
+function updateLastDetectBadge(logs) {
+  const el = document.getElementById('lastDetectBadge');
+  const inside = logs.filter(l => !l.exit_time);
+  if (!inside.length) {
+    el.style.display = 'none';
+    return;
+  }
+  const latest = inside[0];
+  const em = latest.entry_emotion || 'neutral';
+  const col = BOX_COLOUR[em] || '#38bdf8';
+  el.style.display = 'block';
+  el.style.borderColor = col + '44';
+  el.innerHTML = `
+    <span style="font-size:.9rem;margin-right:6px">${EMOJI[em]||'❓'}</span>
+    <strong style="color:${col}">${latest.student_name}</strong>
+    <span style="color:#475569;margin-left:6px;font-size:.68rem">${em}</span>
+  `;
 }
 
-/* ── Overlay helpers ────────────────────────────── */
-function clearOverlay() {
-  const canvas = document.getElementById('overlayCanvas');
-  if (canvas) canvas.getContext('2d').clearRect(0, 0, canvas.width, canvas.height);
-}
 
+/* ─────────────────────────────────────────────────────────────
+   HELPERS
+───────────────────────────────────────────────────────────── */
 function setStatus(msg) {
   document.getElementById('liveStatusText').textContent = msg;
 }
-
-function showToast(msg, duration = 2500) {
+function showToast(msg, ms=2800) {
   const el = document.getElementById('liveToast');
   el.textContent = msg;
   el.style.display = 'block';
-  setTimeout(() => el.style.display = 'none', duration);
+  setTimeout(() => el.style.display = 'none', ms);
+}
+function clearCanvas(ctx, cv) {
+  if (ctx && cv) ctx.clearRect(0, 0, cv.width, cv.height);
 }
 
-/* Close modal on backdrop click */
-document.getElementById('liveModal').addEventListener('click', function(e) {
-  if (e.target === this) closeLive();
+/* Close on backdrop click / Escape */
+document.getElementById('liveModal').addEventListener('click', e => {
+  if (e.target === document.getElementById('liveModal')) closeLive();
 });
-
-/* Close on Escape */
 document.addEventListener('keydown', e => { if (e.key === 'Escape') closeLive(); });
 </script>
 {% endblock %}

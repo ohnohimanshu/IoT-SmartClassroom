@@ -147,7 +147,12 @@ class EntranceCamConfig(AppConfig):
                 if len(parts) == 2:
                     host, port = parts
                     if port.isdigit():
-                        return f"{'https' if use_ssl else 'http'}://{arg}"
+                        # Convert 0.0.0.0 to 127.0.0.1 for client connections
+                        if host == '0.0.0.0':
+                            host = '127.0.0.1'
+                        elif host == '::':
+                            host = '::1'
+                        return f"{'https' if use_ssl else 'http'}://{host}:{port}"
         
         return 'https://127.0.0.1:8000' if use_ssl else 'http://127.0.0.1:8000'
     
@@ -165,7 +170,11 @@ class EntranceCamConfig(AppConfig):
             print("[INFO] No active cameras found.")
             return
         
-        script_path = os.path.join(os.path.dirname(__file__), 'detection_script.py')
+        # Use detection_script_v2.py (improved version)
+        script_path = os.path.join(
+            os.path.dirname(__file__), '..', 'camera_attendance', 'detection_script_v2.py'
+        )
+        script_path = os.path.normpath(script_path)
         if not os.path.exists(script_path):
             print(f"[ERROR] Detection script not found: {script_path}")
             return
@@ -183,8 +192,7 @@ class EntranceCamConfig(AppConfig):
                 script_path,
                 '--camera-url', str(camera.url),
                 '--camera-id', str(camera.id),
-                '--server', server_url,
-                '--no-gui'
+                '--server', server_url
             ]
             
             print(f"[INFO] Starting detection for camera '{camera.name}' (ID: {camera.id})")
@@ -266,7 +274,10 @@ class EntranceCamConfig(AppConfig):
                         break
                     
                     server_url = self._get_server_url()
-                    script_path = os.path.join(os.path.dirname(__file__), 'detection_script.py')
+                    script_path = os.path.join(
+                        os.path.dirname(__file__), '..', 'camera_attendance', 'detection_script_v2.py'
+                    )
+                    script_path = os.path.normpath(script_path)
                     
                     self._start_camera_detection(camera, script_path, server_url)
                     break

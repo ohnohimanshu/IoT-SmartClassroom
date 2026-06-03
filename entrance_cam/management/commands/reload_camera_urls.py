@@ -83,7 +83,13 @@ class Command(BaseCommand):
 
             # Restart detection scripts
             self.stdout.write('\n🚀 Restarting detection scripts...\n')
-            script_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'detection_script.py')
+            script_path = os.path.join(
+                os.path.dirname(os.path.dirname(__file__)), 
+                '..', 
+                'camera_attendance', 
+                'detection_script.py'
+            )
+            script_path = os.path.normpath(script_path)
             server_url = app_config._get_server_url()
 
             restarted_count = 0

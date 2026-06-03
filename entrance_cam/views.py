@@ -78,19 +78,22 @@ def dashboard(request):
     except Student.DoesNotExist:
         pass
 
+    # Import camera attendance model
+    from camera_attendance.models import CameraAttendanceLog
+
     today = date.today()
     total_students    = Student.objects.filter(is_active=True).count()
     total_cameras     = Camera.objects.filter(is_active=True).count()
     total_fingerprint_devices = ESP32Device.objects.filter(is_active=True).count()
-    today_attendance  = AttendanceLog.objects.filter(date=today).count()
+    today_camera_attendance = CameraAttendanceLog.objects.filter(date=today).count()
     today_fingerprint_attendance = FingerprintAttendance.objects.filter(date=today).count()
-    currently_inside  = AttendanceLog.objects.filter(
+    currently_inside  = CameraAttendanceLog.objects.filter(
         date=today, entry_time__isnull=False, exit_time__isnull=True
     ).count()
     # Count students with face encoding (for camera detection)
     enrolled_students = Student.objects.filter(is_active=True).exclude(face_encoding__isnull=True).exclude(face_encoding='').count()
 
-    emotions_today = (AttendanceLog.objects
+    emotions_today = (CameraAttendanceLog.objects
                       .filter(date=today)
                       .values('entry_emotion')
                       .annotate(count=Count('id')))
@@ -98,11 +101,11 @@ def dashboard(request):
     week_data = []
     for i in range(6, -1, -1):
         d = today - timedelta(days=i)
-        count = AttendanceLog.objects.filter(date=d).count() + FingerprintAttendance.objects.filter(date=d).count()
+        count = CameraAttendanceLog.objects.filter(date=d).count() + FingerprintAttendance.objects.filter(date=d).count()
         week_data.append({'date': d.strftime('%d %b'), 'count': count})
 
     # Get recent logs from both camera and fingerprint
-    recent_camera_logs = (AttendanceLog.objects
+    recent_camera_logs = (CameraAttendanceLog.objects
                          .select_related('student', 'camera')
                          .order_by('-entry_time')[:5])
     recent_fingerprint_logs = (FingerprintAttendance.objects
@@ -139,8 +142,8 @@ def dashboard(request):
         'total_students':   total_students,
         'total_cameras':    total_cameras,
         'total_fingerprint_devices': total_fingerprint_devices,
-        'today_attendance': today_attendance + today_fingerprint_attendance,
-        'today_camera_attendance': today_attendance,
+        'today_attendance': today_camera_attendance + today_fingerprint_attendance,
+        'today_camera_attendance': today_camera_attendance,
         'today_fingerprint_attendance': today_fingerprint_attendance,
         'currently_inside': currently_inside,
         'enrolled_students': enrolled_students,
@@ -751,8 +754,11 @@ def attendance_list(request):
     except ValueError:
         filter_date = date.today()
 
+    # Import camera attendance model
+    from camera_attendance.models import CameraAttendanceLog
+
     # Get both camera and fingerprint attendance
-    camera_logs = (AttendanceLog.objects
+    camera_logs = (CameraAttendanceLog.objects
         .filter(date=filter_date)
         .select_related('student', 'camera')
         .order_by('-entry_time'))
