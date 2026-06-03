@@ -640,20 +640,35 @@ def run_detection(camera_url, camera_id, server_url, cooldown=30, exit_timeout=9
                         logger.debug(f"  {name}: cooldown {cooldown - elapsed:.0f}s")
                         continue
 
-                    # ── Log entry immediately with emotion from async worker ──
-                    # We pass a snapshot and let the worker call back with emotion.
-                    snapshot = encode_snapshot(frame, face_box)
+                    # ── Decide ENTRY vs EXIT synchronously before async emotion ─
+                    # students_inside is the local mirror of "has open log in Django".
+                    # We update it IMMEDIATELY (optimistic) so no second face-detection
+                    # within the emotion-worker delay fires the wrong action.
+                    is_exit = sid in students_inside
 
-                    # Capture variables for the closure
+                    # Gate cooldown BEFORE async work — prevents double-fire
+                    last_entry_time[sid] = now
+
+                    if is_exit:
+                        students_inside.discard(sid)   # optimistic: treat as exited now
+                        last_seen_time.pop(sid, None)
+                        logger.info(f"  -> EXIT  queued : {name}")
+                    else:
+                        students_inside.add(sid)        # optimistic: treat as inside now
+                        logger.info(f"  -> ENTRY queued : {name}")
+
+                    snapshot   = encode_snapshot(frame, face_box)
                     _sid       = sid
                     _name      = name
                     _snap      = snapshot
                     _camera_id = camera_id
                     _server    = server_url
+                    _is_exit   = is_exit
 
                     def on_emotion(emotion, confidence,
                                    sid=_sid, name=_name, snap=_snap,
-                                   cam_id=_camera_id, srv=_server):
+                                   cam_id=_camera_id, srv=_server,
+                                   is_exit=_is_exit):
                         ok, status = log_attendance(
                             srv, sid, cam_id,
                             emotion=emotion,
@@ -661,23 +676,18 @@ def run_detection(camera_url, camera_id, server_url, cooldown=30, exit_timeout=9
                             snapshot_b64=snap,
                         )
                         if ok:
-                            # Update tracking state (thread-safe: Python GIL)
-                            if status == 'entry_logged':
+                            action = "EXIT" if is_exit else "ENTRY"
+                            logger.info(f"  OK {action}: {name} emotion={emotion} ({confidence:.2f})")
+                        else:
+                            # API call failed — roll back optimistic state change
+                            if is_exit:
                                 students_inside.add(sid)
-                                logger.info(f"  → ENTRY logged: {name} emotion={emotion}")
-                            elif status == 'exit_logged':
+                            else:
                                 students_inside.discard(sid)
-                                last_entry_time.pop(sid, None)
-                                last_seen_time.pop(sid, None)
-                                logger.info(f"  → EXIT  logged: {name} emotion={emotion}")
+                            logger.warning(f"  API failed for {name} — state rolled back")
 
-                    # Update cooldown immediately (before emotion arrives)
-                    # so we don't re-trigger for the same student
-                    last_entry_time[sid] = now
-
-                    # Submit to async emotion worker — never blocks
+                    # Submit emotion detection — never blocks the loop
                     _emotion_worker.submit(frame, face_box, on_emotion)
-
                 except Exception as e:
                     logger.error(f"✗ face processing error: {e}", exc_info=True)
                     continue

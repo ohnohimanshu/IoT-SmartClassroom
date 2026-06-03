@@ -1,21 +1,3 @@
-"""
-Classroom Behavior Detection
-=============================
-Colour scheme on live feed / video:
-  GREEN  rectangle  — focused
-  ORANGE rectangle  — distracted / looking_away / head_down  → saved to DB
-  RED    rectangle  — using_phone / eating_food              → saved + WhatsApp
-
-Head-pose detection strategy (no model download needed):
-  • OpenCV Haar cascades: frontal face → focused
-                          profile face → looking_away
-                          neither face found → head_down (looking down)
-
-WhatsApp (Twilio):
-  Known student  → parent WhatsApp number
-  Unknown person → ADMIN_WHATSAPP from env
-"""
-
 import cv2
 import json
 import time
