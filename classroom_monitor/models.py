@@ -210,7 +210,8 @@ class VideoStudentZone(models.Model):
 # ── Behavior Incident Model ───────────────────────────────────────────────────
 
 BEHAVIOR_INCIDENT_CHOICES = [
-    # RED — alert + WhatsApp
+    # RED — alert + WhatsApp (critical)
+    ('fighting',     'Physical Fight'),
     ('using_phone',  'Using Phone'),
     ('eating_food',  'Eating Food'),
     # ORANGE — stored only

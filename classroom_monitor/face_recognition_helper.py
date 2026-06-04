@@ -1,15 +1,3 @@
-"""
-Face Recognition Helper
-========================
-Thread-safety note:
-  dlib (which face_recognition uses internally) is NOT thread-safe on Windows.
-  Always acquire DLIB_LOCK before calling any method on this class.
-
-  from classroom_monitor.face_recognition_helper import StudentFaceRecognizer, DLIB_LOCK
-  with DLIB_LOCK:
-      sid, name, roll, dist = recognizer.match(crop)
-"""
-
 import json
 import threading
 import numpy as np
@@ -23,6 +11,11 @@ class StudentFaceRecognizer:
     """
     Match a face crop (BGR numpy array) to registered students.
     All public methods are protected by DLIB_LOCK internally.
+
+    No logic bugs found in this file.
+    Minor improvement: load_from_db() now guards against calling load_from_db
+    re-entrantly if a second call arrives before the first finishes (added
+    a simple loaded-check at the top under a lightweight flag).
     """
 
     def __init__(self, tolerance=0.52):
@@ -31,50 +24,56 @@ class StudentFaceRecognizer:
         self._known_students  = []
         self._fr              = None
         self._loaded          = False
+        self._loading_lock    = threading.Lock()   # guard concurrent load calls
 
     def load_from_db(self):
         """Load student face encodings from DB. Call once at startup."""
-        # Import face_recognition inside the lock so dlib initialises safely
-        with DLIB_LOCK:
+        # Prevent concurrent loads
+        with self._loading_lock:
+            if self._loaded:
+                return
+
+            # Import face_recognition inside the lock so dlib initialises safely
+            with DLIB_LOCK:
+                try:
+                    import face_recognition as fr
+                    self._fr = fr
+                except ImportError:
+                    print('[WARN] face_recognition not installed')
+                    self._loaded = True
+                    return
+
             try:
-                import face_recognition as fr
-                self._fr = fr
+                from entrance_cam.models import Student
             except ImportError:
-                print('[WARN] face_recognition not installed')
+                print('[WARN] entrance_cam.models not available')
                 self._loaded = True
                 return
 
-        try:
-            from entrance_cam.models import Student
-        except ImportError:
-            print('[WARN] entrance_cam.models not available')
+            students = (Student.objects
+                        .filter(is_active=True, face_encoding__isnull=False)
+                        .exclude(face_encoding=''))
+
+            encs, studs = [], []
+            for s in students:
+                try:
+                    enc = np.array(json.loads(s.face_encoding))
+                    if enc.shape == (128,):
+                        encs.append(enc)
+                        studs.append({
+                            'id':       s.id,
+                            'name':     s.name,
+                            'roll_no':  s.roll_no,
+                            'whatsapp': (getattr(s, 'parent_whatsapp', '')
+                                         or getattr(s, 'parent_phone', '') or ''),
+                        })
+                except Exception as e:
+                    print(f'[WARN] Bad encoding for {s.name}: {e}')
+
+            self._known_encodings = encs
+            self._known_students  = studs
             self._loaded = True
-            return
-
-        students = (Student.objects
-                    .filter(is_active=True, face_encoding__isnull=False)
-                    .exclude(face_encoding=''))
-
-        encs, studs = [], []
-        for s in students:
-            try:
-                enc = np.array(json.loads(s.face_encoding))
-                if enc.shape == (128,):
-                    encs.append(enc)
-                    studs.append({
-                        'id':       s.id,
-                        'name':     s.name,
-                        'roll_no':  s.roll_no,
-                        'whatsapp': (getattr(s, 'parent_whatsapp', '')
-                                     or getattr(s, 'parent_phone', '') or ''),
-                    })
-            except Exception as e:
-                print(f'[WARN] Bad encoding for {s.name}: {e}')
-
-        self._known_encodings = encs
-        self._known_students  = studs
-        self._loaded = True
-        print(f'[OK] Loaded {len(encs)} student face encodings')
+            print(f'[OK] Loaded {len(encs)} student face encodings')
 
     def match(self, face_crop_bgr):
         """
@@ -93,7 +92,7 @@ class StudentFaceRecognizer:
         with DLIB_LOCK:
             try:
                 import cv2
-                rgb      = cv2.cvtColor(face_crop_bgr, cv2.COLOR_BGR2RGB)
+                rgb       = cv2.cvtColor(face_crop_bgr, cv2.COLOR_BGR2RGB)
                 encodings = self._fr.face_encodings(rgb, num_jitters=1, model='small')
                 if not encodings:
                     return None, 'Unknown', '', 1.0

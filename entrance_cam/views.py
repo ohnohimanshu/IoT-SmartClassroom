@@ -277,79 +277,64 @@ def camera_edit(request, pk):
 
 @login_required
 def camera_proxy_stream(request, pk):
-    """
-    MJPEG proxy: fetches the camera's HTTP stream server-side and re-serves it
-    to the browser over HTTPS.
-
-    WHY THIS IS NEEDED:
-    The Django server runs on HTTPS (runsslserver). Browsers enforce Mixed
-    Content rules and silently block any http:// resource (images, video)
-    loaded from an https:// page. The ESP32-CAM serves on plain HTTP/port 80
-    and cannot do TLS natively. This proxy is the correct fix:
-
-        Browser (HTTPS) ←──── Django proxy ────→ ESP32-CAM (HTTP)
-
-    The browser only ever talks to the same HTTPS origin, so no Mixed
-    Content warning is raised. Django fetches the HTTP stream internally
-    (server-to-server on the same LAN) and streams it straight through.
-
-    Performance note: Django's dev server is single-threaded by default, but
-    this view uses a generator + StreamingHttpResponse so it doesn't buffer
-    the whole stream into RAM. For production, use gunicorn/uvicorn.
-    """
+    """MJPEG proxy — serves the rebroadcast stream from detection_script to browser."""
     import requests as req_lib
     import urllib3
+    import traceback
     urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-    camera = get_object_or_404(Camera, pk=pk)
-    url = camera.url.strip()
-
-    # Local webcam — cannot proxy
-    if url.isdigit():
-        return JsonResponse({'error': 'Local webcam cannot be proxied'}, status=400)
-
-    # Auto-append /stream for bare ESP32-CAM URLs
-    if url.lower().startswith('http://') and not any(
-        url.lower().endswith(p) for p in ['/stream', '/video', '/mjpeg']
-    ):
-        import re
-        if re.match(r'^https?://[\d.]+/?$', url):
-            url = url.rstrip('/') + '/stream'
-
-    def stream_generator(upstream_resp):
-        """Yield chunks from the upstream MJPEG response."""
-        try:
-            for chunk in upstream_resp.iter_content(chunk_size=4096):
-                if chunk:
-                    yield chunk
-        except Exception:
-            pass
-        finally:
-            upstream_resp.close()
-
     try:
+        camera = get_object_or_404(Camera, pk=pk)
+
+        if camera.url.strip().isdigit():
+            return JsonResponse({'error': 'Local webcam cannot be proxied'}, status=400)
+
+        # Calculate rebroadcast port (8765 + camera index)
+        all_cameras = list(Camera.objects.filter(is_active=True).order_by('id'))
+        try:
+            camera_index = all_cameras.index(camera)
+        except ValueError:
+            camera_index = 0
+        
+        rebroadcast_port = 8765 + camera_index
+        rebroadcast_url = f'http://127.0.0.1:{rebroadcast_port}/stream'
+
+        def stream_generator(upstream_resp):
+            try:
+                for chunk in upstream_resp.iter_content(chunk_size=4096):
+                    if chunk:
+                        yield chunk
+            except Exception:
+                pass
+            finally:
+                upstream_resp.close()
+
         upstream = req_lib.get(
-            url,
+            rebroadcast_url,
             stream=True,
-            timeout=(5, None),   # (connect timeout, read timeout=None → stream forever)
+            timeout=(3, None),
             verify=False,
         )
         upstream.raise_for_status()
 
-        content_type = upstream.headers.get('Content-Type', 'multipart/x-mixed-replace;boundary=gc0p4Jq0M2Yt08jU534c0p')
-        response = StreamingHttpResponse(
-            stream_generator(upstream),
-            content_type=content_type,
+        content_type = upstream.headers.get(
+            'Content-Type',
+            'multipart/x-mixed-replace;boundary=gc0p4Jq0M2Yt08jU534c0p'
         )
+        response = StreamingHttpResponse(stream_generator(upstream), content_type=content_type)
         response['Cache-Control'] = 'no-store, no-cache, must-revalidate'
         response['Access-Control-Allow-Origin'] = '*'
         return response
 
+    except req_lib.exceptions.ConnectionError:
+        return JsonResponse({
+            'error': 'Detection script not running. Start it first so the stream is available.'
+        }, status=503)
     except req_lib.exceptions.ConnectTimeout:
-        return JsonResponse({'error': 'Camera connection timed out'}, status=504)
-    except req_lib.exceptions.ConnectionError as e:
-        return JsonResponse({'error': f'Cannot reach camera: {str(e)[:120]}'}, status=502)
+        return JsonResponse({'error': 'Rebroadcast server not responding'}, status=504)
     except Exception as e:
+        logger.error(f"camera_proxy_stream error: {e}")
+        logger.error(traceback.format_exc())
         return JsonResponse({'error': str(e)[:200]}, status=502)
 
 
