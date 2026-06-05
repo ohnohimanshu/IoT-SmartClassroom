@@ -115,15 +115,28 @@ def dashboard(request):
     # Combine and sort recent logs
     recent_logs = []
     for log in recent_camera_logs:
-        recent_logs.append({
-            'type': 'camera',
-            'student': log.student,
-            'device': log.camera,
-            'time': log.entry_time or log.exit_time,
-            'action': 'entry' if log.entry_time else 'exit',
-            'emotion': log.entry_emotion if log.entry_time else log.exit_emotion,
-            'confidence': None
-        })
+        # Add entry log if entry_time exists
+        if log.entry_time:
+            recent_logs.append({
+                'type': 'camera',
+                'student': log.student,
+                'device': log.camera,
+                'time': log.entry_time,
+                'action': 'entry',
+                'emotion': log.entry_emotion,
+                'confidence': None
+            })
+        # Add exit log if exit_time exists
+        if log.exit_time:
+            recent_logs.append({
+                'type': 'camera',
+                'student': log.student,
+                'device': log.camera,
+                'time': log.exit_time,
+                'action': 'exit',
+                'emotion': log.exit_emotion,
+                'confidence': None
+            })
     for log in recent_fingerprint_logs:
         recent_logs.append({
             'type': 'fingerprint',
@@ -756,14 +769,26 @@ def attendance_list(request):
     # Combine and sort all logs by timestamp
     all_logs = []
     for log in camera_logs:
-        all_logs.append({
-            'type': 'camera',
-            'student': log.student,
-            'device': log.camera,
-            'timestamp': log.entry_time or log.exit_time,
-            'action': 'entry' if log.entry_time else 'exit',
-            'emotion': log.entry_emotion if log.entry_time else log.exit_emotion,
-        })
+        # Add entry log if entry_time exists
+        if log.entry_time:
+            all_logs.append({
+                'type': 'camera',
+                'student': log.student,
+                'device': log.camera,
+                'timestamp': log.entry_time,
+                'action': 'entry',
+                'emotion': log.entry_emotion,
+            })
+        # Add exit log if exit_time exists
+        if log.exit_time:
+            all_logs.append({
+                'type': 'camera',
+                'student': log.student,
+                'device': log.camera,
+                'timestamp': log.exit_time,
+                'action': 'exit',
+                'emotion': log.exit_emotion,
+            })
 
     for log in fingerprint_logs:
         all_logs.append({

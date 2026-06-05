@@ -269,9 +269,9 @@ def detect_faces(frame):
         raw_faces = face_cascade.detectMultiScale(
             gray,
             scaleFactor=1.05,
-            minNeighbors=6,       # relaxed from 10 — QVGA frames have less detail
-            minSize=(60, 60),     # suits QVGA 320x240 frames
-            maxSize=(300, 300),
+            minNeighbors=6,       # relaxed from 10
+            minSize=(60, 60),     # minimum reasonable face size
+            maxSize=(800, 800),   # much larger for 1080p cameras!
             flags=cv2.CASCADE_SCALE_IMAGE,
         )
         if len(raw_faces) == 0:
@@ -287,19 +287,18 @@ def detect_faces(frame):
 
             face_gray = gray[y:y+h, x:x+w]
 
-            # 2. Eye check — relaxed for QVGA (320x240) low-res stream.
-            # At this resolution eye detail is poor; requiring BOTH eyes
-            # rejects valid faces. We require at least 1 eye instead.
-            if _eye_cascade is not None:
-                try:
-                    eyes = _eye_cascade.detectMultiScale(
-                        face_gray, 1.1, 3, minSize=(15, 15)
-                    )
-                    if len(eyes) < 1:
-                        logger.debug(f"  ✗ No eyes detected — rejected")
-                        continue
-                except Exception:
-                    pass   # eye cascade fail — let it through
+            # 2. Temporarily disabled eye check to help with 1080p detection
+            # We can re-enable later after basic detection is working
+            # if _eye_cascade is not None:
+            #     try:
+            #         eyes = _eye_cascade.detectMultiScale(
+            #             face_gray, 1.1, 3, minSize=(30, 30)  # larger min eyes for 1080p
+            #         )
+            #         if len(eyes) < 1:
+            #             logger.debug(f"  ✗ No eyes detected — rejected")
+            #             continue
+            #     except Exception:
+            #         pass   # eye cascade fail — let it through
 
             # 3. Skin-tone check: mean pixel value should be mid-range
             mean_val = float(np.mean(face_gray))

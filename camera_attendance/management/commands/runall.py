@@ -7,6 +7,7 @@ Features:
 - Starts detection script for each camera
 - Handles 1 camera now, scales to 3-4 cameras automatically
 - Cleans up all processes on exit
+- Uses --noreload by default, avoids duplicate detection processes
 """
 import subprocess
 import sys
@@ -19,7 +20,7 @@ from entrance_cam.models import Camera
 
 
 class Command(BaseCommand):
-    help = 'Run SSL server with detection scripts for all active cameras'
+    help = 'Run server with detection scripts for all active cameras'
 
     def add_arguments(self, parser):
         parser.add_argument(
@@ -28,7 +29,7 @@ class Command(BaseCommand):
         )
         parser.add_argument(
             '--addrport', default='0.0.0.0:8000',
-            help='Address and port for SSL server'
+            help='Address and port for server'
         )
         parser.add_argument(
             '--server-only',
@@ -41,12 +42,24 @@ class Command(BaseCommand):
             default=8765,
             help='Base port for MJPEG rebroadcast (default: 8765)'
         )
+        parser.add_argument(
+            '--ssl',
+            action='store_true',
+            help='Use SSL server (default: non-SSL)'
+        )
+        parser.add_argument(
+            '--use-reload',
+            action='store_true',
+            help='Enable Django reloader (risk of duplicate detection scripts)'
+        )
 
     def handle(self, *args, **options):
-        camera_ids = options['camera_ids']
-        addrport = options['addrport']
-        server_only = options['server_only']
-        rebroadcast_base_port = options['rebroadcast_base_port']
+        camera_ids = options.get('camera_ids')
+        addrport = options.get('addrport', '0.0.0.0:8000')
+        server_only = options.get('server_only', False)
+        rebroadcast_base_port = options.get('rebroadcast_base_port', 8765)
+        use_ssl = options.get('ssl', False)
+        use_reload = options.get('use_reload', False)
 
         # Track all detection processes
         detection_processes = []
@@ -80,7 +93,8 @@ class Command(BaseCommand):
                 # Camera 1 → 8765, Camera 2 → 8766, Camera 3 → 8767, etc.
                 rebroadcast_port = rebroadcast_base_port + idx
 
-                server_url = f"https://{addrport}" if not addrport.startswith('http') else addrport
+                # Use correct protocol for API calls
+                server_url = "https://localhost:8000" if use_ssl else "http://localhost:8000"
 
                 self.stdout.write(self.style.NOTICE(
                     f'\n[{idx+1}/{len(cameras)}] Configuring Camera {camera.id} ({camera.name})'
@@ -105,18 +119,10 @@ class Command(BaseCommand):
                     f'\nStarting detection for Camera {camera.id} ({camera.name})...'
                 ))
                 self.stdout.write(f'Command: {" ".join(cmd)}')
-                self.stdout.write(f'Rebroadcast port: {rebroadcast_port}')
 
                 try:
-                    # Start detection process
-                    proc = subprocess.Popen(
-                        cmd,
-                        stdout=subprocess.PIPE,
-                        stderr=subprocess.STDOUT,
-                        text=True,
-                        bufsize=1,
-                        universal_newlines=True
-                    )
+                    # Start detection process with logs visible (don't capture output)
+                    proc = subprocess.Popen(cmd)
 
                     detection_processes.append({
                         'process': proc,
@@ -129,9 +135,8 @@ class Command(BaseCommand):
 
                     # Check if process is still running
                     if proc.poll() is not None:
-                        stdout, _ = proc.communicate()
                         self.stdout.write(self.style.ERROR(
-                            f'Detection script for Camera {camera.id} failed to start:\n{stdout}'
+                            f'Detection script for Camera {camera.id} failed to start - exit code {proc.poll()}'
                         ))
                     else:
                         self.stdout.write(self.style.SUCCESS(
@@ -171,11 +176,15 @@ class Command(BaseCommand):
         signal.signal(signal.SIGINT, signal_handler)
         signal.signal(signal.SIGTERM, signal_handler)
 
-        # Start SSL server (this blocks)
-        self.stdout.write(self.style.SUCCESS(f'\nStarting SSL server on {addrport}...'))
+        # Start server (this blocks)
+        server_type = "SSL" if use_ssl else "HTTP"
+        self.stdout.write(self.style.SUCCESS(f'\nStarting {server_type} server on {addrport}...'))
         self.stdout.write(self.style.WARNING('Press Ctrl+C to stop everything\n'))
 
         try:
-            call_command('runsslserver', addrport=addrport)
+            if use_ssl:
+                call_command('runsslserver', addrport=addrport, use_reloader=use_reload)
+            else:
+                call_command('runserver', addrport=addrport, use_reloader=use_reload)
         finally:
             cleanup()
