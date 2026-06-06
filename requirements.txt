@@ -1,6 +1,7 @@
 # Core
 django==5.1.4
 django-sslserver==0.22
+psycopg2-binary==2.9.10
 
 # Image processing
 pillow==11.1.0

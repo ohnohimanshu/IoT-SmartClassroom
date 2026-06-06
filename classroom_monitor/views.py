@@ -538,7 +538,7 @@ def _generate_video_stream(video_path, camera_id=0, camera_location='Classroom',
     result_lock = threading.Lock()
     latest_dets = []                        # list[dict] — latest detections
     detect_q    = _queue.Queue(maxsize=1)   # frames  → detect worker
-    save_q      = _queue.Queue(maxsize=20)  # incident dicts → DB/WA saver
+    save_q      = _queue.Queue(maxsize=50)  # incident dicts → DB/WA saver
     stop_event  = threading.Event()
     cooldown    = {}                        # det_type → last incident timestamp
 
@@ -559,12 +559,16 @@ def _generate_video_stream(video_path, camera_id=0, camera_location='Classroom',
 
     # ── Save worker — DB write + email alert, NO dlib ──────────────────────────────
     def _save_worker():
+        from django.db import close_old_connections
         while not stop_event.is_set():
             try:
                 item = save_q.get(timeout=0.5)
             except _queue.Empty:
                 continue
+            
             try:
+                # Clean up old connections before/after DB operations
+                close_old_connections()
                 _save_incident_direct(
                     det_type     = item['type'],
                     confidence   = item['confidence'],
@@ -577,8 +581,9 @@ def _generate_video_stream(video_path, camera_id=0, camera_location='Classroom',
                 )
                 tag = f"{item['name']} ({item['roll']})" if item['student'] else 'Unknown'
                 print(f"[INCIDENT] {LABEL_MAP.get(item['type'], item['type'])} | {tag}")
+                close_old_connections()
             except Exception as exc:
-                print(f'[SAVE worker] {exc}')
+                print(f'[SAVE WORKER] {exc}')
 
     det_thread  = threading.Thread(target=_detection_worker, daemon=True)
     save_thread = threading.Thread(target=_save_worker,      daemon=True)
@@ -681,7 +686,7 @@ def _generate_video_stream(video_path, camera_id=0, camera_location='Classroom',
                 for det in snap_dets:
                     if not (det['is_alert'] or det['is_distracted']):
                         continue
-                    key = det['type']
+                    key = (det['type'], det.get('track_id'))
                     if (now - cooldown.get(key, 0)) < COOLDOWN_S:
                         continue
 

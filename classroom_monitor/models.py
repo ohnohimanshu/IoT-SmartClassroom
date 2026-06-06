@@ -293,7 +293,7 @@ class IncidentReport(models.Model):
     def get_incident_emoji(self):
         """Return emoji for incident type."""
         emoji_map = {
-            'phone_usage': '📱',
+            'using_phone': '📱',
             'eating_food': '🍔',
             'fighting': '🥊',
             'distracted': '😴',
