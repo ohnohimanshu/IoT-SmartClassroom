@@ -3,11 +3,12 @@ import json
 import base64
 import logging
 from datetime import date
-from django.shortcuts import render
+from django.shortcuts import render, redirect, get_object_or_404
 from django.http import JsonResponse
 from django.views.decorators.csrf import csrf_exempt
 from django.views.decorators.http import require_POST
 from django.contrib.auth.decorators import login_required
+from django.contrib import messages
 from django.utils import timezone
 from django.db.models import Count
 from django.db import transaction
@@ -15,10 +16,174 @@ import requests
 from django.http import StreamingHttpResponse
 
 
-from entrance_cam.models import Student, Camera
-from .models import CameraAttendanceLog
+from entrance_cam.models import Student
+from .models import Camera, CameraAttendanceLog
+from .forms import CameraForm
 
 logger = logging.getLogger(__name__)
+
+# ── Try importing shared utils; provide safe fallbacks if absent ──────────────
+
+# ── Camera Management Views ────────────────────────────────────────────────────
+
+@login_required
+def camera_list(request):
+    cameras = Camera.objects.all()
+    return render(request, 'camera_attendance/camera_list.html', {'cameras': cameras})
+
+
+@login_required
+def camera_add(request):
+    if request.method == 'POST':
+        form = CameraForm(request.POST)
+        if form.is_valid():
+            cam = form.save()
+            messages.success(request, f'Camera "{cam.name}" added.')
+            return redirect('camera_attendance:camera_list')
+    else:
+        form = CameraForm()
+    return render(request, 'camera_attendance/camera_form.html',
+                  {'form': form, 'action': 'Add Camera'})
+
+
+@login_required
+def camera_edit(request, pk):
+    camera = get_object_or_404(Camera, pk=pk)
+    if request.method == 'POST':
+        form = CameraForm(request.POST, instance=camera)
+        if form.is_valid():
+            form.save()
+            messages.success(request, 'Camera updated.')
+            return redirect('camera_attendance:camera_list')
+    else:
+        form = CameraForm(instance=camera)
+    return render(request, 'camera_attendance/camera_form.html',
+                  {'form': form, 'action': 'Edit Camera', 'camera': camera})
+
+
+@login_required
+def camera_delete(request, pk):
+    camera = get_object_or_404(Camera, pk=pk)
+    if request.method == 'POST':
+        camera.delete()
+        messages.success(request, 'Camera deleted.')
+        return redirect('camera_attendance:camera_list')
+    return render(request, 'entrance_cam/confirm_delete.html',
+                  {'obj': camera, 'type': 'Camera'})
+
+
+@login_required
+def camera_test(request, pk):
+    """
+    Quick connectivity check for a camera URL.
+    """
+    import requests as req_lib
+    import urllib3
+    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+    camera = get_object_or_404(Camera, pk=pk)
+    url = camera.url.strip()
+
+    # Local webcam index — can't test over HTTP
+    if url.isdigit():
+        return JsonResponse({'status': 'local', 'message': 'Local webcam — cannot test remotely'})
+
+    try:
+        # stream=True: only fetch headers + first chunk, don't download the whole stream
+        resp = req_lib.get(
+            url,
+            timeout=5,
+            verify=False,  # allow HTTP cameras from HTTPS Django server
+            stream=True,   # CRITICAL: don't try to read infinite MJPEG body
+            allow_redirects=True,
+        )
+        # Read just a tiny bit to confirm data is actually flowing
+        first_chunk = next(resp.iter_content(chunk_size=512), b'')
+        resp.close()
+
+        if resp.status_code < 400 and len(first_chunk) > 0:
+            content_type = resp.headers.get('Content-Type', '')
+            return JsonResponse({
+                'status': 'online',
+                'code': resp.status_code,
+                'content_type': content_type,
+                'bytes_received': len(first_chunk),
+            })
+        else:
+            return JsonResponse({
+                'status': 'offline',
+                'error': f'HTTP {resp.status_code} — no data received',
+            })
+    except req_lib.exceptions.ConnectTimeout:
+        return JsonResponse({'status': 'offline', 'error': 'Connection timed out — check IP and WiFi'})
+    except req_lib.exceptions.ConnectionError as e:
+        return JsonResponse({'status': 'offline', 'error': f'Cannot reach camera: {str(e)[:120]}'})
+    except Exception as e:
+        return JsonResponse({'status': 'offline', 'error': str(e)[:200]})
+
+
+@login_required
+def camera_proxy_stream(request, pk):
+    """MJPEG proxy — serves the rebroadcast stream from detection_script to browser."""
+    import requests as req_lib
+    import urllib3
+    import traceback
+    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+    try:
+        camera = get_object_or_404(Camera, pk=pk)
+
+        if camera.url.strip().isdigit():
+            return JsonResponse({'error': 'Local webcam cannot be proxied'}, status=400)
+
+        # Calculate rebroadcast port (8765 + camera index)
+        all_cameras = list(Camera.objects.filter(is_active=True).order_by('id'))
+        try:
+            camera_index = all_cameras.index(camera)
+        except ValueError:
+            camera_index = 0
+
+        rebroadcast_port = 8765 + camera_index
+        rebroadcast_url = f'http://127.0.0.1:{rebroadcast_port}/stream'
+
+        def stream_generator(upstream_resp):
+            try:
+                for chunk in upstream_resp.iter_content(chunk_size=4096):
+                    if chunk:
+                        yield chunk
+            except Exception:
+                pass
+            finally:
+                upstream_resp.close()
+
+        upstream = req_lib.get(
+            rebroadcast_url,
+            stream=True,
+            timeout=(3, None),
+            verify=False,
+        )
+        upstream.raise_for_status()
+
+        content_type = upstream.headers.get(
+            'Content-Type',
+            'multipart/x-mixed-replace;boundary=gc0p4Jq0M2Yt08jU534c0p'
+        )
+        response = StreamingHttpResponse(stream_generator(upstream), content_type=content_type)
+        response['Cache-Control'] = 'no-store, no-cache, must-revalidate'
+        response['Access-Control-Allow-Origin'] = '*'
+        return response
+
+    except req_lib.exceptions.ConnectionError:
+        return JsonResponse({
+            'error': 'Detection script not running. Start it first so the stream is available.'
+        }, status=503)
+    except req_lib.exceptions.ConnectTimeout:
+        return JsonResponse({'error': 'Rebroadcast server not responding'}, status=504)
+    except Exception as e:
+        logger.error(f"camera_proxy_stream error: {e}")
+        logger.error(traceback.format_exc())
+        return JsonResponse({'error': str(e)[:200]}, status=502)
+
 
 # ── Try importing shared utils; provide safe fallbacks if absent ──────────────
 
@@ -491,3 +656,4 @@ def camera_attendance_dashboard(request):
                 'emotions_today': [], 'mood_summary': [], 'recent_logs': [],
             },
         )
+

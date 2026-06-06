@@ -1,7 +1,8 @@
 from django.db import models
 from django.utils import timezone
 from django.contrib.auth.models import User
-from entrance_cam.models import Student, Camera
+from entrance_cam.models import Student
+from camera_attendance.models import Camera
 
 
 class ClassroomCamera(models.Model):

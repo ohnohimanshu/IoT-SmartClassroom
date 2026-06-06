@@ -8,8 +8,8 @@ from django.management.base import BaseCommand
 from django.test import Client
 from django.utils import timezone
 from datetime import date
-from entrance_cam.models import Student, Camera
-from camera_attendance.models import CameraAttendanceLog
+from entrance_cam.models import Student
+from camera_attendance.models import Camera, CameraAttendanceLog
 
 
 class Command(BaseCommand):

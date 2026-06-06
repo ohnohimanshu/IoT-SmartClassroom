@@ -14,7 +14,8 @@ import os
 from datetime import datetime
 
 from .models import LabSession, Screenshot, CameraSnapshot, ActivityLog
-from entrance_cam.models import Student, AttendanceLog
+from entrance_cam.models import Student
+from camera_attendance.models import CameraAttendanceLog
 
 DEEPFACE_AVAILABLE = None  # None = not yet checked; True/False after first use
 
@@ -85,7 +86,7 @@ def student_dashboard(request):
     except Student.DoesNotExist:
         return redirect('dashboard')
     
-    attendance_logs = AttendanceLog.objects.filter(student=student)[:10]
+    attendance_logs = CameraAttendanceLog.objects.filter(student=student)[:10]
     past_sessions = LabSession.objects.filter(student=student, is_active=False)[:10]
     
     return render(request, 'lab_monitor/student_dashboard.html', {

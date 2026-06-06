@@ -133,7 +133,7 @@
     <a href="{% url 'student_list' %}" class="sidebar-link {% if 'student' in request.resolver_match.url_name %}active{% endif %}">
       <i class="bi bi-people-fill"></i> Students
     </a>
-    <a href="{% url 'camera_list' %}" class="sidebar-link {% if 'camera' in request.resolver_match.url_name %}active{% endif %}">
+    <a href="{% url 'camera_attendance:camera_list' %}" class="sidebar-link {% if 'camera' in request.resolver_match.url_name %}active{% endif %}">
       <i class="bi bi-camera-video"></i> Cameras
     </a>
     <a href="{% url 'esp32_device_list' %}" class="sidebar-link {% if 'esp32' in request.resolver_match.url_name %}active{% endif %}">

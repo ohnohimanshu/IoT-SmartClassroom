@@ -73,10 +73,10 @@ cv2                        = None
 np                         = None
 face_recognition           = None
 DeepFace                   = None
+mp                         = None
+mp_face_detection          = None
 FACE_RECOGNITION_AVAILABLE = False
 DEEPFACE_AVAILABLE         = False
-face_cascade               = None
-_eye_cascade               = None
 
 VALID_EMOTIONS = {'happy', 'sad', 'angry', 'neutral', 'surprise', 'fear', 'disgust'}
 EMOTION_MAP = {
@@ -90,9 +90,8 @@ EMOTION_MAP = {
 #  DEPENDENCY LOADER
 # ─────────────────────────────────────────────────────────────────────────────
 def load_dependencies():
-    global cv2, np, face_recognition, DeepFace
+    global cv2, np, face_recognition, DeepFace, mp, mp_face_detection
     global FACE_RECOGNITION_AVAILABLE, DEEPFACE_AVAILABLE
-    global face_cascade, _eye_cascade
 
     logger.info("Loading dependencies…")
 
@@ -106,19 +105,35 @@ def load_dependencies():
         logger.error(f"✗ OpenCV not installed: {e}")
         sys.exit(1)
 
-    frontal_path = cv2.data.haarcascades + 'haarcascade_frontalface_default.xml'
-    face_cascade = cv2.CascadeClassifier(frontal_path)
-    if face_cascade.empty():
-        logger.error("✗ Haar frontal cascade not found")
-        sys.exit(1)
+    try:
+        import mediapipe as _mp
+        mp = _mp
+        mp_face_detection = mp.solutions.face_detection.FaceDetection(
+            model_selection=1,  # 0 for short-range, 1 for full-range
+            min_detection_confidence=0.7
+        )
+        logger.info("✓ MediaPipe Face Detection loaded")
+    except ImportError as e:
+        logger.warning(f"⚠ MediaPipe not installed: {e}")
+        logger.warning("  Falling back to Haar cascades (lower accuracy)")
+        try:
+            global face_cascade, _eye_cascade
+            frontal_path = cv2.data.haarcascades + 'haarcascade_frontalface_default.xml'
+            face_cascade = cv2.CascadeClassifier(frontal_path)
+            if face_cascade.empty():
+                logger.error("✗ Haar frontal cascade not found")
+                sys.exit(1)
 
-    eye_path = cv2.data.haarcascades + 'haarcascade_eye.xml'
-    _eye_cascade = cv2.CascadeClassifier(eye_path)
-    if _eye_cascade.empty():
-        logger.warning("⚠ Eye cascade not found — eye validation disabled")
-        _eye_cascade = None
-    else:
-        logger.info("✓ Haar cascades loaded (frontal + eye)")
+            eye_path = cv2.data.haarcascades + 'haarcascade_eye.xml'
+            _eye_cascade = cv2.CascadeClassifier(eye_path)
+            if _eye_cascade.empty():
+                logger.warning("⚠ Eye cascade not found — eye validation disabled")
+                _eye_cascade = None
+            else:
+                logger.info("✓ Haar cascades loaded (frontal + eye)")
+        except Exception as e2:
+            logger.error(f"✗ Could not load fallback Haar cascades: {e2}")
+            sys.exit(1)
 
     try:
         import face_recognition as _fr
@@ -249,67 +264,71 @@ def load_open_logs(server_url):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  FACE DETECTION  — strict, requires BOTH eyes
+#  FACE DETECTION  — Use MediaPipe for accuracy, fall back to Haar
 # ─────────────────────────────────────────────────────────────────────────────
 def detect_faces(frame):
     """
     Returns list of (x, y, w, h) face boxes.
-    Applies:
-      • Strict Haar parameters (minNeighbors=10, minSize=120)
-      • Aspect ratio check (0.75–1.3)
-      • Both-eye validation when eye cascade is available
-      • Basic skin-tone check (reject uniformly dark/bright regions)
+    First tries MediaPipe, if not available falls back to Haar.
     """
     if frame is None or frame.size == 0:
         return []
     try:
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        gray = cv2.equalizeHist(gray)
+        if mp_face_detection is not None:
+            # Use MediaPipe
+            rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            results = mp_face_detection.process(rgb_frame)
+            faces = []
+            if results.detections:
+                h, w, _ = frame.shape
+                for detection in results.detections:
+                    bbox = detection.location_data.relative_bounding_box
+                    x1 = int(bbox.xmin * w)
+                    y1 = int(bbox.ymin * h)
+                    width = int(bbox.width * w)
+                    height = int(bbox.height * h)
+                    # Clamp to valid coordinates
+                    x1 = max(0, x1)
+                    y1 = max(0, y1)
+                    width = min(width, w - x1)
+                    height = min(height, h - y1)
+                    faces.append((x1, y1, width, height))
+            return faces
+        else:
+            # Fall back to Haar cascades
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            gray = cv2.equalizeHist(gray)
 
-        raw_faces = face_cascade.detectMultiScale(
-            gray,
-            scaleFactor=1.05,
-            minNeighbors=6,       # relaxed from 10
-            minSize=(60, 60),     # minimum reasonable face size
-            maxSize=(800, 800),   # much larger for 1080p cameras!
-            flags=cv2.CASCADE_SCALE_IMAGE,
-        )
-        if len(raw_faces) == 0:
-            return []
+            raw_faces = face_cascade.detectMultiScale(
+                gray,
+                scaleFactor=1.05,
+                minNeighbors=6,
+                minSize=(60, 60),
+                maxSize=(800, 800),
+                flags=cv2.CASCADE_SCALE_IMAGE,
+            )
+            if len(raw_faces) == 0:
+                return []
 
-        validated = []
-        for (x, y, w, h) in raw_faces:
-            # 1. Aspect ratio
-            ar = w / h if h > 0 else 1.0
-            if not (0.75 <= ar <= 1.3):
-                logger.debug(f"  ✗ Bad aspect ratio {ar:.2f}")
-                continue
+            validated = []
+            for (x, y, w, h) in raw_faces:
+                # 1. Aspect ratio
+                ar = w / h if h > 0 else 1.0
+                if not (0.75 <= ar <= 1.3):
+                    logger.debug(f"  ✗ Bad aspect ratio {ar:.2f}")
+                    continue
 
-            face_gray = gray[y:y+h, x:x+w]
+                # 3. Skin-tone check: mean pixel value should be mid-range
+                face_gray = gray[y:y+h, x:x+w]
+                mean_val = float(np.mean(face_gray))
+                if mean_val < 30 or mean_val > 230:
+                    logger.debug(f"  ✗ Skin-tone check failed (mean={mean_val:.0f})")
+                    continue
 
-            # 2. Temporarily disabled eye check to help with 1080p detection
-            # We can re-enable later after basic detection is working
-            # if _eye_cascade is not None:
-            #     try:
-            #         eyes = _eye_cascade.detectMultiScale(
-            #             face_gray, 1.1, 3, minSize=(30, 30)  # larger min eyes for 1080p
-            #         )
-            #         if len(eyes) < 1:
-            #             logger.debug(f"  ✗ No eyes detected — rejected")
-            #             continue
-            #     except Exception:
-            #         pass   # eye cascade fail — let it through
+                validated.append((x, y, w, h))
+                logger.debug(f"  ✓ Face validated at ({x},{y},{w},{h})")
 
-            # 3. Skin-tone check: mean pixel value should be mid-range
-            mean_val = float(np.mean(face_gray))
-            if mean_val < 30 or mean_val > 230:
-                logger.debug(f"  ✗ Skin-tone check failed (mean={mean_val:.0f})")
-                continue
-
-            validated.append((x, y, w, h))
-            logger.debug(f"  ✓ Face validated at ({x},{y},{w},{h})")
-
-        return validated
+            return validated
     except Exception as e:
         logger.error(f"✗ detect_faces: {e}")
         return []

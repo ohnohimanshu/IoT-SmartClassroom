@@ -3,6 +3,12 @@ from django.contrib.auth.models import User
 from django.utils import timezone
 import datetime
 
+# For backwards compatibility: import Camera from camera_attendance
+try:
+    from camera_attendance.models import Camera
+except ImportError:
+    pass
+
 COURSE_CHOICES = [
     ('B.Tech', 'B.Tech'), ('M.Tech', 'M.Tech'), ('BCA', 'BCA'),
     ('MCA', 'MCA'),       ('B.Sc', 'B.Sc'),     ('M.Sc', 'M.Sc'),
@@ -159,90 +165,3 @@ class FingerprintAttendance(models.Model):
             delta = self.timestamp - entry_record.timestamp
             return int(delta.total_seconds() // 60)
         return None
-
-
-class Camera(models.Model):
-    """
-    Camera configuration for attendance detection.
-    
-    Fields:
-        name: Camera name/identifier
-        url: Camera stream URL or webcam index
-        location: Physical location of camera
-        is_active: Whether camera is active
-        created_at: Creation timestamp
-    """
-    name      = models.CharField(max_length=100)
-    url       = models.CharField(
-        max_length=300,
-        help_text="Webcam index (0, 1, …) or IP stream URL e.g. http://192.168.1.100:8080/video",
-    )
-    location  = models.CharField(max_length=100, default='Entrance')
-    is_active = models.BooleanField(default=True)
-    created_at = models.DateTimeField(auto_now_add=True)
-
-    class Meta:
-        ordering = ['name']
-        verbose_name = 'Camera'
-        verbose_name_plural = 'Cameras'
-
-    def __str__(self):
-        """Return string representation of the camera."""
-        return f"{self.name} @ {self.location}"
-
-
-class AttendanceLog(models.Model):
-    student = models.ForeignKey(
-        Student, on_delete=models.CASCADE, related_name='attendance_logs',
-    )
-    camera = models.ForeignKey(
-        Camera, on_delete=models.SET_NULL, null=True, blank=True,
-    )
-
-    # Using timezone.now() for proper timezone handling
-    # Field stays writable so views.py can create logs with explicit dates
-    date = models.DateField(default=timezone.now)
-
-    entry_time = models.DateTimeField(null=True, blank=True)
-    exit_time  = models.DateTimeField(null=True, blank=True)
-
-    entry_emotion       = models.CharField(max_length=20, choices=EMOTION_CHOICES, default='unknown')
-    exit_emotion        = models.CharField(max_length=20, choices=EMOTION_CHOICES, default='unknown')
-    entry_emotion_score = models.FloatField(default=0.0)
-    exit_emotion_score  = models.FloatField(default=0.0)
-
-    entry_snapshot = models.ImageField(upload_to='snapshots/entry/', blank=True, null=True)
-    exit_snapshot  = models.ImageField(upload_to='snapshots/exit/',  blank=True, null=True)
-
-    # Populated on exit: 'improved' | 'declined' | 'stable' | 'unknown'
-    mood_comparison = models.CharField(
-        max_length=20, choices=MOOD_COMPARISON_CHOICES,
-        default='unknown', blank=True,
-    )
-
-    duration_minutes = models.IntegerField(null=True, blank=True)
-    is_present       = models.BooleanField(default=True)
-
-    class Meta:
-        ordering = ['-date', '-entry_time']
-        # No unique_together on (student, date) — allows multiple visits per day.
-        # The open-log query in views.api_log_entry handles visit sequencing.
-        indexes = [
-            models.Index(fields=['student', 'date']),
-            models.Index(fields=['date', '-entry_time']),
-            models.Index(fields=['camera', 'date']),
-        ]
-        verbose_name = 'Attendance Log'
-        verbose_name_plural = 'Attendance Logs'
-
-    def __str__(self):
-        return f"{self.student.name} — {self.date}"
-
-    def calculate_duration(self):
-        """
-        Compute duration_minutes in memory.
-        Does NOT call self.save() — caller is responsible for saving.
-        """
-        if self.entry_time and self.exit_time:
-            delta = self.exit_time - self.entry_time
-            self.duration_minutes = int(delta.total_seconds() / 60)

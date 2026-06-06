@@ -925,7 +925,7 @@ def api_incidents_report(request):
         cam_id = data.get('camera_id')
         if cam_id:
             try:
-                from entrance_cam.models import Camera
+                from camera_attendance.models import Camera
                 camera = Camera.objects.get(pk=cam_id)
             except Exception:
                 # Try ClassroomCamera as fallback

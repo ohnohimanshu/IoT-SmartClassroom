@@ -1,3 +1,4 @@
+
 from django.shortcuts import render, redirect, get_object_or_404
 from django.contrib.auth.decorators import login_required
 from django.contrib.auth import authenticate, login, logout
@@ -19,8 +20,8 @@ import zlib
 import os
 import logging
 
-from .models import Student, Camera, AttendanceLog, ESP32Device, FingerprintAttendance
-from .forms import StudentForm, CameraForm, ESP32DeviceForm
+from .models import Student, ESP32Device, FingerprintAttendance
+from .forms import StudentForm, ESP32DeviceForm
 from attendance_utils import mood_comparison, decode_snapshot, validate_emotion, clamp_score
 
 logger = logging.getLogger(__name__)
@@ -79,7 +80,7 @@ def dashboard(request):
         pass
 
     # Import camera attendance model
-    from camera_attendance.models import CameraAttendanceLog
+    from camera_attendance.models import CameraAttendanceLog, Camera
 
     today = date.today()
     total_students    = Student.objects.filter(is_active=True).count()
@@ -235,418 +236,23 @@ def student_detail(request, pk):
     thirty_days_ago = timezone.now() - timedelta(days=30)
     
     # Combine both types of logs
-    fingerprint_logs = (AttendanceLog.objects
+    fingerprint_logs = (FingerprintAttendance.objects
                        .filter(student=student)
-                       .order_by('-date', '-entry_time')[:30])
+                       .order_by('-date', '-timestamp')[:30])
     
     camera_logs = (CameraAttendanceLog.objects
                   .filter(student=student, entry_time__gte=thirty_days_ago)
                   .order_by('-entry_time')[:30])
     
-    # Combine and sort by date
+    # Combine and sort by time
     all_logs = list(fingerprint_logs) + list(camera_logs)
-    all_logs.sort(key=lambda x: x.entry_time if hasattr(x, 'entry_time') else x.date, reverse=True)
+    all_logs.sort(key=lambda x: x.timestamp if hasattr(x, 'timestamp') else (x.entry_time or x.date), reverse=True)
     
     return render(request, 'entrance_cam/student_detail.html',
                   {'student': student, 'logs': all_logs, 'camera_logs': camera_logs})
 
 
-# ── Cameras ───────────────────────────────────────────────────────────────────
-
-@login_required
-def camera_list(request):
-    cameras = Camera.objects.all()
-    return render(request, 'entrance_cam/camera_list.html', {'cameras': cameras})
-
-
-@login_required
-def camera_add(request):
-    if request.method == 'POST':
-        form = CameraForm(request.POST)
-        if form.is_valid():
-            cam = form.save()
-            messages.success(request, f'Camera "{cam.name}" added.')
-            return redirect('camera_list')
-    else:
-        form = CameraForm()
-    return render(request, 'entrance_cam/camera_form.html',
-                  {'form': form, 'action': 'Add Camera'})
-
-
-@login_required
-def camera_edit(request, pk):
-    camera = get_object_or_404(Camera, pk=pk)
-    if request.method == 'POST':
-        form = CameraForm(request.POST, instance=camera)
-        if form.is_valid():
-            form.save()
-            messages.success(request, 'Camera updated.')
-            return redirect('camera_list')
-    else:
-        form = CameraForm(instance=camera)
-    return render(request, 'entrance_cam/camera_form.html',
-                  {'form': form, 'action': 'Edit Camera', 'camera': camera})
-
-
-@login_required
-def camera_proxy_stream(request, pk):
-    """MJPEG proxy — serves the rebroadcast stream from detection_script to browser."""
-    import requests as req_lib
-    import urllib3
-    import traceback
-    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-
-    try:
-        camera = get_object_or_404(Camera, pk=pk)
-
-        if camera.url.strip().isdigit():
-            return JsonResponse({'error': 'Local webcam cannot be proxied'}, status=400)
-
-        # Calculate rebroadcast port (8765 + camera index)
-        all_cameras = list(Camera.objects.filter(is_active=True).order_by('id'))
-        try:
-            camera_index = all_cameras.index(camera)
-        except ValueError:
-            camera_index = 0
-        
-        rebroadcast_port = 8765 + camera_index
-        rebroadcast_url = f'http://127.0.0.1:{rebroadcast_port}/stream'
-
-        def stream_generator(upstream_resp):
-            try:
-                for chunk in upstream_resp.iter_content(chunk_size=4096):
-                    if chunk:
-                        yield chunk
-            except Exception:
-                pass
-            finally:
-                upstream_resp.close()
-
-        upstream = req_lib.get(
-            rebroadcast_url,
-            stream=True,
-            timeout=(3, None),
-            verify=False,
-        )
-        upstream.raise_for_status()
-
-        content_type = upstream.headers.get(
-            'Content-Type',
-            'multipart/x-mixed-replace;boundary=gc0p4Jq0M2Yt08jU534c0p'
-        )
-        response = StreamingHttpResponse(stream_generator(upstream), content_type=content_type)
-        response['Cache-Control'] = 'no-store, no-cache, must-revalidate'
-        response['Access-Control-Allow-Origin'] = '*'
-        return response
-
-    except req_lib.exceptions.ConnectionError:
-        return JsonResponse({
-            'error': 'Detection script not running. Start it first so the stream is available.'
-        }, status=503)
-    except req_lib.exceptions.ConnectTimeout:
-        return JsonResponse({'error': 'Rebroadcast server not responding'}, status=504)
-    except Exception as e:
-        logger.error(f"camera_proxy_stream error: {e}")
-        logger.error(traceback.format_exc())
-        return JsonResponse({'error': str(e)[:200]}, status=502)
-
-
-@login_required
-def camera_delete(request, pk):
-    camera = get_object_or_404(Camera, pk=pk)
-    if request.method == 'POST':
-        camera.delete()
-        messages.success(request, 'Camera deleted.')
-        return redirect('camera_list')
-    return render(request, 'entrance_cam/confirm_delete.html',
-                  {'obj': camera, 'type': 'Camera'})
-
-
-@login_required
-def camera_test(request, pk):
-    """
-    Quick connectivity check for a camera URL.
-
-    FIX: urllib.request.urlopen() hangs forever on MJPEG streams because
-    MJPEG is an infinite multipart response — it never "finishes".
-    We now use requests with stream=True and just check the HTTP status code
-    (and the first few bytes) without consuming the body.
-
-    FIX 2: SSL verification disabled so the Django HTTPS server can reach
-    plain HTTP ESP32-CAM streams without SSL errors.
-
-    FIX 3: For webcam indexes (numeric strings like "0"), return a special
-    'local' status instead of trying to open them as URLs.
-    """
-    import requests as req_lib
-    import urllib3
-    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-
-    camera = get_object_or_404(Camera, pk=pk)
-    url = camera.url.strip()
-
-    # Local webcam index — can't test over HTTP
-    if url.isdigit():
-        return JsonResponse({'status': 'local', 'message': 'Local webcam — cannot test remotely'})
-
-    try:
-        # stream=True: only fetch headers + first chunk, don't download the whole stream
-        resp = req_lib.get(
-            url,
-            timeout=5,
-            verify=False,           # allow HTTP cameras from HTTPS Django server
-            stream=True,            # CRITICAL: don't try to read infinite MJPEG body
-            allow_redirects=True,
-        )
-        # Read just a tiny bit to confirm data is actually flowing
-        first_chunk = next(resp.iter_content(chunk_size=512), b'')
-        resp.close()
-
-        if resp.status_code < 400 and len(first_chunk) > 0:
-            content_type = resp.headers.get('Content-Type', '')
-            return JsonResponse({
-                'status': 'online',
-                'code': resp.status_code,
-                'content_type': content_type,
-                'bytes_received': len(first_chunk),
-            })
-        else:
-            return JsonResponse({
-                'status': 'offline',
-                'error': f'HTTP {resp.status_code} — no data received',
-            })
-    except req_lib.exceptions.ConnectTimeout:
-        return JsonResponse({'status': 'offline', 'error': 'Connection timed out — check IP and WiFi'})
-    except req_lib.exceptions.ConnectionError as e:
-        return JsonResponse({'status': 'offline', 'error': f'Cannot reach camera: {str(e)[:120]}'})
-    except Exception as e:
-        return JsonResponse({'status': 'offline', 'error': str(e)[:200]})
-
-
 # ── Attendance ────────────────────────────────────────────────────────────────
-
-# ── Internal helpers ──────────────────────────────────────────────────────────
-# Note: Using shared utilities from attendance_utils.py instead of local helpers
-
-
-# ── API: log entry / exit (called by detection_script.py) ────────────────────
-
-@csrf_exempt
-@csrf_exempt
-@transaction.atomic
-def api_log_entry(request):
-    """
-    POST  /api/log/
-
-    Expected JSON body:
-        student_id  : int       — Student PK
-        camera_id   : int       — Camera PK
-        emotion     : str       — e.g. 'happy', 'neutral'  (default 'unknown')
-        score       : float     — confidence 0.0–1.0        (default 0.0)
-        snapshot    : str|null  — base64 JPEG               (optional)
-
-    Logic:
-        • If today already has an open log (entry present, exit NULL)
-          for this student  →  record EXIT.
-        • Otherwise  →  record ENTRY.
-
-    This correctly handles multiple in/out visits per day.
-    """
-    if request.method != 'POST':
-        logger.warning(f"Invalid method: {request.method}")
-        return JsonResponse({'error': 'POST only'}, status=405)
-
-    try:
-        data = json.loads(request.body)
-    except (json.JSONDecodeError, ValueError) as e:
-        logger.error(f"Invalid JSON body: {e}")
-        return JsonResponse({'error': 'Invalid JSON body'}, status=400)
-
-    # ── Validate required fields ──────────────────────────────────────────────
-    student_id = data.get('student_id')
-    camera_id  = data.get('camera_id')
-    if student_id is None or camera_id is None:
-        logger.warning(f"Missing required fields: student_id={student_id}, camera_id={camera_id}")
-        return JsonResponse(
-            {'error': 'student_id and camera_id are required'}, status=400
-        )
-
-    try:
-        student = Student.objects.get(pk=student_id, is_active=True)
-    except Student.DoesNotExist:
-        logger.warning(f"Student {student_id} not found or inactive")
-        return JsonResponse({'error': f'Student {student_id} not found or inactive'}, status=404)
-
-    try:
-        camera = Camera.objects.get(pk=camera_id, is_active=True)
-    except Camera.DoesNotExist:
-        logger.warning(f"Camera {camera_id} not found or inactive")
-        return JsonResponse({'error': f'Camera {camera_id} not found or inactive'}, status=404)
-
-    # ── Parse optional fields ─────────────────────────────────────────────────
-    try:
-        today        = date.today()
-        emotion      = validate_emotion(data.get('emotion'))
-        score        = clamp_score(float(data.get('score') or 0.0))
-        snapshot_b64 = data.get('snapshot')
-
-        # ── Decide ENTRY or EXIT ──────────────────────────────────────────────────
-        open_log = (AttendanceLog.objects
-                    .filter(student=student, date=today,
-                            entry_time__isnull=False,
-                            exit_time__isnull=True)
-                    .order_by('-entry_time')
-                    .first())
-
-        if open_log:
-            # ── EXIT ──────────────────────────────────────────────────────────────
-            open_log.exit_time          = timezone.now()
-            open_log.exit_emotion       = emotion
-            open_log.exit_emotion_score = score
-            open_log.mood_comparison    = mood_comparison(open_log.entry_emotion, emotion)
-
-            snapshot_file = decode_snapshot(snapshot_b64, student.roll_no, 'exit')
-            if snapshot_file:
-                open_log.exit_snapshot = snapshot_file
-
-            # Calculate duration
-            if open_log.entry_time:
-                delta = open_log.exit_time - open_log.entry_time
-                open_log.duration_minutes = int(delta.total_seconds() // 60)
-
-            open_log.save()
-
-            logger.info(f"EXIT: {student.name} | emotion={emotion} | "
-                       f"duration={open_log.duration_minutes} min | "
-                       f"mood={open_log.mood_comparison}")
-
-            return JsonResponse({
-                'status':          'exit_logged',
-                'student':         student.name,
-                'duration':        open_log.duration_minutes,
-                'mood_comparison': open_log.mood_comparison,
-                'exit_emotion':    emotion,
-            })
-
-        else:
-            # ── ENTRY ─────────────────────────────────────────────────────────────
-            log = AttendanceLog(
-                student             = student,
-                camera              = camera,
-                date                = today,
-                entry_time          = timezone.now(),
-                entry_emotion       = emotion,
-                entry_emotion_score = score,
-            )
-            snapshot_file = decode_snapshot(snapshot_b64, student.roll_no, 'entry')
-            if snapshot_file:
-                log.entry_snapshot = snapshot_file
-
-            log.save()
-
-            logger.info(f"ENTRY: {student.name} | emotion={emotion} | score={score:.2f}")
-
-            return JsonResponse({
-                'status':         'entry_logged',
-                'student':        student.name,
-                'entry_emotion':  emotion,
-            })
-    
-    except Exception as e:
-        logger.error(f"Error logging attendance: {e}", exc_info=True)
-        return JsonResponse({'error': 'Internal server error'}, status=500)
-
-
-# ── API: student face encodings (called by detection_script.py) ──────────────
-
-@csrf_exempt
-@csrf_exempt
-def api_students_encodings(request):
-    """
-    GET  /api/students/encodings/
-
-    Returns JSON list of active students that have a face encoding:
-        [ { "id": 1, "name": "Ravi Kumar", "encoding": "[0.123, ...]" }, ... ]
-    """
-    if request.method != 'GET':
-        logger.warning(f"Invalid method: {request.method}")
-        return JsonResponse({'error': 'GET only'}, status=405)
-
-    try:
-        students = (Student.objects
-                    .filter(is_active=True, is_enrolled=True)
-                    .exclude(face_encoding__isnull=True)
-                    .exclude(face_encoding=''))
-
-        data = [
-            {'id': s.id, 'name': s.name, 'encoding': s.face_encoding}
-            for s in students
-        ]
-        logger.info(f"Retrieved {len(data)} students with face encodings")
-        return JsonResponse(data, safe=False)
-    except Exception as e:
-        logger.error(f"Error retrieving student encodings: {e}", exc_info=True)
-        return JsonResponse({'error': 'Internal server error'}, status=500)
-@csrf_exempt
-def api_live_detections(request):
-    """
-    GET  /api/live-detections/?camera_id=<pk>
-
-    Returns today's attendance logs for a specific camera so the
-    Live modal can populate the right-hand detections panel.
-
-    Response:
-    {
-      "today_total":  12,
-      "inside_now":    3,
-      "logs": [
-        {
-          "student_name":   "Ravi Kumar",
-          "entry_time":     "2025-06-01T09:14:00",
-          "exit_time":      null,
-          "entry_emotion":  "happy",
-          "exit_emotion":   "neutral",
-          "mood_comparison":"improved",
-          "duration":       null
-        }, ...
-      ]
-    }
-    """
-    if request.method != 'GET':
-        return JsonResponse({'error': 'GET only'}, status=405)
-
-    camera_id = request.GET.get('camera_id')
-    today     = date.today()
-
-    qs = AttendanceLog.objects.filter(date=today).select_related('student')
-    if camera_id:
-        qs = qs.filter(camera_id=camera_id)
-    qs = qs.order_by('-entry_time')[:50]
-
-    logs = []
-    for log in qs:
-        logs.append({
-            'student_name':    log.student.name,
-            'roll_no':         log.student.roll_no,
-            'entry_time':      log.entry_time.isoformat()  if log.entry_time  else None,
-            'exit_time':       log.exit_time.isoformat()   if log.exit_time   else None,
-            'entry_emotion':   log.entry_emotion,
-            'exit_emotion':    log.exit_emotion,
-            'mood_comparison': log.mood_comparison,
-            'duration':        log.duration_minutes,
-        })
-
-    inside_now = AttendanceLog.objects.filter(
-        date=today,
-        entry_time__isnull=False,
-        exit_time__isnull=True,
-    ).count()
-
-    return JsonResponse({
-        'today_total': qs.count(),
-        'inside_now':  inside_now,
-        'logs':        logs,
-    })
 
 
 # ── ESP32 Devices ─────────────────────────────────────────────────────────────────
@@ -691,7 +297,8 @@ def esp32_device_delete(request, pk):
         device.delete()
         messages.success(request, 'ESP32 Device deleted.')
         return redirect('esp32_device_list')
-    return render(request, 'entrance_cam/confirm_delete.html', {'obj': device, 'type': 'ESP32 Device'})
+    return render(request, 'entrance_cam/confirm_delete.html',
+                  {'obj': device, 'type': 'ESP32 Device'})
 
 
 # ── Fingerprint Enrollment ────────────────────────────────────────────────────────
@@ -720,6 +327,7 @@ def enroll_fingerprint(request, student_id):
     cache.set('esp32_command', {'command': 'ENROLL', 'fingerprint_id': fp_slot}, timeout=120)
     return JsonResponse({'ok': True, 'slot': fp_slot})   # ← JSON, not redirect
 
+
 @login_required
 def enrollment_status(request, student_id):
     try:
@@ -742,7 +350,7 @@ def view_fingerprint_image(request, student_id):
     return JsonResponse({'error': 'No fingerprint image available'}, status=404)
 
 
-# ── Updated Attendance View ───────────────────────────────────────────────────────
+# ── Updated Attendance View ────────────────────────────────────────────────────────
 
 @login_required
 def attendance_list(request):
@@ -812,7 +420,7 @@ def attendance_list(request):
     })
 
 
-# ── ESP32 API Endpoints ───────────────────────────────────────────────────────────
+# ── ESP32 API Endpoints ────────────────────────────────────────────────────────────
 
 def esp32_auth(f):
     @wraps(f)
@@ -939,7 +547,6 @@ def api_esp32_upload_image(request):
 
 
 @csrf_exempt
-@csrf_exempt
 @esp32_auth
 def api_mark_fingerprint_attendance(request):
     if request.method != 'POST':
@@ -989,3 +596,4 @@ def api_mark_fingerprint_attendance(request):
         'time': now.strftime('%H:%M'),
         'confidence': confidence
     })
+

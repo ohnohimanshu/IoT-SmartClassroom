@@ -3,8 +3,8 @@ Diagnostic command to check camera attendance system status.
 """
 from django.management.base import BaseCommand
 from django.utils import timezone
-from entrance_cam.models import Student, Camera
-from camera_attendance.models import CameraAttendanceLog
+from entrance_cam.models import Student
+from camera_attendance.models import Camera, CameraAttendanceLog
 
 
 class Command(BaseCommand):

@@ -45,7 +45,7 @@ def generate_face_encoding_on_photo_upload(sender, instance, created, **kwargs):
         except Exception:
             pass  # On any error fall through and regenerate to be safe
 
-    # ── Load face_recognition ─────────────────────────────────────────────────
+    # ── Load face_recognition ONLY WHEN NEEDED ─────────────────────────────────
     try:
         import face_recognition
     except ImportError:

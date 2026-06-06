@@ -5,7 +5,37 @@ Completely separate from fingerprint enrollment system
 from django.db import models
 from django.utils import timezone
 import datetime
-from entrance_cam.models import Student, Camera
+from entrance_cam.models import Student
+
+
+class Camera(models.Model):
+    """
+    Camera configuration for attendance detection.
+
+    Fields:
+        name: Camera name/identifier
+        url: Camera stream URL or webcam index
+        location: Physical location of camera
+        is_active: Whether camera is active
+        created_at: Creation timestamp
+    """
+    name = models.CharField(max_length=100)
+    url = models.CharField(
+        max_length=300,
+        help_text="Webcam index (0, 1, …) or IP stream URL e.g. http://192.168.1.100:8080/video",
+    )
+    location = models.CharField(max_length=100, default='Entrance')
+    is_active = models.BooleanField(default=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ['name']
+        verbose_name = 'Camera'
+        verbose_name_plural = 'Cameras'
+
+    def __str__(self):
+        """Return string representation of the camera."""
+        return f"{self.name} @ {self.location}"
 
 
 class CameraAttendanceLog(models.Model):

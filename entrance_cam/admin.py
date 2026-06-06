@@ -1,6 +1,6 @@
 from django.contrib import admin
 from django.utils.html import format_html
-from .models import Student, Camera, AttendanceLog, ESP32Device, FingerprintAttendance
+from .models import Student, ESP32Device, FingerprintAttendance
 
 @admin.register(Student)
 class StudentAdmin(admin.ModelAdmin):
@@ -65,7 +65,7 @@ class StudentAdmin(admin.ModelAdmin):
         """Show detailed enrollment information."""
         status = obj.get_enrollment_status()
         encoding_len = len(obj.face_encoding or '') // 100  # Very rough size estimate
-        
+
         html = f'<strong>Status:</strong> {status}<br/>'
         if obj.face_encoding:
             html += f'<strong>Encoding:</strong> Present (~{encoding_len} KB)<br/>'
@@ -127,19 +127,6 @@ class StudentAdmin(admin.ModelAdmin):
             self.message_user(request, msg, level='WARNING')
 
     regenerate_face_encodings_action.short_description = '🔄 Regenerate Face Encodings for selected students'
-
-@admin.register(Camera)
-class CameraAdmin(admin.ModelAdmin):
-    list_display = ['name', 'url', 'location', 'is_active']
-    list_filter = ['is_active', 'location']
-    search_fields = ['name', 'url']
-
-@admin.register(AttendanceLog)
-class AttendanceLogAdmin(admin.ModelAdmin):
-    list_display = ['student', 'camera', 'date', 'entry_time', 'exit_time', 'mood_comparison']
-    list_filter = ['date', 'mood_comparison']
-    search_fields = ['student__name', 'student__roll_no']
-    date_hierarchy = 'date'
 
 @admin.register(ESP32Device)
 class ESP32DeviceAdmin(admin.ModelAdmin):

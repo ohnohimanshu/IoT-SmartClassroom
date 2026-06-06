@@ -1,7 +1,12 @@
 from django.contrib import admin
 from django.utils.html import format_html
-from .models import CameraAttendanceLog
+from .models import CameraAttendanceLog, Camera
 
+@admin.register(Camera)
+class CameraAdmin(admin.ModelAdmin):
+    list_display = ['name', 'url', 'location', 'is_active']
+    list_filter = ['is_active', 'location']
+    search_fields = ['name', 'url']
 
 @admin.register(CameraAttendanceLog)
 class CameraAttendanceLogAdmin(admin.ModelAdmin):
@@ -20,7 +25,7 @@ class CameraAttendanceLogAdmin(admin.ModelAdmin):
     search_fields = ['student__name', 'student__roll_no']
     date_hierarchy = 'date'
     readonly_fields = ['created_at', 'updated_at']
-    
+
     fieldsets = (
         ('Student & Camera', {
             'fields': ('student', 'camera', 'date')
@@ -36,10 +41,10 @@ class CameraAttendanceLogAdmin(admin.ModelAdmin):
         }),
         ('Metadata', {
             'fields': ('created_at', 'updated_at'),
-            'classes': ('collapse',)
+            'classes': ('collapse',),
         }),
     )
-    
+
     def entry_emotion_display(self, obj):
         """Display entry emotion with color."""
         colors = {
@@ -59,7 +64,7 @@ class CameraAttendanceLogAdmin(admin.ModelAdmin):
             obj.entry_emotion.title()
         )
     entry_emotion_display.short_description = 'Entry Emotion'
-    
+
     def exit_emotion_display(self, obj):
         """Display exit emotion with color."""
         if not obj.exit_emotion:
@@ -81,14 +86,14 @@ class CameraAttendanceLogAdmin(admin.ModelAdmin):
             obj.exit_emotion.title()
         )
     exit_emotion_display.short_description = 'Exit Emotion'
-    
+
     def duration_display(self, obj):
         """Display duration in minutes."""
         if obj.duration_minutes is None:
             return '—'
         return f'{obj.duration_minutes} min'
     duration_display.short_description = 'Duration'
-    
+
     def mood_display(self, obj):
         """Display mood comparison."""
         if not obj.mood_comparison or obj.mood_comparison == 'unknown':
