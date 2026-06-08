@@ -836,7 +836,7 @@ def incidents_dashboard(request):
         incidents = incidents.filter(is_reviewed=bool(int(reviewed)))
     
     # Stats
-    phone_count = IncidentReport.objects.filter(incident_type='phone_usage').count()
+    phone_count = IncidentReport.objects.filter(incident_type='using_phone').count()
     eating_count = IncidentReport.objects.filter(incident_type='eating_food').count()
     distracted_count = IncidentReport.objects.filter(incident_type='distracted').count()
     

@@ -1,6 +1,7 @@
 
 #!/bin/bash
-
+export POSTGRES_HOST=${POSTGRES_HOST:-db}
+export POSTGRES_PORT=${POSTGRES_PORT:-5432}
 # Wait for PostgreSQL to be ready
 echo "Waiting for PostgreSQL to start..."
 while ! nc -z $POSTGRES_HOST $POSTGRES_PORT; do
