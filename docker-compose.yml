@@ -20,7 +20,6 @@ services:
   web:
     build: .
     container_name: classroom_iot_web
-    command: gunicorn --workers 4 --bind 0.0.0.0:8000 classroom_iot.wsgi:application
     volumes:
       - ./media:/app/media
       - ./staticfiles:/app/staticfiles
