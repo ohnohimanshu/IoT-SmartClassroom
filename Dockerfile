@@ -47,7 +47,31 @@ RUN python manage.py collectstatic --noinput || true
 # Expose port 8000 for Django
 EXPOSE 8000
 
-# Create startup script inline
+# Install supervisor to manage multiple processes (Django + detection scripts)
+RUN pip install --no-cache-dir supervisor
+
+# Create supervisor config directory
+RUN mkdir -p /etc/supervisor/conf.d
+
+# Supervisor config for Gunicorn (Django web server)
+RUN cat > /etc/supervisor/conf.d/gunicorn.conf << 'EOF'
+[program:gunicorn]
+command=gunicorn --workers 4 --bind 0.0.0.0:8000 classroom_iot.wsgi:application
+directory=/app
+autostart=true
+autorestart=true
+redirect_stderr=true
+stdout_logfile=/var/log/supervisor/gunicorn.log
+priority=999
+EOF
+
+# Create a Python helper script to generate supervisor configs from database
+COPY scripts/generate_supervisor_configs.py /app/generate_supervisor_configs.py
+RUN chmod +x /app/generate_supervisor_configs.py
+
+RUN chmod +x /app/generate_supervisor_configs.py
+
+# Create startup script
 RUN cat > /app/start.sh << 'EOF'
 #!/bin/bash
 set -e
@@ -72,11 +96,37 @@ else:
     print("Superuser 'himanshu' already exists.")
 PYEOF
 
-echo "Starting Django server..."
-exec gunicorn --workers 4 --bind 0.0.0.0:8000 classroom_iot.wsgi:application
+echo "Generating supervisor configs for camera detection scripts..."
+python generate_supervisor_configs.py || echo "⚠ Warning: Could not generate configs (database may not be ready yet)"
+
+echo "Starting supervisor (Django + face detection)..."
+exec /usr/local/bin/supervisord -c /etc/supervisor/supervisord.conf -n
 EOF
 
 RUN chmod +x /app/start.sh
+
+# Create supervisor main config
+RUN cat > /etc/supervisor/supervisord.conf << 'EOF'
+[supervisord]
+nodaemon=true
+logfile=/var/log/supervisor/supervisord.log
+pidfile=/var/run/supervisord.pid
+
+[unix_http_server]
+file=/var/run/supervisor.sock
+
+[supervisorctl]
+serverurl=unix:///var/run/supervisor.sock
+
+[rpcinterface:supervisor]
+supervisor.rpcinterface_factory = supervisor.rpcinterface:make_main_rpcinterface
+
+[include]
+files = /etc/supervisor/conf.d/*.conf
+EOF
+
+# Create log directory for supervisor
+RUN mkdir -p /var/log/supervisor
 
 # Use inline startup script as entrypoint
 ENTRYPOINT ["/app/start.sh"]

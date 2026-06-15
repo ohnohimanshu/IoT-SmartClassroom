@@ -25,6 +25,8 @@ services:
       - ./staticfiles:/app/staticfiles
     ports:
       - "8000:8000"
+    env_file:
+      - .env
     environment:
       POSTGRES_USER: classroom_iot_user
       POSTGRES_PASSWORD: change_this_in_production
@@ -33,11 +35,23 @@ services:
       POSTGRES_PORT: 5432
       DJANGO_SECRET_KEY: django-insecure-classroom-iot-dev-key-change-in-production
       DJANGO_DEBUG: "False"
-      DJANGO_ALLOWED_HOSTS: "*,127.0.0.1,localhost"
+      DJANGO_ALLOWED_HOSTS: "*, 127.0.0.1, localhost, 10.7.31.114"
     depends_on:
       db:
         condition: service_healthy
     restart: always
+  nginx:
+    image: nginx:alpine
+    container_name: classroom_iot_nginx
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./certs:/etc/nginx/certs:ro
+    depends_on:
+      web:
+        condition: service_started
 
 volumes:
   postgres_data:
