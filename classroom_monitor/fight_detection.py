@@ -98,4 +98,3 @@ class FightDetector:
         if track_id in self._current_detections:
             return self._current_detections[track_id]
         return None
-

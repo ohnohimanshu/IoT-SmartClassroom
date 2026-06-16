@@ -56,7 +56,7 @@ RUN mkdir -p /etc/supervisor/conf.d
 # Supervisor config for Gunicorn (Django web server)
 RUN cat > /etc/supervisor/conf.d/gunicorn.conf << 'EOF'
 [program:gunicorn]
-command=gunicorn --workers 4 --bind 0.0.0.0:8000 classroom_iot.wsgi:application
+command=gunicorn --workers 4 --timeout 0 --bind 0.0.0.0:8000 classroom_iot.wsgi:application
 directory=/app
 autostart=true
 autorestart=true
