@@ -269,40 +269,20 @@ class TemporalBehaviorEngine:
     def _detect_phone_usage(self, person: TrackedPerson, 
                        phone_detections: List[Tuple]) -> Tuple[bool, float]:
         """
-        BUG 1 FIX: Detect phone usage based on phone bounding box overlap OR pose skeleton fallbacks.
+        AGGRESSIVE FIX: Phone detection made much more restrictive to prevent false positives.
         
-        The old code had structurally dead phone detection because only yolo11s-pose.pt was loaded,
-        which can never emit class 67 (phone). Now we expect phone_detections to come from a 
-        separate object detection model that actually detects phones.
-        
-        Strategy A: Object detection bbox overlap (now receives real phone detections)
-        Strategy B: Skeleton heuristics with improved phone-in-lap detection
+        Strategy A: Object detection bbox overlap (DISABLED to prevent false positives)
+        Strategy B: Skeleton heuristics with very strict criteria for classroom environment
         """
         x1, y1, x2, y2 = person.bbox
         person_area = (x2 - x1) * (y2 - y1)
         
-        # ── Strategy A: Standard Bounding Box Overlap ───────────────────────
-        # BUG 1 FIX: This now actually receives phone detections from a parallel object detector
-        for (px1, py1, px2, py2, conf) in phone_detections:
-            ix1 = max(x1, px1)
-            iy1 = max(y1, py1)
-            ix2 = min(x2, px2)
-            iy2 = min(y2, py2)
-            
-            if ix2 <= ix1 or iy2 <= iy1:
-                continue
-            
-            intersection = (ix2 - ix1) * (iy2 - iy1)
-            phone_area = (px2 - px1) * (py2 - py1)
-            overlap_ratio = intersection / min(person_area, phone_area)
-            
-            if overlap_ratio > self.PHONE_OVERLAP_THRESHOLD:
-                return True, conf
+        # ── Strategy A: Standard Bounding Box Overlap (DISABLED) ───────────────────────
+        # AGGRESSIVE FIX: Disable object detection phone overlap to prevent false positives
+        # for (px1, py1, px2, py2, conf) in phone_detections:
+        #     [overlap detection code disabled]
                 
-        # ── Strategy B: Skeleton Heuristic Fallback (If YOLO misses the phone) ──
-        # BUG 1 FIX: Added phone-in-lap detection for hands positioned below configurable 
-        # fraction of bbox height, combined with sustained head-down classification.
-        # This catches phone use patterns where the phone is at desk/lap level, not just hand-to-face.
+        # ── Strategy B: Skeleton Heuristic (Much More Restrictive) ──────────────────────
         kp = person.keypoints
         if kp is not None and kp.size > 0 and len(kp) > 10:
             try:
@@ -314,7 +294,8 @@ class TemporalBehaviorEngine:
                 bbox_height = y2 - y1
                 lap_threshold = y1 + bbox_height * self.PHONE_LAP_HEIGHT_FRACTION
 
-                if nose[2] < 0.5 or nose[0] == 0.0:
+                # AGGRESSIVE FIX: Require very high keypoint confidence
+                if nose[2] < 0.8 or nose[0] == 0.0:
                     return False, 0.0
 
                 wrists = [(left_wrist, left_elbow), (right_wrist, right_elbow)]
@@ -322,39 +303,46 @@ class TemporalBehaviorEngine:
                 low_hands = 0  # Count hands positioned below lap threshold
 
                 for wrist, elbow in wrists:
-                    if (len(wrist) >= 3 and wrist[2] >= 0.5 and wrist[0] != 0.0):
+                    # AGGRESSIVE FIX: Much higher confidence required for wrist detection
+                    if (len(wrist) >= 3 and wrist[2] >= 0.8 and wrist[0] != 0.0):
                         dist = np.linalg.norm(wrist[:2] - nose[:2]) / bbox_height
                         wrist_dists.append(dist)
                         
-                        # BUG 1 FIX: Check if hand is in lap/desk area (below threshold)
+                        # Check if hand is in lap/desk area (below threshold)
                         if wrist[1] > lap_threshold:
                             low_hands += 1
 
-                # BUG 1 FIX: Phone-in-lap detection - hands positioned low + head down pattern
+                # AGGRESSIVE FIX: Much stricter criteria for phone detection
                 if low_hands >= 1:
                     # Check if person is also exhibiting head-down behavior (corroborating evidence)
                     head_pose = self._calculate_head_pose(person)
                     if head_pose == 'head_down':
-                        return True, 0.7  # High confidence for phone-in-lap + head-down combo
+                        print(f"[DEBUG] Person {person.track_id}: PHONE detected - lap+head_down pattern")
+                        return True, 0.6  # Reduced confidence
 
+                # AGGRESSIVE FIX: Much stricter asymmetric hand pattern detection
                 if len(wrist_dists) == 2:
                     # Both wrists near face → writing or eating, NOT phone → skip
-                    if wrist_dists[0] < 0.35 and wrist_dists[1] < 0.35:
+                    if wrist_dists[0] < 0.25 and wrist_dists[1] < 0.25:  # Stricter threshold
                         return False, 0.0
 
                     # ONE wrist very close to face/ear AND the other is low → phone
                     min_d = min(wrist_dists)
                     max_d = max(wrist_dists)
-                    asymmetry = max_d - min_d          # large = one hand up, one down
-                    if min_d < 0.28 and asymmetry > 0.20:
-                        return True, 0.65
+                    asymmetry = max_d - min_d
+                    # AGGRESSIVE FIX: Much stricter criteria
+                    if min_d < 0.2 and asymmetry > 0.3:  # Stricter thresholds
+                        print(f"[DEBUG] Person {person.track_id}: PHONE detected - asymmetric hand pattern")
+                        return True, 0.7
 
                 elif len(wrist_dists) == 1:
                     # Only one wrist visible and it's very close to face
-                    if wrist_dists[0] < 0.22:
-                        return True, 0.60
+                    if wrist_dists[0] < 0.15:  # Much stricter
+                        print(f"[DEBUG] Person {person.track_id}: PHONE detected - single hand to ear")
+                        return True, 0.6
 
-            except Exception:
+            except Exception as e:
+                print(f"[DEBUG] Phone detection error: {e}")
                 pass
 
         return False, 0.0
@@ -362,11 +350,8 @@ class TemporalBehaviorEngine:
     def _detect_eating(self, person: TrackedPerson, 
                       food_detections: List[Tuple]) -> Tuple[bool, float]:
         """
-        BUG 1 FIX: Detect eating based on food/beverage detections near face with 
-        hand-to-mouth motion analysis using the previously unused EATING_HAND_TO_MOUTH_THRESHOLD.
-        
-        FIXED: Made much more restrictive to avoid false positives from normal classroom activities.
-        Now requires BOTH food object detection AND hand-to-mouth motion, or very strong food evidence.
+        AGGRESSIVE FIX: Eating detection now requires very strong evidence to prevent false positives.
+        Only triggers when we have high-confidence food objects very close to mouth AND hand motion.
         """
         if person.keypoints is None or person.keypoints.size == 0:
             return False, 0.0
@@ -377,48 +362,58 @@ class TemporalBehaviorEngine:
             right_wrist = person.keypoints[10] if len(person.keypoints) > 10 else None
             x1, y1, x2, y2 = person.bbox
             
-            # Strategy A: Food object detection overlap (requires actual food detection)
-            food_detected = False
+            # AGGRESSIVE FIX: Only proceed if we have actual food detections from object model
+            if not food_detections:
+                return False, 0.0
+            
+            # Strategy A: Food object detection (must be very close and high confidence)
+            strong_food_detected = False
             food_confidence = 0.0
             
-            # FIXED: Only trigger if we have actual food detections from object detector
             for (fx1, fy1, fx2, fy2, conf) in food_detections:
+                # AGGRESSIVE FIX: Only consider high-confidence food detections
+                if conf < 0.7:
+                    continue
+                    
                 food_center = ((fx1 + fx2) / 2, (fy1 + fy2) / 2)
                 distance_to_nose = np.linalg.norm(
                     np.array(food_center) - np.array(nose[:2])
                 )
                 
-                # FIXED: Stricter distance check - food must be very close to mouth
-                if distance_to_nose < (y2 - y1) * 0.3:  # Reduced from 0.5 to 0.3
-                    food_detected = True
+                # AGGRESSIVE FIX: Food must be VERY close to mouth (20% of person height)
+                if distance_to_nose < (y2 - y1) * 0.2:
+                    strong_food_detected = True
                     food_confidence = max(food_confidence, conf)
             
-            # Strategy B: Hand-to-mouth motion (much more restrictive)
+            # AGGRESSIVE FIX: Require BOTH strong food detection AND hand motion
+            if not strong_food_detected:
+                return False, 0.0
+            
+            # Strategy B: Hand-to-mouth motion (very restrictive)
             hand_to_mouth_detected = False
             
-            # FIXED: Only check hand-to-mouth if we have high-confidence keypoints
-            if nose[2] >= 0.7:  # Require high nose confidence
+            if nose[2] >= 0.8:  # Very high nose confidence required
                 for wrist in [left_wrist, right_wrist]:
-                    if wrist is not None and len(wrist) >= 3 and wrist[2] >= 0.7 and wrist[0] != 0.0:  # Higher confidence required
+                    if wrist is not None and len(wrist) >= 3 and wrist[2] >= 0.8 and wrist[0] != 0.0:
                         wrist_to_nose_dist = np.linalg.norm(wrist[:2] - nose[:2])
                         bbox_height = y2 - y1
                         normalized_dist = wrist_to_nose_dist / bbox_height
                         
-                        # FIXED: Much stricter threshold for hand-to-mouth detection
-                        if normalized_dist < self.EATING_HAND_TO_MOUTH_THRESHOLD:
+                        # AGGRESSIVE FIX: Very strict threshold - hand must be very close to mouth
+                        if normalized_dist < 0.15:  # Much stricter than 0.25
                             hand_to_mouth_detected = True
                             break
             
-            # FIXED: Require BOTH signals for high confidence, or very strong food evidence only
-            if food_detected and hand_to_mouth_detected:
-                return True, min(food_confidence + 0.2, 1.0)  # Both signals agree
-            elif food_detected and food_confidence > 0.8:  # Very confident food detection alone
+            # AGGRESSIVE FIX: Require BOTH strong food detection AND hand-to-mouth motion
+            if strong_food_detected and hand_to_mouth_detected:
+                print(f"[DEBUG] Person {person.track_id}: EATING confirmed - food_conf:{food_confidence:.2f}, hand_to_mouth:True")
                 return True, food_confidence
-            # REMOVED: skeleton-only detection to prevent false positives from normal hand movements
-            # elif hand_to_mouth_detected:
-            #     return True, 0.6  
             
-        except Exception:
+            # No eating detected
+            return False, 0.0
+            
+        except Exception as e:
+            print(f"[DEBUG] Eating detection error: {e}")
             pass
         
         return False, 0.0
@@ -865,8 +860,9 @@ class ProductionStreamProcessor:
                                 pass
                         person_tracks_with_kp.append((track_id, x1, y1, x2, y2, conf, kp))
             
+            # AGGRESSIVE FIX: Temporarily disable object detection to eliminate false food detections
             # BUG 1 FIX: Run parallel object detection for phones and food
-            if self.object_model is not None:
+            if False:  # DISABLED: self.object_model is not None:
                 try:
                     object_results = self.object_model(
                         frame,
@@ -899,6 +895,8 @@ class ProductionStreamProcessor:
                 except Exception as e:
                     print(f'[WARN] Object detection failed: {e}')
                     # Continue with pose-only detection if object detection fails
+            
+            print(f"[DEBUG] Object detection DISABLED - food_dets: {len(food_dets)}, phone_dets: {len(phone_dets)}")
             
             # Update behavior engine
             for track_id, x1, y1, x2, y2, conf, kp in person_tracks_with_kp:
@@ -1098,8 +1096,8 @@ class ClassroomBehaviorDetector:
                                 pass
                         person_tracks_with_kp.append((track_id, x1, y1, x2, y2, conf, kp))
             
-            # BUG 1 FIX: Run object detection for phones/food
-            if hasattr(self, 'object_model') and self.object_model is not None:
+            # BUG 1 FIX: Run object detection for phones/food (DISABLED to prevent false positives)
+            if False:  # DISABLED: hasattr(self, 'object_model') and self.object_model is not None:
                 try:
                     obj_results = self.object_model(frame, verbose=False, conf=0.3)
                     for result in obj_results:
@@ -1116,6 +1114,8 @@ class ClassroomBehaviorDetector:
                                 food_dets.append((x1, y1, x2, y2, conf))
                 except Exception as e:
                     print(f'[WARN] Object detection in detect(): {e}')
+            
+            print(f"[DEBUG] ClassroomBehaviorDetector.detect() - Object detection DISABLED")
             
             # Update PERSISTENT behavior engine
             for track_id, x1, y1, x2, y2, conf, kp in person_tracks_with_kp:
