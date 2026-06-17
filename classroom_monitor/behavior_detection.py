@@ -1145,40 +1145,6 @@ class ClassroomBehaviorDetector:
         
         except Exception as e:
             print(f'[ERROR] detect(): {e}')
-            return []id in [46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56]:
-                        food_dets.append((x1, y1, x2, y2, conf))
-            
-            # Update PERSISTENT behavior engine
-            for track_id, x1, y1, x2, y2, conf, kp in person_tracks_with_kp:
-                self._detect_engine.update_person(track_id, (x1, y1, x2, y2), kp, timestamp)
-            self._detect_engine.cleanup_stale(timestamp)
-            
-            # Feed raw frame to 3D CNN fight detector
-            self._detect_engine.add_frame_for_fight_detection(frame)
-
-            # Evaluate each person
-            for track_id in self._detect_engine.tracked_people:
-                det_result = self._detect_engine.evaluate_person(track_id, phone_dets, food_dets)
-                
-                # Convert to original dict format
-                det_dict = {
-                    'type': det_result.type,
-                    'bbox': det_result.bbox,
-                    'confidence': det_result.confidence,
-                    'color': det_result.color,
-                    'label': det_result.label,
-                    'is_alert': det_result.is_alert,
-                    'is_distracted': det_result.is_distracted,
-                    'track_id': det_result.track_id
-                }
-                if det_result.fight_info:
-                    det_dict['fight_info'] = det_result.fight_info
-                detections.append(det_dict)
-            
-            return detections
-        
-        except Exception as e:
-            print(f'[ERROR] detect(): {e}')
             return []
     
     def _detect_behaviors(self, frame):
