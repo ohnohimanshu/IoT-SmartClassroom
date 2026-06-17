@@ -103,7 +103,7 @@ class TemporalBehaviorEngine:
     # BUG 1 FIX: Configurable thresholds for new heuristics
     # These replace magic numbers and make the system tunable for real classroom footage
     PHONE_OVERLAP_THRESHOLD = 0.3
-    EATING_HAND_TO_MOUTH_THRESHOLD = 0.4  # Now actually used instead of being dead code
+    EATING_HAND_TO_MOUTH_THRESHOLD = 0.25  # FIXED: More restrictive to avoid false positives from normal hand movements
     ENGAGEMENT_HEAD_POSE_THRESHOLD = 0.6
     
     # BUG 2 FIX: Configurable thresholds for head-down detection
@@ -114,9 +114,9 @@ class TemporalBehaviorEngine:
     
     # BUG 3 FIX: Configurable thresholds for pairwise fight detection
     # Fight detection now works on pairs of people, not scene-wide
-    FIGHT_PROXIMITY_THRESHOLD = 150.0  # pixels - how close people must be to be fight candidates
-    FIGHT_VELOCITY_THRESHOLD = 25.0    # relative keypoint velocity between pairs
-    FIGHT_CONFIRMATION_FRAMES = 3      # consecutive frames needed to confirm fight
+    FIGHT_PROXIMITY_THRESHOLD = 100.0  # FIXED: Reduced from 150 - people must be closer to be fight candidates
+    FIGHT_VELOCITY_THRESHOLD = 15.0    # FIXED: Reduced from 25 - more sensitive to physical interaction
+    FIGHT_CONFIRMATION_FRAMES = 2      # FIXED: Reduced from 3 - faster fight detection response
     
     # BUG 1 FIX: Phone-in-lap detection threshold
     # Detects phone use when hands are positioned below this fraction of bbox height
@@ -365,8 +365,8 @@ class TemporalBehaviorEngine:
         BUG 1 FIX: Detect eating based on food/beverage detections near face with 
         hand-to-mouth motion analysis using the previously unused EATING_HAND_TO_MOUTH_THRESHOLD.
         
-        The old code only checked for food bbox overlap but the constant EATING_HAND_TO_MOUTH_THRESHOLD 
-        was never used. Now we use wrist-to-nose distance oscillation as corroborating evidence.
+        FIXED: Made much more restrictive to avoid false positives from normal classroom activities.
+        Now requires BOTH food object detection AND hand-to-mouth motion, or very strong food evidence.
         """
         if person.keypoints is None or person.keypoints.size == 0:
             return False, 0.0
@@ -377,42 +377,46 @@ class TemporalBehaviorEngine:
             right_wrist = person.keypoints[10] if len(person.keypoints) > 10 else None
             x1, y1, x2, y2 = person.bbox
             
-            # Strategy A: Food object detection overlap (now receives real food detections)
+            # Strategy A: Food object detection overlap (requires actual food detection)
             food_detected = False
             food_confidence = 0.0
             
+            # FIXED: Only trigger if we have actual food detections from object detector
             for (fx1, fy1, fx2, fy2, conf) in food_detections:
                 food_center = ((fx1 + fx2) / 2, (fy1 + fy2) / 2)
                 distance_to_nose = np.linalg.norm(
                     np.array(food_center) - np.array(nose[:2])
                 )
                 
-                if distance_to_nose < (y2 - y1) * 0.5:
+                # FIXED: Stricter distance check - food must be very close to mouth
+                if distance_to_nose < (y2 - y1) * 0.3:  # Reduced from 0.5 to 0.3
                     food_detected = True
                     food_confidence = max(food_confidence, conf)
             
-            # Strategy B: BUG 1 FIX - Hand-to-mouth repeated motion using EATING_HAND_TO_MOUTH_THRESHOLD
-            # Check if wrist-to-nose distance oscillates below threshold (repeated hand-to-mouth motion)
+            # Strategy B: Hand-to-mouth motion (much more restrictive)
             hand_to_mouth_detected = False
             
-            for wrist in [left_wrist, right_wrist]:
-                if wrist is not None and len(wrist) >= 3 and wrist[2] >= 0.5 and wrist[0] != 0.0:
-                    wrist_to_nose_dist = np.linalg.norm(wrist[:2] - nose[:2])
-                    bbox_height = y2 - y1
-                    normalized_dist = wrist_to_nose_dist / bbox_height
-                    
-                    # BUG 1 FIX: Actually use EATING_HAND_TO_MOUTH_THRESHOLD instead of leaving it dead
-                    if normalized_dist < self.EATING_HAND_TO_MOUTH_THRESHOLD:
-                        hand_to_mouth_detected = True
-                        break
+            # FIXED: Only check hand-to-mouth if we have high-confidence keypoints
+            if nose[2] >= 0.7:  # Require high nose confidence
+                for wrist in [left_wrist, right_wrist]:
+                    if wrist is not None and len(wrist) >= 3 and wrist[2] >= 0.7 and wrist[0] != 0.0:  # Higher confidence required
+                        wrist_to_nose_dist = np.linalg.norm(wrist[:2] - nose[:2])
+                        bbox_height = y2 - y1
+                        normalized_dist = wrist_to_nose_dist / bbox_height
+                        
+                        # FIXED: Much stricter threshold for hand-to-mouth detection
+                        if normalized_dist < self.EATING_HAND_TO_MOUTH_THRESHOLD:
+                            hand_to_mouth_detected = True
+                            break
             
-            # Combine both signals - food detection OR hand-to-mouth motion
+            # FIXED: Require BOTH signals for high confidence, or very strong food evidence only
             if food_detected and hand_to_mouth_detected:
-                return True, min(food_confidence + 0.2, 1.0)  # High confidence when both signals agree
-            elif food_detected:
+                return True, min(food_confidence + 0.2, 1.0)  # Both signals agree
+            elif food_detected and food_confidence > 0.8:  # Very confident food detection alone
                 return True, food_confidence
-            elif hand_to_mouth_detected:
-                return True, 0.6  # Moderate confidence for skeleton-only detection
+            # REMOVED: skeleton-only detection to prevent false positives from normal hand movements
+            # elif hand_to_mouth_detected:
+            #     return True, 0.6  
             
         except Exception:
             pass
@@ -627,20 +631,26 @@ class TemporalBehaviorEngine:
         
         if fight_detected:
             person.behavior_history.append('fighting')
+            print(f"[DEBUG] Person {track_id}: FIGHTING detected")
         else:
             # Check phone usage
             is_phone, phone_conf = self._detect_phone_usage(person, phone_detections)
             if is_phone:
                 person.behavior_history.append('using_phone')
+                print(f"[DEBUG] Person {track_id}: PHONE detected (conf: {phone_conf:.2f})")
             else:
                 # Check eating
                 is_eating, eat_conf = self._detect_eating(person, food_detections)
                 if is_eating:
                     person.behavior_history.append('eating_food')
+                    print(f"[DEBUG] Person {track_id}: EATING detected (conf: {eat_conf:.2f}, food_objects: {len(food_detections)})")
                 else:
                     # Evaluate engagement
                     head_pose = self._calculate_head_pose(person)
                     person.behavior_history.append(head_pose)
+                    # Only print non-focused states to reduce spam
+                    if head_pose != 'focused':
+                        print(f"[DEBUG] Person {track_id}: HEAD_POSE = {head_pose}")
         
         # Temporal smoothing - require 3 consecutive same states
         final_behavior = 'focused'
@@ -861,7 +871,7 @@ class ProductionStreamProcessor:
                     object_results = self.object_model(
                         frame,
                         verbose=False,
-                        conf=0.3,  # Higher confidence for object detection to reduce false positives
+                        conf=0.5,  # FIXED: Increased from 0.3 to 0.5 - higher confidence required to reduce false food detections
                         iou=0.5
                     )
                     
@@ -879,6 +889,12 @@ class ProductionStreamProcessor:
                                 phone_dets.append((x1, y1, x2, y2, conf))
                             elif cls_id in [46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56]:  # Food/drink classes
                                 food_dets.append((x1, y1, x2, y2, conf))
+                    
+                    # FIXED: Add debug logging for food/phone detections
+                    if food_dets:
+                        print(f"[DEBUG] Frame has {len(food_dets)} food detections: {[f'cls{cls_id}({conf:.2f})' for _, _, _, _, conf in food_dets]}")
+                    if phone_dets:
+                        print(f"[DEBUG] Frame has {len(phone_dets)} phone detections: {[(conf,) for _, _, _, _, conf in phone_dets]}")
                                 
                 except Exception as e:
                     print(f'[WARN] Object detection failed: {e}')
