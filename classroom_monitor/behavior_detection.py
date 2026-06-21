@@ -12,8 +12,6 @@ from typing import Dict, List, Optional, Tuple
 # Keep existing color/label maps for backward compatibility
 COLOR_MAP = {
     'focused':      (0,  200,  60),
-    'looking_away': (0,  165, 255),
-    'head_down':    (0,  165, 255),
     'distracted':   (0,  165, 255),
     'using_phone':  (0,    0, 220),
     'eating_food':  (0,    0, 220),
@@ -22,8 +20,6 @@ COLOR_MAP = {
 }
 LABEL_MAP = {
     'focused':      'Focused',
-    'looking_away': 'Looking Away',
-    'head_down':    'Head Down',
     'distracted':   'Distracted',
     'using_phone':  'Using Phone',
     'eating_food':  'Eating Food',
@@ -32,7 +28,13 @@ LABEL_MAP = {
 }
 
 ALERT_POSES      = {'using_phone', 'eating_food', 'fighting'}
-DISTRACTED_POSES = {'looking_away', 'head_down', 'distracted'}
+# SENIOR FIX: 'looking_away' and 'head_down' are no longer exposed as
+# separate public behavior states (per requirements). They still get
+# computed internally by _calculate_head_pose() -- that raw signal is
+# kept purely as supporting evidence for the phone-in-lap heuristic and
+# is collapsed down to a single 'distracted' label before it's ever
+# stored in behavior_history or shown to a user. See evaluate_person().
+DISTRACTED_POSES = {'distracted'}
 
 # BUG 5 FIX: Single shared face-recognition tolerance constant
 # This eliminates the inconsistency between StudentFaceRecognizer.tolerance (0.52) 
@@ -102,9 +104,22 @@ class TemporalBehaviorEngine:
     ENGAGEMENT_HEAD_POSE_THRESHOLD = 0.6
     
     LOW_CONFIDENCE_THRESHOLD = 0.5
-    
-    FIGHT_PROXIMITY_RATIO = 1.5        # candidate pair if centers are within 1.5x avg bbox height
-    FIGHT_WRIST_PROXIMITY_RATIO = 0.4  # candidate pair if any wrists are within 0.4x avg bbox height
+
+    # SENIOR FIX (critical): this constant was referenced at runtime
+    # (self.HEAD_DOWN_CONSECUTIVE_FRAMES) but never defined anywhere in the
+    # class. Every time a person's facial keypoints dropped below
+    # LOW_CONFIDENCE_THRESHOLD -- i.e. exactly the moment someone puts their
+    # head down -- _calculate_head_pose hit an AttributeError, which was
+    # silently swallowed by its own `except Exception: return 'focused'`
+    # handler. Net effect: head-down/distracted detection could NEVER fire,
+    # no error ever printed, and the phone "cupped-hands-in-lap + head_down"
+    # heuristic below (which only fires when head_pose == 'head_down') was
+    # permanently dead code. This single missing constant was silently
+    # disabling two features at once.
+    HEAD_DOWN_CONSECUTIVE_FRAMES = 5   # ~0.5s of sustained low facial-keypoint confidence at 10 FPS
+
+    FIGHT_PROXIMITY_RATIO = 1.8        # candidate pair if centers are within 1.8x scale_ref (see _detect_fighting_pairwise)
+    FIGHT_WRIST_PROXIMITY_RATIO = 0.4  # candidate pair if any wrists are within 0.4x scale_ref
     FIGHT_CONFIRMATION_FRAMES = 2      # FIXED: Reduced from 3 - faster fight detection response
     
     # BUG 1 FIX: Phone-in-lap detection threshold
@@ -186,6 +201,14 @@ class TemporalBehaviorEngine:
         """
         Estimate head pose using scale-invariant structural ratios.
         Returns 'focused', 'looking_away', or 'head_down'.
+
+        NOTE: as of the SENIOR FIX pass, these three values are an INTERNAL
+        signal only. evaluate_person() collapses them down to the two
+        public-facing engagement states ('focused' / 'distracted') before
+        anything is stored in behavior_history or shown to a user. The raw
+        granular value is still useful internally though -- specifically,
+        _detect_phone_usage() needs to know whether the head is *down*
+        (not just "distracted") to support its lap-phone heuristic.
         
         BUG 2 FIX: When facial keypoints (nose, eyes) are missing or below confidence threshold 
         for a sustained period while body keypoints remain present, classify as head_down 
@@ -276,9 +299,27 @@ class TemporalBehaviorEngine:
                     return True
             return False
 
+        # SENIOR FIX: COCO-pretrained "cell phone" (class 67) has notoriously
+        # weak recall for small, partially-occluded, or steeply-angled phone
+        # detections -- exactly the conditions in classroom CCTV footage
+        # (phone low in the lap, hand wrapped around most of it, oblique
+        # downward camera angle). Requiring conf >= 0.5 here, on top of the
+        # object detector's own confidence floor, was stacking two strict
+        # filters and throwing away real but lower-confidence phone boxes
+        # before the wrist-proximity check below even got a chance to look
+        # at them. Lowered to 0.35 -- false positives are still controlled
+        # by the wrist-distance gate and by the 3-frame temporal smoothing
+        # in evaluate_person(), so this trades a small amount of precision
+        # for materially better recall, which is the right trade-off for a
+        # safety-relevant alert.
+        #
+        # For real production-grade accuracy this should ultimately be
+        # replaced with (or ensembled with) a YOLO model fine-tuned on
+        # classroom-angle phone-in-hand imagery -- stock COCO was never
+        # trained for this camera geometry. See chat for details.
         if phone_detections and kp is not None and kp.size > 0 and len(kp) > 10:
             for (px1, py1, px2, py2, conf) in phone_detections:
-                if conf < 0.5:
+                if conf < 0.35:
                     continue
                 phone_w, phone_h = (px2 - px1), (py2 - py1)
                 if max(phone_w, phone_h) / bbox_height > 0.30:
@@ -323,6 +364,30 @@ class TemporalBehaviorEngine:
                         elif head_pose == 'head_down':
                             print(f"[DEBUG] Person {person.track_id}: PHONE detected - cupped-hands lap+head_down pattern")
                             return True, 0.6
+                elif len(wrist_pts) == 1:
+                    # SENIOR FIX: the two-hand "cupped hands" check above
+                    # completely missed the single most common discreet
+                    # phone-use posture: ONE hand holding the phone low,
+                    # below desk level, while glancing down at it. Requiring
+                    # both wrists meant this whole (very common) case never
+                    # triggered Strategy B at all. Single-hand evidence is
+                    # weaker on its own, so we additionally require the
+                    # *other* wrist to be genuinely not visible (occluded
+                    # below the desk, as opposed to resting visibly on the
+                    # desk while writing) to cut down on false positives
+                    # from normal note-taking with one hand idle.
+                    lone_wrist = wrist_pts[0]
+                    other_wrist = right_wrist if (left_wrist[2] >= 0.8 and left_wrist[0] != 0.0) else left_wrist
+                    other_wrist_occluded = (
+                        other_wrist is None or len(other_wrist) < 3 or
+                        other_wrist[2] < 0.3 or
+                        (other_wrist[0] == 0.0 and other_wrist[1] == 0.0)
+                    )
+                    if (lone_wrist[1] > lap_threshold and other_wrist_occluded
+                            and head_pose == 'head_down'
+                            and not _book_near(lone_wrist)):
+                        print(f"[DEBUG] Person {person.track_id}: PHONE detected - single-hand lap+head_down pattern")
+                        return True, 0.5
                 ear_dists = []
                 for wrist in wrist_pts:
                     best_ear_d = None
@@ -462,16 +527,37 @@ class TemporalBehaviorEngine:
                 center_b = ((bx1 + bx2) / 2, (by1 + by2) / 2)
                 distance = np.linalg.norm(np.array(center_a) - np.array(center_b))
                 
-                # BUG A FIX: proximity gate scaled to the pair's own bbox size
-                # instead of a fixed pixel count, so it behaves the same at
-                # 720p, 1080p, or 4K. Guard against degenerate zero-height boxes.
+                # SENIOR FIX (critical for seated fights): the old gate scaled
+                # purely off bbox HEIGHT. A standing person's bbox spans
+                # head-to-foot, so 1.5x that height is a generous gate. A
+                # SEATED person's bbox only spans head-to-desk (legs are
+                # hidden under the desk), so the same person sitting still
+                # produces a bbox roughly half as tall -- which shrinks the
+                # proximity gate to roughly half its size too, even though
+                # the physical desk spacing between two seated students
+                # hasn't changed at all. Result: two students fighting at
+                # adjacent desks were silently dropped before ever reaching
+                # the 3D CNN classifier, because `distance > proximity_limit`
+                # was true even when they were right next to each other.
+                #
+                # Fix: (1) use the larger of height/width as the scale
+                # reference, since shoulder width stays roughly constant
+                # whether seated or standing; (2) treat literal bbox overlap
+                # (bodies/limbs visibly intersecting -- the single most
+                # reliable physical-contact signal there is) as an automatic
+                # candidate trigger regardless of scale.
                 avg_bbox_height = ((ay2 - ay1) + (by2 - by1)) / 2.0
-                if avg_bbox_height <= 0:
+                avg_bbox_width  = ((ax2 - ax1) + (bx2 - bx1)) / 2.0
+                scale_ref = max(avg_bbox_height, avg_bbox_width)
+                if scale_ref <= 0:
                     continue
-                proximity_limit = avg_bbox_height * self.FIGHT_PROXIMITY_RATIO
-                
+                proximity_limit = scale_ref * self.FIGHT_PROXIMITY_RATIO
+
+                boxes_overlap = not (ax2 < bx1 or bx2 < ax1 or ay2 < by1 or by2 < ay1)
+
                 # BUG 3 FIX: Only consider pairs within proximity threshold
-                if distance > proximity_limit:
+                # (or whose boxes already overlap -- see comment above).
+                if distance > proximity_limit and not boxes_overlap:
                     continue
                 
                 # Calculate relative keypoint proximity (simple physical-contact heuristic;
@@ -489,7 +575,10 @@ class TemporalBehaviorEngine:
                         # instead of a fixed pixel count.
                         a_wrists = [person_a.keypoints[9][:2], person_a.keypoints[10][:2]]
                         b_wrists = [person_b.keypoints[9][:2], person_b.keypoints[10][:2]]
-                        wrist_limit = avg_bbox_height * self.FIGHT_WRIST_PROXIMITY_RATIO
+                        # SENIOR FIX: use the same scale_ref computed above
+                        # (height+width aware) instead of avg_bbox_height
+                        # alone, for the same seated-vs-standing reason.
+                        wrist_limit = scale_ref * self.FIGHT_WRIST_PROXIMITY_RATIO
                         
                         for a_wrist in a_wrists:
                             for b_wrist in b_wrists:
@@ -508,8 +597,10 @@ class TemporalBehaviorEngine:
                     keypoints_unreliable = True
                 
                 # Add to candidates if proximity + (motion indicator OR degraded
-                # pose tracking) present
-                if velocity_detected or keypoints_unreliable:
+                # pose tracking) present -- OR the boxes are already overlapping,
+                # which on its own is strong enough evidence of physical contact
+                # to warrant letting the 3D CNN make the actual call.
+                if velocity_detected or keypoints_unreliable or boxes_overlap:
                     candidate_pairs.append((person_a.track_id, person_b.track_id, distance))
         
         # Step 2: Run dedicated 3D CNN instances on cropped regions for each candidate pair
@@ -523,6 +614,16 @@ class TemporalBehaviorEngine:
         for cand_a_id, cand_b_id, _dist in candidate_pairs:
             self._fight_candidate_ids.add(cand_a_id)
             self._fight_candidate_ids.add(cand_b_id)
+
+        # SENIOR FIX: visibility into candidate formation. Without this it's
+        # impossible to tell, from the field, whether a missed fight is a
+        # GATING problem (pair never became a candidate -- fix is in this
+        # file) or a CLASSIFIER problem (pair became a candidate but the 3D
+        # CNN scored it below confidence_threshold -- fix is in
+        # fight_detection_3dcnn.py / the model weights).
+        if candidate_pairs:
+            print(f"[FIGHT][DEBUG] {len(candidate_pairs)} candidate pair(s) this frame: "
+                  f"{[(a, b, round(d, 1)) for a, b, d in candidate_pairs]}")
         
         for person_a_id, person_b_id, distance in candidate_pairs:
             pair_key = tuple(sorted([person_a_id, person_b_id]))
@@ -582,7 +683,13 @@ class TemporalBehaviorEngine:
             if pair_detector.is_ready():
                 try:
                     is_fighting, confidence = pair_detector.predict()
-                    
+
+                    # SENIOR FIX: log every prediction for an active candidate
+                    # pair, not just confirmed fights, so confidence values
+                    # below threshold are visible during tuning/debugging.
+                    print(f"[FIGHT][DEBUG] pair {pair_key}: cnn_conf={confidence:.2f} "
+                          f"is_fighting={is_fighting} confirmations={pair_state['consecutive_detections']}")
+
                     if is_fighting and confidence > 0.6:
                         # BUG 3 FIX: Only advance counter if enough time has passed (frame-based, not call-based)
                         if current_time - pair_state['last_detection_time'] > 0.3:  # At least 300ms between confirmations
@@ -608,6 +715,14 @@ class TemporalBehaviorEngine:
                 except Exception as e:
                     print(f'[FIGHT] Error in pairwise 3D CNN detection: {e}')
                     continue
+            else:
+                # SENIOR FIX: visibility into the "stuck buffering" failure
+                # mode -- if this prints continuously for a pair that's
+                # clearly in frame, the per-pair detector is never reaching
+                # its sequence_length (16 frames), e.g. because real-time
+                # CPU inference can't keep up and frames are being skipped
+                # faster than the buffer fills.
+                print(f"[FIGHT][DEBUG] pair {pair_key}: detector not ready yet (buffering)")
         
         return fight_results
     
@@ -660,10 +775,17 @@ class TemporalBehaviorEngine:
         elif track_id in self._fight_candidate_ids:
             print(f"[DEBUG] Person {track_id}: contact suspected, holding state pending fight verdict")
         else:
-            head_pose = self._calculate_head_pose(person)
+            # _calculate_head_pose still returns the granular internal
+            # signal ('focused' / 'looking_away' / 'head_down'). We keep
+            # that raw signal around to feed _detect_phone_usage (the
+            # lap+head-down phone heuristic needs to know specifically
+            # whether the head is down, not just "distracted"), but we
+            # never store the granular value itself -- only the collapsed
+            # public state goes into behavior_history.
+            raw_head_signal = self._calculate_head_pose(person)
             
             # Check phone usage
-            is_phone, phone_conf = self._detect_phone_usage(person, phone_detections, head_pose, book_detections)
+            is_phone, phone_conf = self._detect_phone_usage(person, phone_detections, raw_head_signal, book_detections)
             if is_phone:
                 person.behavior_history.append('using_phone')
                 print(f"[DEBUG] Person {track_id}: PHONE detected (conf: {phone_conf:.2f})")
@@ -674,11 +796,15 @@ class TemporalBehaviorEngine:
                     person.behavior_history.append('eating_food')
                     print(f"[DEBUG] Person {track_id}: EATING detected (conf: {eat_conf:.2f}, food_objects: {len(food_detections)})")
                 else:
-                    # Evaluate engagement
-                    person.behavior_history.append(head_pose)
+                    # SENIOR FIX: collapse the granular signal down to the
+                    # two public engagement states requested: 'focused' if
+                    # actively facing forward, 'distracted' for anything
+                    # else (was looking away, head down, etc).
+                    engagement = 'focused' if raw_head_signal == 'focused' else 'distracted'
+                    person.behavior_history.append(engagement)
                     # Only print non-focused states to reduce spam
-                    if head_pose != 'focused':
-                        print(f"[DEBUG] Person {track_id}: HEAD_POSE = {head_pose}")
+                    if engagement != 'focused':
+                        print(f"[DEBUG] Person {track_id}: ENGAGEMENT = {engagement} (raw_signal={raw_head_signal})")
         final_behavior = person.last_final_behavior
         confidence = 0.8
         
@@ -911,10 +1037,21 @@ class ProductionStreamProcessor:
             # The food/drink class list now correctly covers only 46-55 (banana..cake).
             if self.object_model is not None:
                 try:
+                    # SENIOR FIX: was conf=0.5 here but conf=0.3 in the
+                    # legacy detect() pipeline below -- same model, same
+                    # classes, two different recall floors depending on
+                    # which code path happened to run. Unified to 0.3.
+                    # This is a *detector*-level floor across all COCO
+                    # classes; per-class acceptance is still independently
+                    # gated downstream (phone >= 0.35 in
+                    # _detect_phone_usage, food >= 0.7 in _detect_eating),
+                    # so lowering this floor only widens the candidate pool
+                    # those stricter filters get to look at -- it doesn't
+                    # bypass them.
                     object_results = self.object_model(
                         frame,
                         verbose=False,
-                        conf=0.5,  # Higher confidence required to reduce false food detections
+                        conf=0.3,
                         iou=0.5
                     )
                     
