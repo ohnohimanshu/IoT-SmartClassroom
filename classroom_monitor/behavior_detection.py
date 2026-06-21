@@ -68,6 +68,7 @@ class TrackedPerson:
     behavior_history: deque = field(default_factory=lambda: deque(maxlen=16))
     last_seen: float = 0.0
     last_final_behavior: str = 'focused'
+    keypoint_history: deque = field(default_factory=lambda: deque(maxlen=10))
 
 
 @dataclass
@@ -94,10 +95,11 @@ class TemporalBehaviorEngine:
     EATING_HAND_TO_MOUTH_THRESHOLD = 0.15
 
     # Fight detection — skeleton heuristic (always available, no CNN needed)
-    FIGHT_PROXIMITY_RATIO       = 1.8    # candidate if centers within 1.8x scale_ref
-    FIGHT_WRIST_PROXIMITY_RATIO = 0.45   # wrists within 0.45x scale_ref = physical contact
-    FIGHT_SKELETON_CONFIRMS     = 2      # consecutive skeleton frames before flagging fight
-    FIGHT_CNN_CONFIRMS          = 2      # CNN confirmations before flagging fight
+    FIGHT_PROXIMITY_RATIO       = 1.5    # candidate gate: centers within 1.5x scale_ref
+    FIGHT_WRIST_CROSS_RATIO     = 0.30   # wrist inside other bbox OR within 0.30x = contact
+    FIGHT_SKELETON_CONFIRMS     = 3      # must score >= threshold for 3 consecutive frames
+    FIGHT_CNN_CONFIRMS          = 2      # CNN confirmations before flagging
+    FIGHT_SCORE_THRESHOLD       = 0.55   # min skeleton score to count as a confirmation tick
 
     # Alert smoothing
     ALERT_CONFIRM_FRAMES  = 2            # phone/fight: 2-in-a-row confirms
@@ -132,11 +134,15 @@ class TemporalBehaviorEngine:
 
     def update_person(self, track_id: int, bbox: Tuple, keypoints: Optional[np.ndarray], timestamp: float):
         if track_id not in self.tracked_people:
-            self.tracked_people[track_id] = TrackedPerson(
+            p = TrackedPerson(
                 track_id=track_id, bbox=bbox, keypoints=keypoints, last_seen=timestamp)
+            self.tracked_people[track_id] = p
         else:
             p = self.tracked_people[track_id]
             p.bbox, p.keypoints, p.last_seen = bbox, keypoints, timestamp
+
+        if keypoints is not None and keypoints.size > 0:
+            p.keypoint_history.append((timestamp, keypoints.copy()))
 
     def cleanup_stale(self, current_time: float):
         stale = [tid for tid, p in self.tracked_people.items()
@@ -260,30 +266,29 @@ class TemporalBehaviorEngine:
                     if all(np.linalg.norm(w - nose[:2]) / bbox_h < 0.22 for w in wrist_pts):
                         return False, 0.0
 
-                # Both wrists at lap/desk level, close together
-                # head_down raises confidence but is NOT a hard requirement
+                # Both wrists at lap/desk level + hands close together (cupped-phone posture)
+                # Does NOT require head_down: two hands together at lap is distinctive enough.
                 if len(wrist_pts) == 2:
                     both_low    = all(w[1] > lap_thresh for w in wrist_pts)
-                    hands_close = np.linalg.norm(wrist_pts[0] - wrist_pts[1]) / bbox_h < 0.30
+                    hands_close = np.linalg.norm(wrist_pts[0] - wrist_pts[1]) / bbox_h < 0.28
                     if both_low and hands_close:
                         if not (_book_near(wrist_pts[0]) or _book_near(wrist_pts[1])):
-                            conf = 0.7 if head_is_down else 0.55
-                            print(f'[PHONE] Person {person.track_id}: cupped-hands lap, head_down={head_is_down}')
-                            return True, conf
+                            if head_is_down:
+                                print(f'[PHONE] Person {person.track_id}: cupped-hands lap, head_down={head_is_down}')
+                                return True, 0.72
 
                 elif len(wrist_pts) == 1:
+                    # Single wrist at lap level is too ambiguous on its own (could be resting
+                    # arm, writing with one hand, etc.) — require head_down as discriminator.
                     lone  = wrist_pts[0]
                     other = right_wrist if _wrist_ok(left_wrist, 0.5) else left_wrist
                     other_hidden = (
                         other is None or len(other) < 3 or
                         other[2] < 0.25 or (other[0] == 0.0 and other[1] == 0.0)
                     )
-                    # Single wrist at lap level + other wrist hidden
-                    # head_down not required, but raises confidence
-                    if lone[1] > lap_thresh and other_hidden and not _book_near(lone):
-                        conf = 0.6 if head_is_down else 0.45
-                        print(f'[PHONE] Person {person.track_id}: single-hand lap, head_down={head_is_down}')
-                        return True, conf
+                    if lone[1] > lap_thresh and other_hidden and head_is_down and not _book_near(lone):
+                        print(f'[PHONE] Person {person.track_id}: single-hand lap + head_down')
+                        return True, 0.62
 
                 # Hand-to-ear (phone call posture)
                 ear_dists = []
@@ -347,10 +352,44 @@ class TemporalBehaviorEngine:
         if self._fight_detector_3dcnn is not None:
             self._fight_detector_3dcnn.add_frame(frame)
 
+    def _calculate_motion_speed(self, person: TrackedPerson, scale_ref: float) -> float:
+        """
+        Calculate normalized speed of upper body/arm keypoints (wrists, elbows, shoulders, nose).
+        Speed is in units of scale_ref (approx person height) per second.
+        """
+        history = person.keypoint_history
+        if len(history) < 2 or scale_ref <= 0:
+            return 0.0
+
+        speeds = []
+        for i in range(len(history) - 1):
+            t1, kp1 = history[i]
+            t2, kp2 = history[i+1]
+            dt = t2 - t1
+            if dt <= 0.005 or dt > 0.5:
+                continue
+
+            kps_to_check = [0, 5, 6, 7, 8, 9, 10]  # nose, shoulders, elbows, wrists
+            frame_speeds = []
+            for idx in kps_to_check:
+                if idx < len(kp1) and idx < len(kp2):
+                    pt1, pt2 = kp1[idx], kp2[idx]
+                    if len(pt1) >= 3 and len(pt2) >= 3 and pt1[2] > 0.35 and pt2[2] > 0.35:
+                        if pt1[0] != 0.0 and pt2[0] != 0.0:
+                            dist = np.linalg.norm(pt1[:2] - pt2[:2])
+                            speed = dist / (scale_ref * dt)
+                            frame_speeds.append(speed)
+            if frame_speeds:
+                speeds.append(np.max(frame_speeds))
+
+        if not speeds:
+            return 0.0
+        return float(np.max(speeds))
+
     def _skeleton_fight_score(self, a: 'TrackedPerson', b: 'TrackedPerson') -> float:
         """
-        Pure skeleton heuristic fight score [0..1] — works without any CNN.
-        Returns > 0 when physical-contact signals are present between person a and b.
+        Skeleton-only fight score in [0, 1]. Requires evidence of BOTH proximity/contact
+        AND high-velocity motion. Two students sitting next to each other must score < 0.55.
         """
         ax1, ay1, ax2, ay2 = a.bbox
         bx1, by1, bx2, by2 = b.bbox
@@ -362,49 +401,71 @@ class TemporalBehaviorEngine:
         if scale_ref <= 0:
             return 0.0
 
-        ca = np.array([(ax1 + ax2) / 2, (ay1 + ay2) / 2])
-        cb = np.array([(bx1 + bx2) / 2, (by1 + by2) / 2])
-        center_dist = np.linalg.norm(ca - cb) / scale_ref
+        center_a = np.array([(ax1 + ax2) / 2.0, (ay1 + ay2) / 2.0])
+        center_b = np.array([(bx1 + bx2) / 2.0, (by1 + by2) / 2.0])
 
         boxes_overlap = not (ax2 < bx1 or bx2 < ax1 or ay2 < by1 or by2 < ay1)
+        score = 0.20 if boxes_overlap else 0.0
 
-        score = 0.0
+        # Calculate motion speeds
+        speed_a = self._calculate_motion_speed(a, scale_ref)
+        speed_b = self._calculate_motion_speed(b, scale_ref)
+        max_speed = max(speed_a, speed_b)
 
-        # Bounding-box overlap is the strongest physical-contact signal
-        if boxes_overlap:
-            score += 0.5
-        elif center_dist < self.FIGHT_PROXIMITY_RATIO:
-            score += max(0.0, (self.FIGHT_PROXIMITY_RATIO - center_dist) / self.FIGHT_PROXIMITY_RATIO) * 0.3
+        # Apply motion score component
+        if max_speed >= 1.2:
+            score += 0.50
+        elif max_speed >= 0.8:
+            score += 0.30
+        elif max_speed >= 0.5:
+            score += 0.15
 
-        # Wrist proximity between the two people
+        # Check contact/keypoints
         if (a.keypoints is not None and b.keypoints is not None and
                 len(a.keypoints) > 10 and len(b.keypoints) > 10):
             try:
-                wrist_limit = scale_ref * self.FIGHT_WRIST_PROXIMITY_RATIO
+                wrist_cross_limit = scale_ref * self.FIGHT_WRIST_CROSS_RATIO
                 min_wrist_d = float('inf')
-                for ai in (9, 10):
-                    for bi in (9, 10):
-                        aw = a.keypoints[ai]
-                        bw = b.keypoints[bi]
-                        # Only use wrists with reasonable confidence
-                        if len(aw) >= 3 and len(bw) >= 3 and aw[2] > 0.2 and bw[2] > 0.2:
-                            d = np.linalg.norm(aw[:2] - bw[:2])
-                            min_wrist_d = min(min_wrist_d, d)
-                if min_wrist_d < wrist_limit:
-                    score += 0.4 * (1.0 - min_wrist_d / wrist_limit)
-                # Also check if one person's wrist is inside the other's bbox
+
+                # Check A's wrists
                 for ai in (9, 10):
                     aw = a.keypoints[ai]
-                    if len(aw) >= 3 and aw[2] > 0.2:
+                    if len(aw) >= 3 and aw[2] > 0.3:
+                        # A's wrist inside B's bbox AND closer to B's center than A's center
                         if bx1 <= aw[0] <= bx2 and by1 <= aw[1] <= by2:
-                            score += 0.3  # A's wrist is inside B's body
+                            dist_to_own = np.linalg.norm(aw[:2] - center_a)
+                            dist_to_other = np.linalg.norm(aw[:2] - center_b)
+                            if dist_to_other < dist_to_own:
+                                score += 0.20
+                        for bi in (9, 10):
+                            bw = b.keypoints[bi]
+                            if len(bw) >= 3 and bw[2] > 0.3:
+                                d = np.linalg.norm(aw[:2] - bw[:2])
+                                min_wrist_d = min(min_wrist_d, d)
+
+                # Check B's wrists
                 for bi in (9, 10):
                     bw = b.keypoints[bi]
-                    if len(bw) >= 3 and bw[2] > 0.2:
+                    if len(bw) >= 3 and bw[2] > 0.3:
+                        # B's wrist inside A's bbox AND closer to A's center than B's center
                         if ax1 <= bw[0] <= ax2 and ay1 <= bw[1] <= ay2:
-                            score += 0.3  # B's wrist is inside A's body
+                            dist_to_own = np.linalg.norm(bw[:2] - center_b)
+                            dist_to_other = np.linalg.norm(bw[:2] - center_a)
+                            if dist_to_other < dist_to_own:
+                                score += 0.20
+
+                if min_wrist_d < wrist_cross_limit:
+                    score += 0.10
+
             except Exception:
                 pass
+
+        # If motion is slow/static, cap score below the fight threshold
+        if max_speed < 0.5:
+            score = min(score, 0.40)
+
+        print(f"[FIGHT-SKEL] Pair {a.track_id}-{b.track_id}: overlap={boxes_overlap}, "
+              f"speeds=({speed_a:.2f}, {speed_b:.2f}), score={score:.2f}")
 
         return min(score, 1.0)
 
@@ -444,6 +505,28 @@ class TemporalBehaviorEngine:
                 if dist > scale_ref * self.FIGHT_PROXIMITY_RATIO and not boxes_overlap:
                     continue
 
+                # Pre-filter: skip pairs where no wrist crosses the other's bbox
+                # AND boxes don't overlap — avoids scoring normal seated-neighbor pairs.
+                if not boxes_overlap:
+                    has_crossing = False
+                    if (a.keypoints is not None and b.keypoints is not None and
+                            len(a.keypoints) > 10 and len(b.keypoints) > 10):
+                        try:
+                            for ai in (9, 10):
+                                aw = a.keypoints[ai]
+                                if len(aw) >= 3 and aw[2] > 0.3:
+                                    if bx1 <= aw[0] <= bx2 and by1 <= aw[1] <= by2:
+                                        has_crossing = True
+                            for bi in (9, 10):
+                                bw = b.keypoints[bi]
+                                if len(bw) >= 3 and bw[2] > 0.3:
+                                    if ax1 <= bw[0] <= ax2 and ay1 <= bw[1] <= ay2:
+                                        has_crossing = True
+                        except Exception:
+                            has_crossing = True  # unknown, keep in candidates
+                    if not has_crossing:
+                        continue
+
                 candidate_pairs.append((a.track_id, b.track_id, dist, scale_ref))
 
         self._fight_candidate_ids = {tid for a, b, _, _ in candidate_pairs for tid in (a, b)}
@@ -473,22 +556,23 @@ class TemporalBehaviorEngine:
             state = self.fight_pairs[pair_key]
             now   = time.time()
 
-            # Skeleton path: score >= 0.5 triggers a confirmation tick
-            if skel_score >= 0.5:
+            # Skeleton path: score >= FIGHT_SCORE_THRESHOLD triggers a confirmation tick
+            if skel_score >= self.FIGHT_SCORE_THRESHOLD:
                 if now - state['last_skel_time'] > 0.2:
                     state['skel_confirms'] += 1
                     state['last_skel_time'] = now
 
                 if state['skel_confirms'] >= self.FIGHT_SKELETON_CONFIRMS:
-                    print(f'[FIGHT] pair {pair_key}: SKELETON FIGHT confirmed! score={skel_score:.2f}')
+                    print(f'[FIGHT] pair {pair_key}: FIGHT confirmed (skeleton)! score={skel_score:.2f}')
                     fight_results.append((a_id, b_id, min(skel_score, 0.85), {
                         'person_a_id': a_id, 'person_b_id': b_id,
                         'confidence': skel_score, 'trigger': 'skeleton',
                         'distance': dist, 'confirmations': state['skel_confirms'],
                     }))
-                    continue   # no need to also run CNN for this pair
+                    continue
             else:
-                if now - state['last_skel_time'] > 1.5:
+                # Decay counter faster when score drops well below threshold
+                if now - state['last_skel_time'] > (0.8 if skel_score < 0.2 else 2.0):
                     state['skel_confirms'] = max(0, state['skel_confirms'] - 1)
 
             # ── 3D CNN path (when available, used for borderline cases) ───────
