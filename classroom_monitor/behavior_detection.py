@@ -97,9 +97,10 @@ class TemporalBehaviorEngine:
     # Fight detection — skeleton heuristic (always available, no CNN needed)
     FIGHT_PROXIMITY_RATIO       = 1.5    # candidate gate: centers within 1.5x scale_ref
     FIGHT_WRIST_CROSS_RATIO     = 0.30   # wrist inside other bbox OR within 0.30x = contact
-    FIGHT_SKELETON_CONFIRMS     = 3      # must score >= threshold for 3 consecutive frames
+    FIGHT_SKELETON_CONFIRMS     = 4      # must score >= threshold for 4 ticks, close together
     FIGHT_CNN_CONFIRMS          = 2      # CNN confirmations before flagging
-    FIGHT_SCORE_THRESHOLD       = 0.55   # min skeleton score to count as a confirmation tick
+    FIGHT_SCORE_THRESHOLD       = 0.70   # min skeleton score to count as a confirmation tick
+    FIGHT_CONFIRM_WINDOW_SEC    = 1.5    # all confirmation ticks must land within this window
 
     # Alert smoothing
     ALERT_CONFIRM_FRAMES  = 2            # phone/fight: 2-in-a-row confirms
@@ -212,6 +213,37 @@ class TemporalBehaviorEngine:
         except Exception:
             return 'focused'
 
+    # ── Shared helpers ────────────────────────────────────────────────────────
+    @staticmethod
+    def _point_near_book(pt, bbox_h: float, book_detections: List[Tuple]) -> bool:
+        for (bx1, by1, bx2, by2, _) in book_detections:
+            bc = np.array([(bx1 + bx2) / 2.0, (by1 + by2) / 2.0])
+            if np.linalg.norm(np.array(pt) - bc) / bbox_h < 0.25:
+                return True
+        return False
+
+    def _head_down_is_writing(self, person: TrackedPerson,
+                              book_detections: Optional[List[Tuple]] = None) -> bool:
+        """True if a head-down posture is plausibly writing/reading (book/notebook
+        near a hand or near the face) rather than generic distraction."""
+        book_detections = book_detections or []
+        if not book_detections:
+            return False
+        kp = person.keypoints
+        x1, y1, x2, y2 = person.bbox
+        bbox_h = y2 - y1
+        if bbox_h <= 0:
+            return False
+        points = []
+        if kp is not None and kp.size > 0 and len(kp) > 10:
+            for idx in (0, 9, 10):  # nose, left wrist, right wrist
+                w = kp[idx]
+                if len(w) >= 3 and w[2] >= 0.3 and w[0] != 0.0:
+                    points.append(w[:2])
+        if not points:
+            return False
+        return any(self._point_near_book(pt, bbox_h, book_detections) for pt in points)
+
     # ── Phone Detection ───────────────────────────────────────────────────────
     def _detect_phone_usage(self, person: TrackedPerson,
                             phone_detections: List[Tuple],
@@ -227,11 +259,7 @@ class TemporalBehaviorEngine:
         head_is_down = (head_pose == 'head_down')
 
         def _book_near(pt) -> bool:
-            for (bx1, by1, bx2, by2, _) in book_detections:
-                bc = np.array([(bx1 + bx2) / 2.0, (by1 + by2) / 2.0])
-                if np.linalg.norm(np.array(pt) - bc) / bbox_h < 0.25:
-                    return True
-            return False
+            return self._point_near_book(pt, bbox_h, book_detections)
 
         def _wrist_ok(w, min_conf=0.4) -> bool:
             return w is not None and len(w) >= 3 and w[2] >= min_conf and w[0] != 0.0
@@ -414,8 +442,11 @@ class TemporalBehaviorEngine:
 
     def _skeleton_fight_score(self, a: 'TrackedPerson', b: 'TrackedPerson') -> float:
         """
-        Skeleton-only fight score in [0, 1]. Requires evidence of BOTH proximity/contact
-        AND high-velocity motion. Two students sitting next to each other must score < 0.55.
+        Skeleton-only fight score in [0, 1]. Requires REAL wrist-contact evidence
+        AND high-velocity motion together. Motion alone (vulnerable to pose-
+        estimation jitter) or proximity/overlap alone (true of any two students
+        sitting next to each other) can never cross the fight threshold on their
+        own — both signals must agree.
         """
         ax1, ay1, ax2, ay2 = a.bbox
         bx1, by1, bx2, by2 = b.bbox
@@ -431,67 +462,75 @@ class TemporalBehaviorEngine:
         center_b = np.array([(bx1 + bx2) / 2.0, (by1 + by2) / 2.0])
 
         boxes_overlap = not (ax2 < bx1 or bx2 < ax1 or ay2 < by1 or by2 < ay1)
-        score = 0.20 if boxes_overlap else 0.0
 
-        # Calculate motion speeds
+        # Calculate motion speeds (used only AFTER contact is established below)
         speed_a = self._calculate_motion_speed(a, scale_ref)
         speed_b = self._calculate_motion_speed(b, scale_ref)
         max_speed = max(speed_a, speed_b)
 
-        # Apply motion score component
-        if max_speed >= 1.2:
-            score += 0.50
-        elif max_speed >= 0.8:
-            score += 0.30
-        elif max_speed >= 0.5:
-            score += 0.15
-
-        # Check contact/keypoints
+        # ── Contact evidence (required) ────────────────────────────────────
+        contact_score = 0.0
         if (a.keypoints is not None and b.keypoints is not None and
                 len(a.keypoints) > 10 and len(b.keypoints) > 10):
             try:
                 wrist_cross_limit = scale_ref * self.FIGHT_WRIST_CROSS_RATIO
                 min_wrist_d = float('inf')
 
-                # Check A's wrists
                 for ai in (9, 10):
                     aw = a.keypoints[ai]
                     if len(aw) >= 3 and aw[2] > 0.3:
-                        # A's wrist inside B's bbox AND closer to B's center than A's center
                         if bx1 <= aw[0] <= bx2 and by1 <= aw[1] <= by2:
                             dist_to_own = np.linalg.norm(aw[:2] - center_a)
                             dist_to_other = np.linalg.norm(aw[:2] - center_b)
                             if dist_to_other < dist_to_own:
-                                score += 0.20
+                                contact_score += 0.30
                         for bi in (9, 10):
                             bw = b.keypoints[bi]
                             if len(bw) >= 3 and bw[2] > 0.3:
                                 d = np.linalg.norm(aw[:2] - bw[:2])
                                 min_wrist_d = min(min_wrist_d, d)
 
-                # Check B's wrists
                 for bi in (9, 10):
                     bw = b.keypoints[bi]
                     if len(bw) >= 3 and bw[2] > 0.3:
-                        # B's wrist inside A's bbox AND closer to A's center than B's center
                         if ax1 <= bw[0] <= ax2 and ay1 <= bw[1] <= ay2:
                             dist_to_own = np.linalg.norm(bw[:2] - center_b)
                             dist_to_other = np.linalg.norm(bw[:2] - center_a)
                             if dist_to_other < dist_to_own:
-                                score += 0.20
+                                contact_score += 0.30
 
                 if min_wrist_d < wrist_cross_limit:
-                    score += 0.10
+                    contact_score += 0.15
 
             except Exception:
                 pass
 
-        # If motion is slow/static, cap score below the fight threshold
-        if max_speed < 0.5:
-            score = min(score, 0.40)
+        if contact_score <= 0.0:
+            # No physical contact evidence at all -> this cannot be scored as a
+            # fight no matter how "fast" the keypoints appear to be moving.
+            # Two people simply standing/sitting close (bbox overlap) with no
+            # hand contact is the normal classroom case, not a fight.
+            print(f"[FIGHT-SKEL] Pair {a.track_id}-{b.track_id}: no contact evidence, "
+                  f"speeds=({speed_a:.2f}, {speed_b:.2f}) -> score=0.00")
+            return 0.0
 
-        print(f"[FIGHT-SKEL] Pair {a.track_id}-{b.track_id}: overlap={boxes_overlap}, "
-              f"speeds=({speed_a:.2f}, {speed_b:.2f}), score={score:.2f}")
+        score = min(contact_score, 0.55)
+
+        # Motion only adds to the score once contact evidence already exists.
+        if max_speed >= 1.5:
+            score += 0.45
+        elif max_speed >= 1.0:
+            score += 0.25
+        elif max_speed >= 0.6:
+            score += 0.10
+
+        # Static/slow contact (e.g. resting a hand on a desk near a neighbor)
+        # is capped well below the fight threshold.
+        if max_speed < 0.6:
+            score = min(score, 0.35)
+
+        print(f"[FIGHT-SKEL] Pair {a.track_id}-{b.track_id}: contact={contact_score:.2f}, "
+              f"overlap={boxes_overlap}, speeds=({speed_a:.2f}, {speed_b:.2f}), score={score:.2f}")
 
         return min(score, 1.0)
 
@@ -531,27 +570,36 @@ class TemporalBehaviorEngine:
                 if dist > scale_ref * self.FIGHT_PROXIMITY_RATIO and not boxes_overlap:
                     continue
 
-                # Pre-filter: skip pairs where no wrist crosses the other's bbox
-                # AND boxes don't overlap — avoids scoring normal seated-neighbor pairs.
-                if not boxes_overlap:
-                    has_crossing = False
-                    if (a.keypoints is not None and b.keypoints is not None and
-                            len(a.keypoints) > 10 and len(b.keypoints) > 10):
-                        try:
-                            for ai in (9, 10):
-                                aw = a.keypoints[ai]
-                                if len(aw) >= 3 and aw[2] > 0.3:
-                                    if bx1 <= aw[0] <= bx2 and by1 <= aw[1] <= by2:
-                                        has_crossing = True
-                            for bi in (9, 10):
-                                bw = b.keypoints[bi]
-                                if len(bw) >= 3 and bw[2] > 0.3:
-                                    if ax1 <= bw[0] <= ax2 and ay1 <= bw[1] <= ay2:
-                                        has_crossing = True
-                        except Exception:
-                            has_crossing = True  # unknown, keep in candidates
-                    if not has_crossing:
-                        continue
+                # Pre-filter: a pair only becomes a fight CANDIDATE if there is
+                # actual wrist-level evidence of contact. Two students simply
+                # seated next to each other will very often have OVERLAPPING
+                # BOUNDING BOXES (shoulders/arms touching) with zero physical
+                # contact — bbox overlap on its own is NOT evidence of contact
+                # and must never bypass this check.
+                has_crossing = False
+                if (a.keypoints is not None and b.keypoints is not None and
+                        len(a.keypoints) > 10 and len(b.keypoints) > 10):
+                    try:
+                        contact_margin = scale_ref * self.FIGHT_WRIST_CROSS_RATIO
+                        for ai in (9, 10):
+                            aw = a.keypoints[ai]
+                            if len(aw) >= 3 and aw[2] > 0.3:
+                                if bx1 <= aw[0] <= bx2 and by1 <= aw[1] <= by2:
+                                    has_crossing = True
+                                for bi in (9, 10):
+                                    bw = b.keypoints[bi]
+                                    if len(bw) >= 3 and bw[2] > 0.3:
+                                        if np.linalg.norm(aw[:2] - bw[:2]) < contact_margin:
+                                            has_crossing = True
+                        for bi in (9, 10):
+                            bw = b.keypoints[bi]
+                            if len(bw) >= 3 and bw[2] > 0.3:
+                                if ax1 <= bw[0] <= ax2 and ay1 <= bw[1] <= ay2:
+                                    has_crossing = True
+                    except Exception:
+                        has_crossing = False  # unknown -> do NOT default to "keep"
+                if not has_crossing:
+                    continue
 
                 candidate_pairs.append((a.track_id, b.track_id, dist, scale_ref))
 
@@ -577,16 +625,24 @@ class TemporalBehaviorEngine:
                     'skel_confirms': 0,
                     'cnn_confirms': 0,
                     'last_skel_time': 0.0,
+                    'first_skel_time': 0.0,
                     'last_cnn_time': 0.0,
                 }
             state = self.fight_pairs[pair_key]
             now   = time.time()
 
-            # Skeleton path: score >= FIGHT_SCORE_THRESHOLD triggers a confirmation tick
+            # Skeleton path: score >= FIGHT_SCORE_THRESHOLD triggers a confirmation tick.
+            # All ticks for a single fight call must land within FIGHT_CONFIRM_WINDOW_SEC
+            # of the FIRST tick — if too much time passes without re-confirming, the
+            # whole streak resets. This prevents scattered, unrelated jitter spikes
+            # spread out over many seconds from ever accumulating into a "confirmed" fight.
             if skel_score >= self.FIGHT_SCORE_THRESHOLD:
-                if now - state['last_skel_time'] > 0.2:
+                if state['skel_confirms'] == 0 or (now - state['first_skel_time']) > self.FIGHT_CONFIRM_WINDOW_SEC:
+                    state['skel_confirms']   = 1
+                    state['first_skel_time'] = now
+                elif now - state['last_skel_time'] > 0.2:
                     state['skel_confirms'] += 1
-                    state['last_skel_time'] = now
+                state['last_skel_time'] = now
 
                 if state['skel_confirms'] >= self.FIGHT_SKELETON_CONFIRMS:
                     print(f'[FIGHT] pair {pair_key}: FIGHT confirmed (skeleton)! score={skel_score:.2f}')
@@ -597,9 +653,10 @@ class TemporalBehaviorEngine:
                     }))
                     continue
             else:
-                # Decay counter faster when score drops well below threshold
-                if now - state['last_skel_time'] > (0.8 if skel_score < 0.2 else 2.0):
-                    state['skel_confirms'] = max(0, state['skel_confirms'] - 1)
+                # Any sub-threshold frame breaks the streak immediately rather than
+                # slowly decaying — a real fight produces threshold-crossing contact
+                # repeatedly and quickly, not once every couple of seconds.
+                state['skel_confirms'] = 0
 
             # ── 3D CNN path (when available, used for borderline cases) ───────
             if not self._cnn_available:
@@ -678,9 +735,15 @@ class TemporalBehaviorEngine:
         # ── Append raw behavior to history ──────────────────────────────────
         if fight_detected:
             person.behavior_history.append('fighting')
-        elif track_id in self._fight_candidate_ids:
-            pass  # contact suspected, hold state
         else:
+            # IMPORTANT: merely being a "fight candidate" (i.e. within proximity
+            # of another tracked person — true for almost every student in a
+            # normal classroom seating arrangement) must NEVER suppress normal
+            # behavior classification. Previously this branch did `pass`, which
+            # froze phone/eating/focus evaluation for any student sitting near
+            # a classmate — which is most students, most of the time. Only an
+            # ACTUALLY CONFIRMED fight (handled above) should override the
+            # regular checks below.
             raw_head = self._calculate_head_pose(person)
             is_phone, phone_conf = self._detect_phone_usage(person, phone_detections, raw_head, book_detections)
             if is_phone:
@@ -689,6 +752,11 @@ class TemporalBehaviorEngine:
                 is_eating, _ = self._detect_eating(person, food_detections)
                 if is_eating:
                     person.behavior_history.append('eating_food')
+                elif raw_head == 'head_down' and self._head_down_is_writing(person, book_detections):
+                    # Head-down + a book/notebook near the hands/face is normal
+                    # writing/reading, not "distraction". Without this check a
+                    # student taking notes gets mislabeled as distracted.
+                    person.behavior_history.append('focused')
                 else:
                     person.behavior_history.append('focused' if raw_head == 'focused' else 'distracted')
 
