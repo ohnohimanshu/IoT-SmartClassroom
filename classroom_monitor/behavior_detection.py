@@ -97,46 +97,12 @@ class DetectionResult:
 
 # ── Temporal Behavior Engine ────────────────────────────────────────────────
 class TemporalBehaviorEngine:
-    """
-    Hierarchical behavior engine with temporal smoothing.
-    Requires 3 consecutive positive evaluations before state change.
-    
-    Fight detection uses a 3D CNN (mc3_18) instead of skeleton heuristics.
-    """
-    
-    # BUG 1 FIX: Configurable thresholds for new heuristics
-    # These replace magic numbers and make the system tunable for real classroom footage
     PHONE_OVERLAP_THRESHOLD = 0.3
     EATING_HAND_TO_MOUTH_THRESHOLD = 0.25  # FIXED: More restrictive to avoid false positives from normal hand movements
     ENGAGEMENT_HEAD_POSE_THRESHOLD = 0.6
     
-    # BUG 2 FIX: Configurable thresholds for head-down detection
-    # When facial keypoints are missing for this many consecutive frames while body is present,
-    # classify as head_down instead of incorrectly returning 'focused'
-    HEAD_DOWN_CONSECUTIVE_FRAMES = 8  # ~1 second at 8 FPS processing rate
     LOW_CONFIDENCE_THRESHOLD = 0.5
     
-    # BUG 3 FIX: Configurable thresholds for pairwise fight detection
-    # Fight detection now works on pairs of people, not scene-wide
-    #
-    # BUG A FIX: these used to be raw pixel distances (100px center-to-center,
-    # 15px wrist-to-wrist), which only make sense at one specific camera
-    # resolution. At native 1080p+ a seated person's bbox is commonly
-    # 400-600px tall, so 100px of center separation requires the two people
-    # to be almost fully overlapping, and 15px of wrist separation requires
-    # near pixel-perfect overlap of hand keypoints -- far stricter than two
-    # people actually grabbing each other. (The old comments claiming
-    # 150->100 and 25->15 "increased sensitivity" also had the logic
-    # backwards: shrinking a `distance < threshold` cutoff makes it HARDER
-    # to satisfy, not easier -- that's what was silently starving the
-    # candidate-pair gate so the 3D CNN never even got a clip to classify.)
-    #
-    # Both thresholds are now expressed as ratios of the pair's average bbox
-    # height, so they scale automatically with camera resolution and with
-    # how close/far the camera is to the subjects. Note this gate is only a
-    # cheap pre-filter that decides which pairs are worth running the 3D CNN
-    # on -- the CNN (plus FIGHT_CONFIRMATION_FRAMES) is what actually decides
-    # "fighting", so it's fine for this gate to be generous.
     FIGHT_PROXIMITY_RATIO = 1.5        # candidate pair if centers are within 1.5x avg bbox height
     FIGHT_WRIST_PROXIMITY_RATIO = 0.4  # candidate pair if any wrists are within 0.4x avg bbox height
     FIGHT_CONFIRMATION_FRAMES = 2      # FIXED: Reduced from 3 - faster fight detection response
@@ -155,15 +121,6 @@ class TemporalBehaviorEngine:
         # BUG 3 FIX: Track pairwise fight detection state instead of scene-wide
         self.fight_pairs: Dict[Tuple[int, int], Dict] = {}  # (person_a, person_b) -> fight state
         self.fight_pair_detectors: Dict[Tuple[int, int], 'FightDetector3DCNN'] = {}  # per-pair 3D CNN instances
-
-        # BUG FIX: track_ids currently in ANY candidate contact pair, even
-        # before the 3D CNN confirms a fight. The CNN needs a 16-frame
-        # buffer plus extra confirmations before it can say "fighting" --
-        # multiple seconds -- while head_down only needs ~8 low-confidence
-        # frames to lock in. Without this, real fights reliably get
-        # labeled head_down before the CNN ever gets a verdict in. See
-        # evaluate_person, where this is used to hold the engagement
-        # evaluation in place while a verdict is pending.
         self._fight_candidate_ids: set = set()
         
         # 3D CNN fight detector (replaces skeleton-heuristic approach)
@@ -303,32 +260,6 @@ class TemporalBehaviorEngine:
                        phone_detections: List[Tuple],
                        head_pose: str,
                        book_detections: Optional[List[Tuple]] = None) -> Tuple[bool, float]:
-        """
-        Phone detection combining an actual detected phone object (when the
-        object model sees one) with strict, scale-invariant skeleton heuristics.
-
-        BUG B FIX: the previous skeleton-only heuristics false-positived on
-        extremely common, non-phone classroom postures:
-          - "any one hand below the lap line + head down" is also exactly
-            what writing or reading at a desk looks like, so it fired
-            constantly on students taking notes.
-          - "one wrist near the NOSE + the other hand elsewhere" is also what
-            chin-resting (a common boredom posture) and eating look like,
-            since the nose/chin region is where a resting hand naturally
-            ends up regardless of whether anything is held.
-        Fixes: require BOTH wrists together at lap height (cupping a phone)
-        rather than just one hand down, and use ear distance (not nose
-        distance) for the to-the-ear gesture, since a phone call holds the
-        hand to the side of the head while chin-resting holds it centered
-        under the mouth.
-
-        BUG D FIX: notebooks/pencil cases held in two hands at lap height
-        while writing were still tripping the cupped-hands pattern, and the
-        generic (non-fine-tuned) object model occasionally classifies the
-        same objects as "cell phone" outright. book_detections (COCO class
-        73) lets both paths cross-check against an actual notebook/book
-        sighting at the hands before committing to "phone".
-        """
         x1, y1, x2, y2 = person.bbox
         bbox_height = y2 - y1
         if bbox_height <= 0:
@@ -345,30 +276,14 @@ class TemporalBehaviorEngine:
                     return True
             return False
 
-        # ── Strategy A: Object-detector phone bbox near a wrist ─────────────
-        # Re-enabled. An actual phone object detected near a hand is far more
-        # specific evidence than posture alone, and dropping it entirely (as
-        # the previous "AGGRESSIVE FIX" did) left the system relying only on
-        # generic hand/face heuristics that can't tell phone use apart from
-        # writing, eating, or chin-resting.
         if phone_detections and kp is not None and kp.size > 0 and len(kp) > 10:
             for (px1, py1, px2, py2, conf) in phone_detections:
                 if conf < 0.5:
                     continue
-                # BUG D FIX: size sanity check. A real phone's bbox is small
-                # relative to a person -- a notebook, pencil case, or
-                # calculator misclassified as "cell phone" by the generic
-                # (non-fine-tuned) COCO model is typically a good deal
-                # larger. Reject detections too big to plausibly be a phone
-                # rather than trusting the class label alone.
                 phone_w, phone_h = (px2 - px1), (py2 - py1)
                 if max(phone_w, phone_h) / bbox_height > 0.30:
                     continue
                 phone_center = np.array([(px1 + px2) / 2.0, (py1 + py2) / 2.0])
-                # BUG D FIX: if a book/notebook was also seen right at this
-                # same spot, the object model is more likely confusing the
-                # two than seeing both a phone and a notebook stacked
-                # together -- don't let the phone reading win in that case.
                 if _book_near(phone_center):
                     continue
                 for wrist_idx in (9, 10):
@@ -388,62 +303,26 @@ class TemporalBehaviorEngine:
                 left_wrist  = kp[9]
                 right_wrist = kp[10]
                 lap_threshold = y1 + bbox_height * self.PHONE_LAP_HEIGHT_FRACTION
-
-                # BUG FIX: nose confidence is no longer required up front.
-                # A student looking down at a phone in their lap is exactly
-                # the head_down posture that lowers nose-keypoint confidence
-                # (face tilted away from the camera), so gating this whole
-                # strategy on nose[2] >= 0.8 was silently disabling phone
-                # detection in the most common phone-use posture -- which is
-                # why real phone use was falling through to plain head_down.
-                # The nose is only actually needed for the "hands near
-                # nose/mouth = eating/chin-rest" guard below, so just track
-                # its availability and skip that one guard when it's missing;
-                # the lap-cupping and hand-to-ear checks don't need it at all.
                 nose_visible = len(nose) >= 3 and nose[2] >= 0.8 and nose[0] != 0.0
 
                 wrist_pts = []
                 for wrist in (left_wrist, right_wrist):
                     if len(wrist) >= 3 and wrist[2] >= 0.8 and wrist[0] != 0.0:
                         wrist_pts.append(wrist[:2])
-
-                # Guard: both hands hovering right at the mouth/nose is eating,
-                # talking with hands, or writing held close to the face --
-                # not phone use. Only checkable when the nose is confidently
-                # localized; if it isn't, fall through to the other checks
-                # instead of bailing out of phone detection entirely.
                 if nose_visible and len(wrist_pts) == 2:
                     nose_dists = [np.linalg.norm(w - nose[:2]) / bbox_height for w in wrist_pts]
                     if nose_dists[0] < 0.25 and nose_dists[1] < 0.25:
                         return False, 0.0
 
-                # FIX: cupped-hands-in-lap pattern. Previously this fired if
-                # EITHER hand was below the lap line -- indistinguishable from
-                # one hand resting on a desk while writing. Now requires BOTH
-                # wrists visible, BOTH below the lap line, AND close together
-                # (cupping a phone), since writing/reading normally has the
-                # hands apart (pen hand + paper/desk hand).
                 if len(wrist_pts) == 2:
                     both_low = all(w[1] > lap_threshold for w in wrist_pts)
                     hands_together = np.linalg.norm(wrist_pts[0] - wrist_pts[1]) / bbox_height < 0.25
                     if both_low and hands_together:
-                        # BUG D FIX: this exact pattern -- two hands together
-                        # at desk/lap height while looking down -- is also
-                        # what holding a notebook open with both hands while
-                        # writing looks like. If a book/notebook object was
-                        # actually seen at the hands, trust that over the
-                        # ambiguous posture and don't call it a phone.
                         if _book_near(wrist_pts[0]) or _book_near(wrist_pts[1]):
                             pass
                         elif head_pose == 'head_down':
                             print(f"[DEBUG] Person {person.track_id}: PHONE detected - cupped-hands lap+head_down pattern")
                             return True, 0.6
-
-                # FIX: phone-to-ear pattern now measured against the EAR
-                # keypoint instead of the nose. Chin-resting and eating both
-                # bring a hand to the nose/mouth region; an actual phone call
-                # brings it to the side of the head near the ear, which is a
-                # more specific and less commonly-confused cue.
                 ear_dists = []
                 for wrist in wrist_pts:
                     best_ear_d = None
@@ -626,18 +505,6 @@ class TemporalBehaviorEngine:
                     except Exception:
                         keypoints_unreliable = True
                 else:
-                    # BUG FIX: real physical contact is exactly what makes a
-                    # pose model lose the wrists -- overlapping bodies confuse
-                    # per-person keypoint attribution, and fast motion causes
-                    # blur/occlusion. Previously, missing/short keypoint
-                    # arrays here meant the pair silently never became a
-                    # candidate, so the scenario this gate exists to catch
-                    # was the scenario most likely to make it never fire.
-                    # Two people already this close (proximity gate above)
-                    # with one or both losing pose tracking is at least as
-                    # suspicious as a clean wrist-proximity reading -- treat
-                    # it as a candidate too and let the 3D CNN, which looks
-                    # at raw pixels rather than keypoints, make the real call.
                     keypoints_unreliable = True
                 
                 # Add to candidates if proximity + (motion indicator OR degraded
@@ -791,28 +658,8 @@ class TemporalBehaviorEngine:
             person.behavior_history.append('fighting')
             print(f"[DEBUG] Person {track_id}: FIGHTING detected")
         elif track_id in self._fight_candidate_ids:
-            # BUG FIX: this person is currently in a contact-candidate pair --
-            # the 3D CNN hasn't reached a verdict yet (it needs a 16-frame
-            # buffer plus confirmations, which takes noticeably longer than
-            # the ~8 low-confidence frames it takes the engagement heuristic
-            # to lock in head_down). The same occlusion/motion-blur that
-            # makes wrist tracking unreliable during contact also tanks
-            # nose/eye confidence, so without this guard a real fight
-            # reliably gets mislabeled head_down before the CNN ever gets a
-            # chance to weigh in. Hold the previously confirmed state
-            # instead of feeding a misleading reading into the smoothing
-            # window -- don't run phone/eating/head_pose this frame at all.
             print(f"[DEBUG] Person {track_id}: contact suspected, holding state pending fight verdict")
         else:
-            # BUG B FIX: compute head pose exactly once per frame and reuse it.
-            # _calculate_head_pose() increments low_confidence_counters as a
-            # side effect, so calling it again later in the engagement branch
-            # (when phone/eating both come back negative) silently doubled
-            # the counter for any frame with ambiguous face keypoints,
-            # making head_down trigger after ~4 frames instead of the
-            # intended HEAD_DOWN_CONSECUTIVE_FRAMES (8) -- which in turn made
-            # the phone heuristic's "head_down" corroboration fire far more
-            # often than designed.
             head_pose = self._calculate_head_pose(person)
             
             # Check phone usage
@@ -832,27 +679,6 @@ class TemporalBehaviorEngine:
                     # Only print non-focused states to reduce spam
                     if head_pose != 'focused':
                         print(f"[DEBUG] Person {track_id}: HEAD_POSE = {head_pose}")
-        
-        # Temporal smoothing - require 3 consecutive same states before switching.
-        # ROOT CAUSE FIX (part 1): the old fallback took Counter(full 16-frame
-        # history).most_common(1), which let a single noisy 'eating_food'/
-        # 'using_phone' frame win the vote -- legitimate engagement states are
-        # split across 3 separate labels (focused/head_down/looking_away) so
-        # they rarely accumulate a high count each, while a one-off alert
-        # misfire doesn't compete against anything and can "win" with as
-        # little as 2 votes, then persists because nothing dislodges it.
-        # ROOT CAUSE FIX (part 2): an earlier version of this fix used a
-        # windowed majority + hysteresis, but that still let an *unconfirmed*
-        # single first-frame alert reading get written into last_final_behavior
-        # and then defended by hysteresis forever. So: ALERT_POSES
-        # (eating_food/using_phone/fighting) now strictly require 3
-        # consecutive identical raw evaluations to ever be confirmed -- a
-        # majority vote or a lone early reading is never enough for them,
-        # since they trigger external incident reports/WhatsApp alerts and
-        # carry a much higher cost when wrong. Ordinary engagement states
-        # (focused/head_down/looking_away/distracted) still get the more
-        # lenient windowed-majority smoothing since brief flicker there is
-        # normal and low-stakes.
         final_behavior = person.last_final_behavior
         confidence = 0.8
         
