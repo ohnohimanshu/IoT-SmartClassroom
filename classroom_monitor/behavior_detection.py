@@ -68,7 +68,7 @@ class TrackedPerson:
     behavior_history: deque = field(default_factory=lambda: deque(maxlen=16))
     last_seen: float = 0.0
     last_final_behavior: str = 'focused'
-    keypoint_history: deque = field(default_factory=lambda: deque(maxlen=10))
+    keypoint_history: deque = field(default_factory=lambda: deque(maxlen=20))
 
 
 @dataclass
@@ -170,30 +170,43 @@ class TemporalBehaviorEngine:
                 return 'focused'
 
             tid = person.track_id
-            low_conf = (
-                nose[2] < self.LOW_CONFIDENCE_THRESHOLD or
-                left_eye[2] < self.LOW_CONFIDENCE_THRESHOLD or
-                right_eye[2] < self.LOW_CONFIDENCE_THRESHOLD or
-                nose[0] == 0.0 or left_eye[0] == 0.0 or right_eye[0] == 0.0
-            )
-            if low_conf:
+            nose_ok = nose[2] >= self.LOW_CONFIDENCE_THRESHOLD and nose[0] != 0.0
+            left_eye_ok = left_eye[2] >= self.LOW_CONFIDENCE_THRESHOLD and left_eye[0] != 0.0
+            right_eye_ok = right_eye[2] >= self.LOW_CONFIDENCE_THRESHOLD and right_eye[0] != 0.0
+
+            # Head down is suspected if the nose is obscured OR both eyes are obscured
+            head_down_suspected = (not nose_ok) or (not left_eye_ok and not right_eye_ok)
+
+            if head_down_suspected:
                 self.low_confidence_counters[tid] = self.low_confidence_counters.get(tid, 0) + 1
                 return 'head_down' if self.low_confidence_counters[tid] >= self.HEAD_DOWN_CONSECUTIVE_FRAMES else 'focused'
             else:
                 self.low_confidence_counters[tid] = 0
 
-            inter_eye = np.linalg.norm(left_eye[:2] - right_eye[:2])
-            if inter_eye < 0.1:
-                return 'focused'
+            # If both eyes are visible, check for horizontal head rotation (yaw) or vertical tilt (pitch)
+            if left_eye_ok and right_eye_ok:
+                inter_eye = np.linalg.norm(left_eye[:2] - right_eye[:2])
+                if inter_eye > 0.1:
+                    # Yaw ratio: nose offset from eyes center, normalized by inter-eye distance
+                    eyes_center_x = (left_eye[0] + right_eye[0]) / 2.0
+                    yaw_ratio = abs(nose[0] - eyes_center_x) / inter_eye
+                    if yaw_ratio > 0.35:
+                        return 'looking_away'
 
-            drop_ratio = (nose[1] - (left_eye[1] + right_eye[1]) / 2) / inter_eye
-            if drop_ratio > 0.45:
-                return 'head_down'
+                    # Pitch (drop) ratio for head down
+                    drop_ratio = (nose[1] - (left_eye[1] + right_eye[1]) / 2) / inter_eye
+                    if drop_ratio > 0.45:
+                        return 'head_down'
 
-            x1, y1, x2, y2 = person.bbox
-            bbox_h = y2 - y1
-            if bbox_h > 10 and inter_eye < bbox_h * 0.05:
-                return 'looking_away'
+                    # Small inter-eye distance relative to bbox height indicates profile view
+                    x1, y1, x2, y2 = person.bbox
+                    bbox_h = y2 - y1
+                    if bbox_h > 10 and inter_eye < bbox_h * 0.09:
+                        return 'looking_away'
+            else:
+                # Profile view (only one eye visible but nose is visible)
+                if nose_ok:
+                    return 'looking_away'
 
             return 'focused'
         except Exception:
@@ -277,17 +290,11 @@ class TemporalBehaviorEngine:
                                 print(f'[PHONE] Person {person.track_id}: cupped-hands lap, head_down={head_is_down}')
                                 return True, 0.72
 
-                elif len(wrist_pts) == 1:
-                    # Single wrist at lap level is too ambiguous on its own (could be resting
-                    # arm, writing with one hand, etc.) — require head_down as discriminator.
-                    lone  = wrist_pts[0]
-                    other = right_wrist if _wrist_ok(left_wrist, 0.5) else left_wrist
-                    other_hidden = (
-                        other is None or len(other) < 3 or
-                        other[2] < 0.25 or (other[0] == 0.0 and other[1] == 0.0)
-                    )
-                    if lone[1] > lap_thresh and other_hidden and head_is_down and not _book_near(lone):
-                        print(f'[PHONE] Person {person.track_id}: single-hand lap + head_down')
+                # Single or both wrists at lap/desk level + head_down (no book near)
+                # This catches holding phone in one hand while the other hand is resting or visible.
+                for lone in wrist_pts:
+                    if lone[1] > lap_thresh and head_is_down and not _book_near(lone):
+                        print(f'[PHONE] Person {person.track_id}: hand at lap + head_down')
                         return True, 0.62
 
                 # Hand-to-ear (phone call posture)
@@ -354,37 +361,56 @@ class TemporalBehaviorEngine:
 
     def _calculate_motion_speed(self, person: TrackedPerson, scale_ref: float) -> float:
         """
-        Calculate normalized speed of upper body/arm keypoints (wrists, elbows, shoulders, nose).
-        Speed is in units of scale_ref (approx person height) per second.
+        Calculate normalized speed of upper body/arm keypoints (wrists, elbows, shoulders, nose)
+        by looking at displacement over multiple past frames in a window of 0.08s to 0.4s.
+        Taking the maximum speed over these comparisons prevents aliasing of periodic movements
+        while requiring dt >= 0.08s filters out high-frequency tracking jitter.
         """
         history = person.keypoint_history
         if len(history) < 2 or scale_ref <= 0:
             return 0.0
 
-        speeds = []
-        for i in range(len(history) - 1):
-            t1, kp1 = history[i]
-            t2, kp2 = history[i+1]
-            dt = t2 - t1
-            if dt <= 0.005 or dt > 0.5:
-                continue
+        t_curr, kp_curr = history[-1]
+        kps_to_check = [0, 5, 6, 7, 8, 9, 10]  # nose, shoulders, elbows, wrists
+        max_speed = 0.0
+        has_compared = False
 
-            kps_to_check = [0, 5, 6, 7, 8, 9, 10]  # nose, shoulders, elbows, wrists
-            frame_speeds = []
-            for idx in kps_to_check:
-                if idx < len(kp1) and idx < len(kp2):
-                    pt1, pt2 = kp1[idx], kp2[idx]
-                    if len(pt1) >= 3 and len(pt2) >= 3 and pt1[2] > 0.35 and pt2[2] > 0.35:
-                        if pt1[0] != 0.0 and pt2[0] != 0.0:
-                            dist = np.linalg.norm(pt1[:2] - pt2[:2])
-                            speed = dist / (scale_ref * dt)
-                            frame_speeds.append(speed)
-            if frame_speeds:
-                speeds.append(np.max(frame_speeds))
+        for t_past, kp_past in history:
+            dt = t_curr - t_past
+            if 0.08 <= dt <= 0.40:
+                has_compared = True
+                frame_speeds = []
+                for idx in kps_to_check:
+                    if idx < len(kp_curr) and idx < len(kp_past):
+                        pt_curr = kp_curr[idx]
+                        pt_past = kp_past[idx]
+                        if len(pt_curr) >= 3 and len(pt_past) >= 3 and pt_curr[2] > 0.35 and pt_past[2] > 0.35:
+                            if pt_curr[0] != 0.0 and pt_past[0] != 0.0:
+                                dist = np.linalg.norm(pt_curr[:2] - pt_past[:2])
+                                speed = dist / (scale_ref * dt)
+                                frame_speeds.append(speed)
+                if frame_speeds:
+                    max_speed = max(max_speed, np.max(frame_speeds))
 
-        if not speeds:
-            return 0.0
-        return float(np.max(speeds))
+        if not has_compared:
+            # Fallback to the oldest frame in history
+            t_past, kp_past = history[0]
+            dt = t_curr - t_past
+            if dt >= 0.08:
+                frame_speeds = []
+                for idx in kps_to_check:
+                    if idx < len(kp_curr) and idx < len(kp_past):
+                        pt_curr = kp_curr[idx]
+                        pt_past = kp_past[idx]
+                        if len(pt_curr) >= 3 and len(pt_past) >= 3 and pt_curr[2] > 0.35 and pt_past[2] > 0.35:
+                            if pt_curr[0] != 0.0 and pt_past[0] != 0.0:
+                                dist = np.linalg.norm(pt_curr[:2] - pt_past[:2])
+                                speed = dist / (scale_ref * dt)
+                                frame_speeds.append(speed)
+                if frame_speeds:
+                    max_speed = max(max_speed, np.max(frame_speeds))
+
+        return float(max_speed)
 
     def _skeleton_fight_score(self, a: 'TrackedPerson', b: 'TrackedPerson') -> float:
         """
