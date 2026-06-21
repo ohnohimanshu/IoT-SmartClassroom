@@ -86,33 +86,35 @@ class DetectionResult:
 # ── Temporal Behavior Engine ─────────────────────────────────────────────────
 class TemporalBehaviorEngine:
     # Phone detection
-    PHONE_OVERLAP_THRESHOLD      = 0.3
-    PHONE_LAP_HEIGHT_FRACTION    = 0.65   # hands below 65% of person height = lap level
+    PHONE_LAP_HEIGHT_FRACTION    = 0.60   # hands below 60% of person height = lap/desk level
     LOW_CONFIDENCE_THRESHOLD     = 0.5
-    HEAD_DOWN_CONSECUTIVE_FRAMES = 5      # ~0.5 s at 10 FPS
+    HEAD_DOWN_CONSECUTIVE_FRAMES = 3      # ~0.3 s at 10 FPS to detect head-down
 
     # Eating detection
     EATING_HAND_TO_MOUTH_THRESHOLD = 0.15
 
-    # Fight detection
-    FIGHT_PROXIMITY_RATIO     = 1.8
-    FIGHT_WRIST_PROXIMITY_RATIO = 0.4
-    FIGHT_CONFIRMATION_FRAMES = 2         # CNN confirmations before flagging
+    # Fight detection — skeleton heuristic (always available, no CNN needed)
+    FIGHT_PROXIMITY_RATIO       = 1.8    # candidate if centers within 1.8x scale_ref
+    FIGHT_WRIST_PROXIMITY_RATIO = 0.45   # wrists within 0.45x scale_ref = physical contact
+    FIGHT_SKELETON_CONFIRMS     = 2      # consecutive skeleton frames before flagging fight
+    FIGHT_CNN_CONFIRMS          = 2      # CNN confirmations before flagging fight
 
-    # Alert smoothing: require fewer consecutive frames than non-alert states
-    ALERT_CONFIRM_FRAMES  = 2            # phone/fight: 2-in-a-row to confirm
+    # Alert smoothing
+    ALERT_CONFIRM_FRAMES  = 2            # phone/fight: 2-in-a-row confirms
     NORMAL_CONFIRM_FRAMES = 3            # focused/distracted: 3-in-a-row
 
     def __init__(self):
         self.tracked_people: Dict[int, TrackedPerson] = {}
         self.cleanup_threshold = 5.0
-
         self.low_confidence_counters: Dict[int, int] = {}
 
         # Pairwise fight state
         self.fight_pairs: Dict[Tuple[int, int], Dict] = {}
         self.fight_pair_detectors: Dict[Tuple[int, int], object] = {}
         self._fight_candidate_ids: set = set()
+
+        # Skeleton-based fight confirmation counters (no CNN needed)
+        self._skeleton_fight_counters: Dict[Tuple[int, int], int] = {}
 
         self._init_fight_detector()
 
@@ -121,10 +123,12 @@ class TemporalBehaviorEngine:
             from classroom_monitor.fight_detection_3dcnn import FightDetector3DCNN
             self._fight_detector_3dcnn = FightDetector3DCNN(
                 device='auto', sequence_length=16, confidence_threshold=0.60)
+            self._cnn_available = True
             print('[BEHAVIOR] 3D CNN fight detector initializing...')
         except Exception as e:
-            print(f'[BEHAVIOR] Fight detector unavailable: {e}')
+            print(f'[BEHAVIOR] 3D CNN unavailable ({e}), using skeleton-only fight detection')
             self._fight_detector_3dcnn = None
+            self._cnn_available = False
 
     def update_person(self, track_id: int, bbox: Tuple, keypoints: Optional[np.ndarray], timestamp: float):
         if track_id not in self.tracked_people:
@@ -141,11 +145,12 @@ class TemporalBehaviorEngine:
             del self.tracked_people[tid]
             self.low_confidence_counters.pop(tid, None)
 
-        stale_pairs = [k for k in self.fight_pairs
+        stale_pairs = [k for k in list(self.fight_pairs.keys())
                        if k[0] not in self.tracked_people or k[1] not in self.tracked_people]
         for k in stale_pairs:
             self.fight_pairs.pop(k, None)
             self.fight_pair_detectors.pop(k, None)
+            self._skeleton_fight_counters.pop(k, None)
 
     # ── Head Pose ─────────────────────────────────────────────────────────────
     def _calculate_head_pose(self, person: TrackedPerson) -> str:
@@ -200,6 +205,7 @@ class TemporalBehaviorEngine:
 
         kp = person.keypoints
         book_detections = book_detections or []
+        head_is_down = (head_pose == 'head_down')
 
         def _book_near(pt) -> bool:
             for (bx1, by1, bx2, by2, _) in book_detections:
@@ -208,26 +214,35 @@ class TemporalBehaviorEngine:
                     return True
             return False
 
-        def _wrist_valid(w, min_conf=0.5) -> bool:
+        def _wrist_ok(w, min_conf=0.4) -> bool:
             return w is not None and len(w) >= 3 and w[2] >= min_conf and w[0] != 0.0
 
-        # Strategy A: object-detected phone near a wrist
+        # ── Strategy A: YOLO-detected phone object near a wrist (most reliable) ──
+        # head_down is NOT required here — a phone is a phone regardless of pose.
         if phone_detections and kp is not None and kp.size > 0 and len(kp) > 10:
             for (px1, py1, px2, py2, conf) in phone_detections:
-                if conf < 0.35:
+                if conf < 0.25:          # low floor; wrist-proximity gate filters FPs
                     continue
                 ph, pw = py2 - py1, px2 - px1
-                if max(pw, ph) / bbox_h > 0.30:
+                if max(pw, ph) / bbox_h > 0.35:   # ignore huge phone-sized rectangles (TVs etc.)
                     continue
                 pc = np.array([(px1 + px2) / 2.0, (py1 + py2) / 2.0])
                 if _book_near(pc):
                     continue
+                # Check if any wrist is near the detected phone
                 for idx in (9, 10):
                     w = kp[idx]
-                    if _wrist_valid(w) and np.linalg.norm(w[:2] - pc) / bbox_h < 0.2:
+                    if _wrist_ok(w, 0.3) and np.linalg.norm(w[:2] - pc) / bbox_h < 0.25:
+                        print(f'[PHONE] Person {person.track_id}: object near wrist, conf={conf:.2f}')
                         return True, float(conf)
+                # Even without a wrist match: if phone bbox overlaps person bbox → likely theirs
+                phone_in_bbox = (px1 >= x1 - 10 and py1 >= y1 - 10 and
+                                 px2 <= x2 + 10 and py2 <= y2 + 10)
+                if phone_in_bbox and conf >= 0.4:
+                    print(f'[PHONE] Person {person.track_id}: phone inside person bbox, conf={conf:.2f}')
+                    return True, float(conf)
 
-        # Strategy B: skeleton heuristic
+        # ── Strategy B: Skeleton heuristic ──────────────────────────────────────
         if kp is not None and kp.size > 0 and len(kp) > 10:
             try:
                 nose        = kp[0]
@@ -237,38 +252,45 @@ class TemporalBehaviorEngine:
                 right_wrist = kp[10]
                 lap_thresh  = y1 + bbox_h * self.PHONE_LAP_HEIGHT_FRACTION
 
-                nose_visible = _wrist_valid(nose, min_conf=0.8)
+                nose_ok    = _wrist_ok(nose, 0.7)
+                wrist_pts  = [w[:2] for w in (left_wrist, right_wrist) if _wrist_ok(w, 0.5)]
 
-                wrist_pts = [w[:2] for w in (left_wrist, right_wrist) if _wrist_valid(w, min_conf=0.8)]
-
-                # Guard: both hands near face → writing, not phone
-                if nose_visible and len(wrist_pts) == 2:
-                    if all(np.linalg.norm(w - nose[:2]) / bbox_h < 0.25 for w in wrist_pts):
+                # Guard: both hands up near face → writing, not phone
+                if nose_ok and len(wrist_pts) == 2:
+                    if all(np.linalg.norm(w - nose[:2]) / bbox_h < 0.22 for w in wrist_pts):
                         return False, 0.0
 
+                # Both wrists at lap/desk level, close together
+                # head_down raises confidence but is NOT a hard requirement
                 if len(wrist_pts) == 2:
-                    both_low     = all(w[1] > lap_thresh for w in wrist_pts)
-                    hands_close  = np.linalg.norm(wrist_pts[0] - wrist_pts[1]) / bbox_h < 0.25
-                    if both_low and hands_close and head_pose == 'head_down':
+                    both_low    = all(w[1] > lap_thresh for w in wrist_pts)
+                    hands_close = np.linalg.norm(wrist_pts[0] - wrist_pts[1]) / bbox_h < 0.30
+                    if both_low and hands_close:
                         if not (_book_near(wrist_pts[0]) or _book_near(wrist_pts[1])):
-                            return True, 0.6
+                            conf = 0.7 if head_is_down else 0.55
+                            print(f'[PHONE] Person {person.track_id}: cupped-hands lap, head_down={head_is_down}')
+                            return True, conf
 
                 elif len(wrist_pts) == 1:
-                    lone = wrist_pts[0]
-                    other = right_wrist if (_wrist_valid(left_wrist, 0.8)) else left_wrist
-                    other_occluded = (
+                    lone  = wrist_pts[0]
+                    other = right_wrist if _wrist_ok(left_wrist, 0.5) else left_wrist
+                    other_hidden = (
                         other is None or len(other) < 3 or
-                        other[2] < 0.3 or (other[0] == 0.0 and other[1] == 0.0)
+                        other[2] < 0.25 or (other[0] == 0.0 and other[1] == 0.0)
                     )
-                    if lone[1] > lap_thresh and other_occluded and head_pose == 'head_down' and not _book_near(lone):
-                        return True, 0.5
+                    # Single wrist at lap level + other wrist hidden
+                    # head_down not required, but raises confidence
+                    if lone[1] > lap_thresh and other_hidden and not _book_near(lone):
+                        conf = 0.6 if head_is_down else 0.45
+                        print(f'[PHONE] Person {person.track_id}: single-hand lap, head_down={head_is_down}')
+                        return True, conf
 
-                # Hand-to-ear pattern (phone call)
+                # Hand-to-ear (phone call posture)
                 ear_dists = []
                 for w in wrist_pts:
                     best = None
                     for ear in (left_ear, right_ear):
-                        if _wrist_valid(ear, 0.5):
+                        if _wrist_ok(ear, 0.4):
                             d = np.linalg.norm(w - ear[:2]) / bbox_h
                             if best is None or d < best:
                                 best = d
@@ -276,12 +298,13 @@ class TemporalBehaviorEngine:
                         ear_dists.append(best)
 
                 if ear_dists:
-                    thresh = 0.18 if len(wrist_pts) == 2 else 0.15
+                    thresh = 0.20 if len(wrist_pts) == 2 else 0.17
                     if min(ear_dists) < thresh:
-                        return True, 0.7 if len(wrist_pts) == 2 else 0.6
+                        print(f'[PHONE] Person {person.track_id}: hand-to-ear posture')
+                        return True, 0.75
 
-            except Exception:
-                pass
+            except Exception as exc:
+                print(f'[PHONE] Heuristic error: {exc}')
 
         return False, 0.0
 
@@ -324,9 +347,72 @@ class TemporalBehaviorEngine:
         if self._fight_detector_3dcnn is not None:
             self._fight_detector_3dcnn.add_frame(frame)
 
+    def _skeleton_fight_score(self, a: 'TrackedPerson', b: 'TrackedPerson') -> float:
+        """
+        Pure skeleton heuristic fight score [0..1] — works without any CNN.
+        Returns > 0 when physical-contact signals are present between person a and b.
+        """
+        ax1, ay1, ax2, ay2 = a.bbox
+        bx1, by1, bx2, by2 = b.bbox
+
+        scale_ref = max(
+            ((ay2 - ay1) + (by2 - by1)) / 2.0,
+            ((ax2 - ax1) + (bx2 - bx1)) / 2.0,
+        )
+        if scale_ref <= 0:
+            return 0.0
+
+        ca = np.array([(ax1 + ax2) / 2, (ay1 + ay2) / 2])
+        cb = np.array([(bx1 + bx2) / 2, (by1 + by2) / 2])
+        center_dist = np.linalg.norm(ca - cb) / scale_ref
+
+        boxes_overlap = not (ax2 < bx1 or bx2 < ax1 or ay2 < by1 or by2 < ay1)
+
+        score = 0.0
+
+        # Bounding-box overlap is the strongest physical-contact signal
+        if boxes_overlap:
+            score += 0.5
+        elif center_dist < self.FIGHT_PROXIMITY_RATIO:
+            score += max(0.0, (self.FIGHT_PROXIMITY_RATIO - center_dist) / self.FIGHT_PROXIMITY_RATIO) * 0.3
+
+        # Wrist proximity between the two people
+        if (a.keypoints is not None and b.keypoints is not None and
+                len(a.keypoints) > 10 and len(b.keypoints) > 10):
+            try:
+                wrist_limit = scale_ref * self.FIGHT_WRIST_PROXIMITY_RATIO
+                min_wrist_d = float('inf')
+                for ai in (9, 10):
+                    for bi in (9, 10):
+                        aw = a.keypoints[ai]
+                        bw = b.keypoints[bi]
+                        # Only use wrists with reasonable confidence
+                        if len(aw) >= 3 and len(bw) >= 3 and aw[2] > 0.2 and bw[2] > 0.2:
+                            d = np.linalg.norm(aw[:2] - bw[:2])
+                            min_wrist_d = min(min_wrist_d, d)
+                if min_wrist_d < wrist_limit:
+                    score += 0.4 * (1.0 - min_wrist_d / wrist_limit)
+                # Also check if one person's wrist is inside the other's bbox
+                for ai in (9, 10):
+                    aw = a.keypoints[ai]
+                    if len(aw) >= 3 and aw[2] > 0.2:
+                        if bx1 <= aw[0] <= bx2 and by1 <= aw[1] <= by2:
+                            score += 0.3  # A's wrist is inside B's body
+                for bi in (9, 10):
+                    bw = b.keypoints[bi]
+                    if len(bw) >= 3 and bw[2] > 0.2:
+                        if ax1 <= bw[0] <= ax2 and ay1 <= bw[1] <= ay2:
+                            score += 0.3  # B's wrist is inside A's body
+            except Exception:
+                pass
+
+        return min(score, 1.0)
+
     def _detect_fighting_pairwise(self, frame: np.ndarray) -> List[Tuple[int, int, float, Dict]]:
         """
-        Pairwise fight detection using per-pair 3D CNN instances.
+        Pairwise fight detection.
+        Primary: skeleton heuristic (always available).
+        Secondary: 3D CNN on cropped pair region (when available).
         Returns list of (person_a_id, person_b_id, confidence, fight_info).
         """
         if len(self.tracked_people) < 2:
@@ -347,10 +433,9 @@ class TemporalBehaviorEngine:
                 cb = np.array([(bx1 + bx2) / 2, (by1 + by2) / 2])
                 dist = np.linalg.norm(ca - cb)
 
-                # Use max(height, width) so seated-bbox doesn't shrink the gate
                 scale_ref = max(
                     ((ay2 - ay1) + (by2 - by1)) / 2.0,
-                    ((ax2 - ax1) + (bx2 - bx1)) / 2.0
+                    ((ax2 - ax1) + (bx2 - bx1)) / 2.0,
                 )
                 if scale_ref <= 0:
                     continue
@@ -359,37 +444,56 @@ class TemporalBehaviorEngine:
                 if dist > scale_ref * self.FIGHT_PROXIMITY_RATIO and not boxes_overlap:
                     continue
 
-                # Wrist proximity check
-                wrist_close = False
-                kp_bad = False
-                if (a.keypoints is not None and b.keypoints is not None and
-                        len(a.keypoints) > 10 and len(b.keypoints) > 10):
-                    try:
-                        wrist_limit = scale_ref * self.FIGHT_WRIST_PROXIMITY_RATIO
-                        for ai in (9, 10):
-                            for bi in (9, 10):
-                                if np.linalg.norm(a.keypoints[ai][:2] - b.keypoints[bi][:2]) < wrist_limit:
-                                    wrist_close = True
-                    except Exception:
-                        kp_bad = True
-                else:
-                    kp_bad = True
+                candidate_pairs.append((a.track_id, b.track_id, dist, scale_ref))
 
-                if wrist_close or kp_bad or boxes_overlap:
-                    candidate_pairs.append((a.track_id, b.track_id, dist))
-
-        self._fight_candidate_ids = {tid for a, b, _ in candidate_pairs for tid in (a, b)}
+        self._fight_candidate_ids = {tid for a, b, _, _ in candidate_pairs for tid in (a, b)}
 
         if candidate_pairs:
             print(f'[FIGHT] {len(candidate_pairs)} candidate pair(s): '
-                  f'{[(a, b, round(d, 1)) for a, b, d in candidate_pairs]}')
+                  f'{[(a, b, round(d, 1)) for a, b, d, _ in candidate_pairs]}')
 
-        for a_id, b_id, dist in candidate_pairs:
+        for a_id, b_id, dist, scale_ref in candidate_pairs:
             if a_id not in self.tracked_people or b_id not in self.tracked_people:
                 continue
 
-            pair_key = tuple(sorted([a_id, b_id]))
             pa, pb   = self.tracked_people[a_id], self.tracked_people[b_id]
+            pair_key = tuple(sorted([a_id, b_id]))
+
+            # ── Skeleton heuristic score (always runs) ────────────────────────
+            skel_score = self._skeleton_fight_score(pa, pb)
+            print(f'[FIGHT] pair {pair_key}: skeleton_score={skel_score:.2f}')
+
+            if pair_key not in self.fight_pairs:
+                self.fight_pairs[pair_key] = {
+                    'skel_confirms': 0,
+                    'cnn_confirms': 0,
+                    'last_skel_time': 0.0,
+                    'last_cnn_time': 0.0,
+                }
+            state = self.fight_pairs[pair_key]
+            now   = time.time()
+
+            # Skeleton path: score >= 0.5 triggers a confirmation tick
+            if skel_score >= 0.5:
+                if now - state['last_skel_time'] > 0.2:
+                    state['skel_confirms'] += 1
+                    state['last_skel_time'] = now
+
+                if state['skel_confirms'] >= self.FIGHT_SKELETON_CONFIRMS:
+                    print(f'[FIGHT] pair {pair_key}: SKELETON FIGHT confirmed! score={skel_score:.2f}')
+                    fight_results.append((a_id, b_id, min(skel_score, 0.85), {
+                        'person_a_id': a_id, 'person_b_id': b_id,
+                        'confidence': skel_score, 'trigger': 'skeleton',
+                        'distance': dist, 'confirmations': state['skel_confirms'],
+                    }))
+                    continue   # no need to also run CNN for this pair
+            else:
+                if now - state['last_skel_time'] > 1.5:
+                    state['skel_confirms'] = max(0, state['skel_confirms'] - 1)
+
+            # ── 3D CNN path (when available, used for borderline cases) ───────
+            if not self._cnn_available:
+                continue
 
             ax1, ay1, ax2, ay2 = pa.bbox
             bx1, by1, bx2, by2 = pb.bbox
@@ -410,38 +514,30 @@ class TemporalBehaviorEngine:
                     print(f'[FIGHT] Error creating pair detector: {e}')
                     continue
 
-            det = self.fight_pair_detectors[pair_key]
-            det.add_frame(crop)
+            cnn_det = self.fight_pair_detectors[pair_key]
+            cnn_det.add_frame(crop)
 
-            if pair_key not in self.fight_pairs:
-                self.fight_pairs[pair_key] = {'consecutive_detections': 0, 'last_detection_time': 0.0}
-            state = self.fight_pairs[pair_key]
-
-            if not det.is_ready():
-                print(f'[FIGHT] pair {pair_key}: buffering...')
+            if not cnn_det.is_ready():
                 continue
 
             try:
-                is_fighting, conf = det.predict()
-                print(f'[FIGHT] pair {pair_key}: conf={conf:.2f} fighting={is_fighting} '
-                      f'confirms={state["consecutive_detections"]}')
-
-                now = time.time()
+                is_fighting, conf = cnn_det.predict()
+                print(f'[FIGHT] pair {pair_key}: cnn conf={conf:.2f} fighting={is_fighting}')
                 if is_fighting and conf > 0.6:
-                    if now - state['last_detection_time'] > 0.3:
-                        state['consecutive_detections'] += 1
-                        state['last_detection_time'] = now
-                    if state['consecutive_detections'] >= self.FIGHT_CONFIRMATION_FRAMES:
+                    if now - state['last_cnn_time'] > 0.3:
+                        state['cnn_confirms'] += 1
+                        state['last_cnn_time'] = now
+                    if state['cnn_confirms'] >= self.FIGHT_CNN_CONFIRMS:
                         fight_results.append((a_id, b_id, conf, {
                             'person_a_id': a_id, 'person_b_id': b_id,
                             'confidence': conf, 'trigger': 'pairwise_3dcnn',
-                            'distance': dist, 'confirmations': state['consecutive_detections'],
+                            'distance': dist, 'confirmations': state['cnn_confirms'],
                         }))
                 else:
-                    if now - state['last_detection_time'] > 1.0:
-                        state['consecutive_detections'] = 0
+                    if now - state['last_cnn_time'] > 1.0:
+                        state['cnn_confirms'] = max(0, state['cnn_confirms'] - 1)
             except Exception as e:
-                print(f'[FIGHT] Prediction error: {e}')
+                print(f'[FIGHT] CNN error: {e}')
 
         return fight_results
 
@@ -486,33 +582,34 @@ class TemporalBehaviorEngine:
                 else:
                     person.behavior_history.append('focused' if raw_head == 'focused' else 'distracted')
 
-        # ── Temporal smoothing with faster confirmation for alert states ─────
+        # ── Temporal smoothing ────────────────────────────────────────────────
+        # Alert states (phone, fight, eating): confirm on ALERT_CONFIRM_FRAMES consecutive.
+        # Non-alert states: confirm on NORMAL_CONFIRM_FRAMES consecutive or >50% majority.
+        # Alert states CAN also win via majority — they are no longer blocked.
         final_behavior = person.last_final_behavior
         history = list(person.behavior_history)
 
-        if len(history) >= 2:
+        if len(history) >= 1:
             last = history[-1]
-            # Alert states confirm on 2-in-a-row; others need 3-in-a-row or majority
-            if last in ALERT_POSES and len(history) >= self.ALERT_CONFIRM_FRAMES:
-                if all(h == last for h in history[-self.ALERT_CONFIRM_FRAMES:]):
+
+            if last in ALERT_POSES:
+                # Alert: confirm after N consecutive frames
+                n = min(self.ALERT_CONFIRM_FRAMES, len(history))
+                if all(h == last for h in history[-n:]):
                     final_behavior = last
-            elif len(history) >= self.NORMAL_CONFIRM_FRAMES:
-                recent = history[-self.NORMAL_CONFIRM_FRAMES:]
-                if len(set(recent)) == 1:
-                    final_behavior = recent[0]
+            else:
+                # Non-alert: 3-in-a-row or majority over last 6 frames
+                if len(history) >= self.NORMAL_CONFIRM_FRAMES:
+                    recent = history[-self.NORMAL_CONFIRM_FRAMES:]
+                    if len(set(recent)) == 1:
+                        final_behavior = recent[0]
+                    else:
+                        window = history[-6:]
+                        top_label, top_count = Counter(window).most_common(1)[0]
+                        if top_count / len(window) > 0.5:
+                            final_behavior = top_label
                 else:
-                    window = history[-6:]
-                    top_label, top_count = Counter(window).most_common(1)[0]
-                    if top_count / len(window) > 0.5 and top_label not in ALERT_POSES:
-                        final_behavior = top_label
-            elif len(history) == 1:
-                raw = history[0]
-                if raw not in ALERT_POSES:
-                    final_behavior = raw
-        elif len(history) == 1:
-            raw = history[0]
-            if raw not in ALERT_POSES:
-                final_behavior = raw
+                    final_behavior = last
 
         person.last_final_behavior = final_behavior
 
