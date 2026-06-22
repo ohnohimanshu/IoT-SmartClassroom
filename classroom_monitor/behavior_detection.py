@@ -78,6 +78,10 @@ class DetectionResult:
 class TemporalBehaviorEngine:
     # Phone detection
     PHONE_LAP_HEIGHT_FRACTION    = 0.60   # hands below 60% of person height = lap/desk level
+    PHONE_CUPPED_SPREAD_MAX      = 0.14   # wrists closer than this = cupped phone (not writing)
+    PHONE_SINGLE_HAND_Y_MIN      = 0.48   # single-hand phone: wrist height band (fraction of bbox)
+    PHONE_SINGLE_HAND_Y_MAX      = 0.66
+    WRITING_DESK_Y_MIN           = 0.67   # single-hand writing: wrist on desk/notebook (lower)
     LOW_CONFIDENCE_THRESHOLD     = 0.5
     HEAD_DOWN_CONSECUTIVE_FRAMES = 3      # ~0.3 s at 10 FPS to detect head-down
 
@@ -88,10 +92,10 @@ class TemporalBehaviorEngine:
     FIGHT_PROXIMITY_RATIO       = 1.5    # candidate gate: centers within 1.5x scale_ref
     FIGHT_WRIST_CROSS_RATIO     = 0.25   # wrist-to-wrist proximity (strong contact signal)
     FIGHT_LIMB_CROSS_RATIO      = 0.32   # elbow/shoulder proximity during grappling
-    FIGHT_SKELETON_CONFIRMS     = 4      # sustained contact+motion before flagging
+    FIGHT_SKELETON_CONFIRMS     = 3      # sustained contact+motion before flagging
     FIGHT_CNN_CONFIRMS          = 2      # CNN confirmations before flagging
-    FIGHT_SCORE_THRESHOLD       = 0.72   # min skeleton score to count as a confirmation tick
-    FIGHT_CONFIRM_WINDOW_SEC    = 1.5    # grappling/contact needs slightly longer window
+    FIGHT_SCORE_THRESHOLD       = 0.68   # min skeleton score to count as a confirmation tick
+    FIGHT_CONFIRM_WINDOW_SEC    = 2.0    # grappling/contact needs slightly longer window
 
     # Alert smoothing
     ALERT_CONFIRM_FRAMES  = 2            # phone/fight: 2-in-a-row confirms
@@ -214,6 +218,13 @@ class TemporalBehaviorEngine:
         spread = np.linalg.norm(wrist_pts[0] - wrist_pts[1]) / bbox_h
         return spread > 0.28
 
+    @staticmethod
+    def _wrist_lateral_offset(wrist, x1: float, x2: float) -> float:
+        """How far a wrist is from body center, normalized by bbox width."""
+        bbox_w = max(x2 - x1, 1.0)
+        center_x = (x1 + x2) / 2.0
+        return abs(wrist[0] - center_x) / bbox_w
+
     def _head_down_like(self, person: TrackedPerson, head_pose: str) -> bool:
         """True when the student is looking down at desk/lap (writing/reading posture)."""
         if head_pose == 'head_down':
@@ -269,20 +280,42 @@ class TemporalBehaviorEngine:
         if not low_wrists:
             return False
 
-        # Single visible hand at notebook (pen writing) — most notebook FPs look like this
+        desk_y = y1 + bbox_h * self.WRITING_DESK_Y_MIN
+
+        # Single hand at desk/notebook — not the centered mid-torso phone-hold zone
         if len(wrists) == 1 or len(low_wrists) == 1:
-            return True
+            w = low_wrists[0]
+            if w[1] >= desk_y:
+                return True
+            if self._wrist_lateral_offset(w, x1, x2) > 0.14:
+                return True
+            return False
 
         if self._hands_spread_writing_posture(wrists, bbox_h):
             return True
 
-        # Two hands on lap but not cupped together → writing / holding paper
+        # Two hands on lap — writing when separated or on desk surface
         if len(low_wrists) == 2:
             spread = np.linalg.norm(low_wrists[0] - low_wrists[1]) / bbox_h
-            if spread > 0.14:
+            if spread > self.PHONE_CUPPED_SPREAD_MAX:
+                return True
+            avg_y_frac = (np.mean([w[1] for w in low_wrists]) - y1) / bbox_h
+            if avg_y_frac >= self.WRITING_DESK_Y_MIN:
                 return True
 
         return False
+
+    def _single_hand_phone_posture(self, person: TrackedPerson, head_pose: str,
+                                   wrist_pts: List[np.ndarray], bbox_h: float,
+                                   y1: float, x1: float, x2: float) -> bool:
+        """One hand in mid-torso zone, head down — typical one-handed phone use."""
+        if not self._head_down_like(person, head_pose) or len(wrist_pts) != 1:
+            return False
+        w = wrist_pts[0]
+        y_frac = (w[1] - y1) / bbox_h
+        if not (self.PHONE_SINGLE_HAND_Y_MIN <= y_frac <= self.PHONE_SINGLE_HAND_Y_MAX):
+            return False
+        return self._wrist_lateral_offset(w, x1, x2) <= 0.18
 
     def _head_down_is_writing(self, person: TrackedPerson,
                               book_detections: Optional[List[Tuple]] = None) -> bool:
@@ -334,10 +367,6 @@ class TemporalBehaviorEngine:
         def _wrist_ok(w, min_conf=0.4) -> bool:
             return w is not None and len(w) >= 3 and w[2] >= min_conf and w[0] != 0.0
 
-        # Notebook / pen writing — never classify as phone from skeleton alone
-        if self._is_writing_posture(person, head_pose, book_detections):
-            return False, 0.0
-
         # ── Strategy A: YOLO-detected phone object near a wrist (most reliable) ──
         if phone_detections and kp is not None and kp.size > 0 and len(kp) > 10:
             wrist_prox_thresh = 0.18 if head_is_down else 0.25
@@ -358,6 +387,10 @@ class TemporalBehaviorEngine:
                         print(f'[PHONE] Person {person.track_id}: object near wrist, conf={conf:.2f}')
                         return True, float(conf)
 
+        # Notebook / pen writing — blocks skeleton-only phone heuristics, not YOLO
+        if self._is_writing_posture(person, head_pose, book_detections):
+            return False, 0.0
+
         # ── Strategy B: Skeleton heuristic (cupped-hands / call posture only) ──
         if kp is not None and kp.size > 0 and len(kp) > 10:
             try:
@@ -376,15 +409,20 @@ class TemporalBehaviorEngine:
                     if all(np.linalg.norm(w - nose[:2]) / bbox_h < 0.22 for w in wrist_pts):
                         return False, 0.0
 
-                # Both wrists at lap/desk level + hands close together (cupped-phone posture)
+                # One hand mid-torso + head down — common one-handed phone use
+                if self._single_hand_phone_posture(
+                        person, head_pose, wrist_pts, bbox_h, y1, x1, x2):
+                    print(f'[PHONE] Person {person.track_id}: single-hand mid-torso, head_down')
+                    return True, 0.70
+
+                # Both wrists at lap/desk + very tight cup (phone-sized), head down
                 if len(wrist_pts) == 2:
                     both_low    = all(w[1] > lap_thresh for w in wrist_pts)
-                    hands_close = np.linalg.norm(wrist_pts[0] - wrist_pts[1]) / bbox_h < 0.28
-                    if both_low and hands_close:
-                        if self._hands_spread_writing_posture(wrist_pts, bbox_h):
-                            pass  # writing spread — not phone
-                        elif not (_book_near(wrist_pts[0]) or _book_near(wrist_pts[1])):
-                            if head_is_down:
+                    spread      = np.linalg.norm(wrist_pts[0] - wrist_pts[1]) / bbox_h
+                    hands_cupped = spread < self.PHONE_CUPPED_SPREAD_MAX
+                    if both_low and hands_cupped:
+                        if not (_book_near(wrist_pts[0]) or _book_near(wrist_pts[1])):
+                            if head_is_down or self._head_down_like(person, head_pose):
                                 print(f'[PHONE] Person {person.track_id}: cupped-hands lap, head_down={head_is_down}')
                                 return True, 0.72
 
@@ -613,8 +651,10 @@ class TemporalBehaviorEngine:
 
         # ── Grappling path (arm-wrestling / interlocked arms) ─────────────────
         if grappling_n >= 2 and overlap:
-            if grappling_n >= 3:
-                # Sustained multi-limb contact — real grappling even if motion is slow
+            if grappling_n >= 5:
+                # Sustained multi-limb interlock — strong fight signal even at moderate speed
+                score += 0.15
+            elif grappling_n >= 3 and (min_speed >= 0.20 or max_speed >= 0.35):
                 score += 0.20
             if min_speed >= 0.25 or max_speed >= 0.35:
                 score += 0.12
@@ -628,12 +668,16 @@ class TemporalBehaviorEngine:
                 score += 0.28
             elif max_speed >= 0.8:
                 score += 0.12
+            elif max_speed >= 0.55 and overlap:
+                score += 0.10
         else:
             # Single reach into neighbor — still capped below threshold unless fast
             if max_speed >= 1.6 and min_speed >= 1.2:
                 score += 0.30
             elif max_speed >= 1.3 and min_speed >= 1.0:
                 score += 0.15
+            elif overlap and max_speed >= 0.75 and min_speed >= 0.45 and grappling_n >= 2:
+                score += 0.12
             else:
                 score = min(score, 0.45)
 
@@ -681,6 +725,10 @@ class TemporalBehaviorEngine:
                 if dist > scale_ref * self.FIGHT_PROXIMITY_RATIO and not boxes_overlap:
                     continue
 
+                speed_a = self._calculate_motion_speed(a, scale_ref)
+                speed_b = self._calculate_motion_speed(b, scale_ref)
+                mutual_motion = max(speed_a, speed_b) >= 0.75 and min(speed_a, speed_b) >= 0.35
+
                 # Pre-filter: a pair only becomes a fight CANDIDATE if there is
                 # actual wrist-level evidence of contact. Two students simply
                 # seated next to each other will very often have OVERLAPPING
@@ -699,9 +747,12 @@ class TemporalBehaviorEngine:
                             or strong_prox
                             or min_d < scale_ref * self.FIGHT_WRIST_CROSS_RATIO * 1.1
                             or (overlap and grapple_n >= 1 and min_d < limb_gate)
+                            or (overlap and mutual_motion and grapple_n >= 1)
                         )
                     except Exception:
                         has_crossing = False
+                elif boxes_overlap and mutual_motion:
+                    has_crossing = True
                 if not has_crossing:
                     continue
 
@@ -755,10 +806,12 @@ class TemporalBehaviorEngine:
                     }))
                     continue
             else:
-                # Any sub-threshold frame breaks the streak immediately rather than
-                # slowly decaying — a real fight produces threshold-crossing contact
-                # repeatedly and quickly, not once every couple of seconds.
-                state['skel_confirms'] = 0
+                # Allow one borderline frame without wiping the whole streak — real
+                # fights can have brief pose-estimation dips between contact frames.
+                if skel_score >= self.FIGHT_SCORE_THRESHOLD * 0.82:
+                    pass
+                else:
+                    state['skel_confirms'] = max(0, state['skel_confirms'] - 1)
 
             # ── 3D CNN path (when available, used for borderline cases) ───────
             if not self._cnn_available:
