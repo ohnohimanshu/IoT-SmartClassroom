@@ -441,8 +441,6 @@ def _get_yolo_detector():
 
 
 def _incident_severity(det_type: str) -> str:
-    if det_type == 'fighting':
-        return 'critical'
     if det_type in ('using_phone', 'eating_food'):
         return 'high'
     if det_type in ('distracted', 'looking_away', 'head_down'):
@@ -451,8 +449,8 @@ def _incident_severity(det_type: str) -> str:
 
 
 def _save_incident_direct(det_type, confidence, snapshot_bgr, student,
-                          student_name, roll_no, camera_obj, request_obj=None,
-                          fight_info=None, description_extra=''):
+                         student_name, roll_no, camera_obj, request_obj=None,
+                         description_extra=''):
     """
     Save IncidentReport to DB and send one alert email per student per incident
     type with a 5-minute cooldown (per student, not global).
@@ -469,10 +467,6 @@ def _save_incident_direct(det_type, confidence, snapshot_bgr, student,
         severity = _incident_severity(det_type)
         tag   = f'{student_name} ({roll_no})' if student else 'Unknown person'
         label = LABEL_MAP.get(det_type, det_type)
-
-        if det_type == 'fighting' and fight_info:
-            opp_id = fight_info.get('person_b_id') if fight_info.get('person_a_id') == student else fight_info.get('person_a_id')
-            tag = f'{tag} vs student track {opp_id}' if student else f'Unknown vs track {opp_id}'
 
         desc = description_extra or f'{label} — {tag}'
 
@@ -587,7 +581,6 @@ def _generate_video_stream(video_path, camera_id=0, camera_location='Classroom',
                     roll_no      = item['roll'],
                     camera_obj   = camera_obj,
                     request_obj  = request_obj,
-                    fight_info   = item.get('fight_info'),
                 )
                 if incident is not None and item.get('cooldown_key') is not None:
                     cooldown[item['cooldown_key']] = time.time()
@@ -821,7 +814,6 @@ def _generate_video_stream(video_path, camera_id=0, camera_location='Classroom',
                                 'student':    student,
                                 'name':       name,
                                 'roll':       roll,
-                                'fight_info': det.get('fight_info'),
                                 'cooldown_key': key,
                             }
                             pending_keys.add(key)
