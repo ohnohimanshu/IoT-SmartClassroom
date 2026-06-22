@@ -420,6 +420,11 @@ def api_camera_students_encodings(request):
     if request.method != 'GET':
         return JsonResponse({'error': 'GET only'}, status=405)
 
+    from classroom_monitor.api_auth import check_detection_api_key
+    auth_err = check_detection_api_key(request)
+    if auth_err:
+        return auth_err
+
     try:
         students = (
             Student.objects

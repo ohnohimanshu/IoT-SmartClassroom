@@ -148,8 +148,9 @@ class ClassroomVideo(models.Model):
         return f"{self.title} ({self.uploaded_at.strftime('%Y-%m-%d')})"
 
     def get_thumbnail_url(self):
-        if self.thumbnail:
-            return self.thumbnail.url
+        first = self.frames.order_by('frame_number').first()
+        if first and first.frame_image:
+            return first.frame_image.url
         return '/static/classroom_monitor/images/video-placeholder.png'
 
 

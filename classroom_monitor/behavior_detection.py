@@ -10,27 +10,16 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
 
-# ── Constants ────────────────────────────────────────────────────────────────
-COLOR_MAP = {
-    'focused':     (0,  200,  60),
-    'distracted':  (0,  165, 255),
-    'using_phone': (0,    0, 220),
-    'eating_food': (0,    0, 220),
-    'fighting':    (0,    0, 255),
-    'not_visible': (120, 120, 120),
-}
-LABEL_MAP = {
-    'focused':     'Focused',
-    'distracted':  'Distracted',
-    'using_phone': 'Using Phone',
-    'eating_food': 'Eating Food',
-    'fighting':    'FIGHT',
-    'not_visible': 'Not Visible',
-}
+from classroom_monitor.constants import (
+    COLOR_MAP, LABEL_MAP, ALERT_POSES, DISTRACTED_POSES, FACE_MATCH_TOLERANCE,
+)
 
-ALERT_POSES      = {'using_phone', 'eating_food', 'fighting'}
-DISTRACTED_POSES = {'distracted'}
-FACE_MATCH_TOLERANCE = 0.52
+
+def _http_verify_ssl() -> bool:
+    """Use HTTP_VERIFY_SSL=false only for dev/self-signed camera certs."""
+    return os.environ.get('HTTP_VERIFY_SSL', 'true').strip().lower() not in (
+        'false', '0', 'no',
+    )
 
 
 # ── Environment Loading ──────────────────────────────────────────────────────
@@ -69,6 +58,7 @@ class TrackedPerson:
     last_seen: float = 0.0
     last_final_behavior: str = 'focused'
     keypoint_history: deque = field(default_factory=lambda: deque(maxlen=20))
+    last_raw_confidence: float = 0.0
 
 
 @dataclass
@@ -96,11 +86,12 @@ class TemporalBehaviorEngine:
 
     # Fight detection — skeleton heuristic (always available, no CNN needed)
     FIGHT_PROXIMITY_RATIO       = 1.5    # candidate gate: centers within 1.5x scale_ref
-    FIGHT_WRIST_CROSS_RATIO     = 0.30   # wrist inside other bbox OR within 0.30x = contact
-    FIGHT_SKELETON_CONFIRMS     = 4      # must score >= threshold for 4 ticks, close together
+    FIGHT_WRIST_CROSS_RATIO     = 0.25   # wrist-to-wrist proximity (strong contact signal)
+    FIGHT_LIMB_CROSS_RATIO      = 0.32   # elbow/shoulder proximity during grappling
+    FIGHT_SKELETON_CONFIRMS     = 4      # sustained contact+motion before flagging
     FIGHT_CNN_CONFIRMS          = 2      # CNN confirmations before flagging
-    FIGHT_SCORE_THRESHOLD       = 0.70   # min skeleton score to count as a confirmation tick
-    FIGHT_CONFIRM_WINDOW_SEC    = 1.5    # all confirmation ticks must land within this window
+    FIGHT_SCORE_THRESHOLD       = 0.72   # min skeleton score to count as a confirmation tick
+    FIGHT_CONFIRM_WINDOW_SEC    = 1.5    # grappling/contact needs slightly longer window
 
     # Alert smoothing
     ALERT_CONFIRM_FRAMES  = 2            # phone/fight: 2-in-a-row confirms
@@ -108,30 +99,23 @@ class TemporalBehaviorEngine:
 
     def __init__(self):
         self.tracked_people: Dict[int, TrackedPerson] = {}
-        self.cleanup_threshold = 5.0
+        self.cleanup_threshold = 2.0
         self.low_confidence_counters: Dict[int, int] = {}
 
         # Pairwise fight state
         self.fight_pairs: Dict[Tuple[int, int], Dict] = {}
         self.fight_pair_detectors: Dict[Tuple[int, int], object] = {}
-        self._fight_candidate_ids: set = set()
+        self._cnn_available = self._check_cnn_available()
 
-        # Skeleton-based fight confirmation counters (no CNN needed)
-        self._skeleton_fight_counters: Dict[Tuple[int, int], int] = {}
-
-        self._init_fight_detector()
-
-    def _init_fight_detector(self):
+    @staticmethod
+    def _check_cnn_available() -> bool:
         try:
             from classroom_monitor.fight_detection_3dcnn import FightDetector3DCNN
-            self._fight_detector_3dcnn = FightDetector3DCNN(
-                device='auto', sequence_length=16, confidence_threshold=0.60)
-            self._cnn_available = True
-            print('[BEHAVIOR] 3D CNN fight detector initializing...')
+            FightDetector3DCNN(device='auto', sequence_length=16)
+            return True
         except Exception as e:
-            print(f'[BEHAVIOR] 3D CNN unavailable ({e}), using skeleton-only fight detection')
-            self._fight_detector_3dcnn = None
-            self._cnn_available = False
+            print(f'[BEHAVIOR] 3D CNN unavailable ({e}), skeleton-only fight detection')
+            return False
 
     def update_person(self, track_id: int, bbox: Tuple, keypoints: Optional[np.ndarray], timestamp: float):
         if track_id not in self.tracked_people:
@@ -157,7 +141,6 @@ class TemporalBehaviorEngine:
         for k in stale_pairs:
             self.fight_pairs.pop(k, None)
             self.fight_pair_detectors.pop(k, None)
-            self._skeleton_fight_counters.pop(k, None)
 
     # ── Head Pose ─────────────────────────────────────────────────────────────
     def _calculate_head_pose(self, person: TrackedPerson) -> str:
@@ -205,12 +188,13 @@ class TemporalBehaviorEngine:
                     if bbox_h > 10 and inter_eye < bbox_h * 0.09:
                         return 'looking_away'
             else:
-                # Profile view (only one eye visible but nose is visible)
+                # One eye visible (profile/participation glance) — do not auto-flag distracted.
                 if nose_ok:
-                    return 'looking_away'
+                    return 'focused'
 
             return 'focused'
-        except Exception:
+        except Exception as exc:
+            print(f'[HEAD] pose error track {person.track_id}: {exc}')
             return 'focused'
 
     # ── Shared helpers ────────────────────────────────────────────────────────
@@ -220,6 +204,84 @@ class TemporalBehaviorEngine:
             bc = np.array([(bx1 + bx2) / 2.0, (by1 + by2) / 2.0])
             if np.linalg.norm(np.array(pt) - bc) / bbox_h < 0.25:
                 return True
+        return False
+
+    @staticmethod
+    def _hands_spread_writing_posture(wrist_pts, bbox_h: float) -> bool:
+        """Two hands low but horizontally separated — typical writing, not phone."""
+        if len(wrist_pts) != 2 or bbox_h <= 0:
+            return False
+        spread = np.linalg.norm(wrist_pts[0] - wrist_pts[1]) / bbox_h
+        return spread > 0.28
+
+    def _head_down_like(self, person: TrackedPerson, head_pose: str) -> bool:
+        """True when the student is looking down at desk/lap (writing/reading posture)."""
+        if head_pose == 'head_down':
+            return True
+        kp = person.keypoints
+        if kp is None or len(kp) < 3:
+            return False
+        try:
+            nose, left_eye, right_eye = kp[0], kp[1], kp[2]
+            if (len(nose) >= 3 and len(left_eye) >= 3 and len(right_eye) >= 3 and
+                    nose[2] >= 0.4 and left_eye[2] >= 0.4 and right_eye[2] >= 0.4):
+                inter_eye = np.linalg.norm(left_eye[:2] - right_eye[:2])
+                if inter_eye > 0.1:
+                    drop_ratio = (nose[1] - (left_eye[1] + right_eye[1]) / 2) / inter_eye
+                    return drop_ratio > 0.35
+        except Exception:
+            pass
+        return False
+
+    def _is_writing_posture(self, person: TrackedPerson,
+                            head_pose: str = '',
+                            book_detections: Optional[List[Tuple]] = None) -> bool:
+        """
+        Skeleton-only writing/reading at desk or notebook on lap.
+        Covers the common case: head down, one hand with pen, notebook not detected by YOLO.
+        """
+        book_detections = book_detections or []
+        if self._head_down_is_writing(person, book_detections):
+            return True
+
+        if not head_pose:
+            head_pose = self._calculate_head_pose(person)
+        if not self._head_down_like(person, head_pose):
+            return False
+
+        kp = person.keypoints
+        x1, y1, x2, y2 = person.bbox
+        bbox_h = y2 - y1
+        if kp is None or kp.size == 0 or len(kp) <= 10 or bbox_h <= 0:
+            return False
+
+        lap_thresh = y1 + bbox_h * 0.52   # notebook-on-lap zone (above strict phone lap line)
+        wrists = []
+        for idx in (9, 10):
+            w = kp[idx]
+            if len(w) >= 3 and w[2] >= 0.35 and w[0] != 0.0:
+                wrists.append(w[:2])
+
+        if not wrists:
+            return False
+
+        low_wrists = [w for w in wrists if w[1] > lap_thresh]
+        if not low_wrists:
+            return False
+
+        # Single visible hand at notebook (pen writing) — most notebook FPs look like this
+        if len(wrists) == 1 or len(low_wrists) == 1:
+            return True
+
+        if self._hands_spread_writing_posture(wrists, bbox_h):
+            return True
+
+        # Two hands on lap but not cupped together → writing / holding paper
+        if len(low_wrists) == 2:
+            spread = np.linalg.norm(low_wrists[0] - low_wrists[1]) / bbox_h
+            if spread > 0.14:
+                return True
+
         return False
 
     def _head_down_is_writing(self, person: TrackedPerson,
@@ -242,6 +304,14 @@ class TemporalBehaviorEngine:
                     points.append(w[:2])
         if not points:
             return False
+        if kp is not None and len(kp) > 10:
+            wrists = []
+            for idx in (9, 10):
+                w = kp[idx]
+                if len(w) >= 3 and w[2] >= 0.3 and w[0] != 0.0:
+                    wrists.append(w[:2])
+            if self._hands_spread_writing_posture(wrists, bbox_h):
+                return True
         return any(self._point_near_book(pt, bbox_h, book_detections) for pt in points)
 
     # ── Phone Detection ───────────────────────────────────────────────────────
@@ -264,11 +334,16 @@ class TemporalBehaviorEngine:
         def _wrist_ok(w, min_conf=0.4) -> bool:
             return w is not None and len(w) >= 3 and w[2] >= min_conf and w[0] != 0.0
 
+        # Notebook / pen writing — never classify as phone from skeleton alone
+        if self._is_writing_posture(person, head_pose, book_detections):
+            return False, 0.0
+
         # ── Strategy A: YOLO-detected phone object near a wrist (most reliable) ──
-        # head_down is NOT required here — a phone is a phone regardless of pose.
         if phone_detections and kp is not None and kp.size > 0 and len(kp) > 10:
+            wrist_prox_thresh = 0.18 if head_is_down else 0.25
+            min_phone_conf = 0.50 if head_is_down else 0.25
             for (px1, py1, px2, py2, conf) in phone_detections:
-                if conf < 0.25:          # low floor; wrist-proximity gate filters FPs
+                if conf < min_phone_conf:
                     continue
                 ph, pw = py2 - py1, px2 - px1
                 if max(pw, ph) / bbox_h > 0.35:   # ignore huge phone-sized rectangles (TVs etc.)
@@ -279,17 +354,11 @@ class TemporalBehaviorEngine:
                 # Check if any wrist is near the detected phone
                 for idx in (9, 10):
                     w = kp[idx]
-                    if _wrist_ok(w, 0.3) and np.linalg.norm(w[:2] - pc) / bbox_h < 0.25:
+                    if _wrist_ok(w, 0.3) and np.linalg.norm(w[:2] - pc) / bbox_h < wrist_prox_thresh:
                         print(f'[PHONE] Person {person.track_id}: object near wrist, conf={conf:.2f}')
                         return True, float(conf)
-                # Even without a wrist match: if phone bbox overlaps person bbox → likely theirs
-                phone_in_bbox = (px1 >= x1 - 10 and py1 >= y1 - 10 and
-                                 px2 <= x2 + 10 and py2 <= y2 + 10)
-                if phone_in_bbox and conf >= 0.4:
-                    print(f'[PHONE] Person {person.track_id}: phone inside person bbox, conf={conf:.2f}')
-                    return True, float(conf)
 
-        # ── Strategy B: Skeleton heuristic ──────────────────────────────────────
+        # ── Strategy B: Skeleton heuristic (cupped-hands / call posture only) ──
         if kp is not None and kp.size > 0 and len(kp) > 10:
             try:
                 nose        = kp[0]
@@ -308,40 +377,35 @@ class TemporalBehaviorEngine:
                         return False, 0.0
 
                 # Both wrists at lap/desk level + hands close together (cupped-phone posture)
-                # Does NOT require head_down: two hands together at lap is distinctive enough.
                 if len(wrist_pts) == 2:
                     both_low    = all(w[1] > lap_thresh for w in wrist_pts)
                     hands_close = np.linalg.norm(wrist_pts[0] - wrist_pts[1]) / bbox_h < 0.28
                     if both_low and hands_close:
-                        if not (_book_near(wrist_pts[0]) or _book_near(wrist_pts[1])):
+                        if self._hands_spread_writing_posture(wrist_pts, bbox_h):
+                            pass  # writing spread — not phone
+                        elif not (_book_near(wrist_pts[0]) or _book_near(wrist_pts[1])):
                             if head_is_down:
                                 print(f'[PHONE] Person {person.track_id}: cupped-hands lap, head_down={head_is_down}')
                                 return True, 0.72
 
-                # Single or both wrists at lap/desk level + head_down (no book near)
-                # This catches holding phone in one hand while the other hand is resting or visible.
-                for lone in wrist_pts:
-                    if lone[1] > lap_thresh and head_is_down and not _book_near(lone):
-                        print(f'[PHONE] Person {person.track_id}: hand at lap + head_down')
-                        return True, 0.62
+                # Hand-to-ear (phone call) — not when head is down reading/writing
+                if head_pose != 'head_down':
+                    ear_dists = []
+                    for w in wrist_pts:
+                        best = None
+                        for ear in (left_ear, right_ear):
+                            if _wrist_ok(ear, 0.4):
+                                d = np.linalg.norm(w - ear[:2]) / bbox_h
+                                if best is None or d < best:
+                                    best = d
+                        if best is not None:
+                            ear_dists.append(best)
 
-                # Hand-to-ear (phone call posture)
-                ear_dists = []
-                for w in wrist_pts:
-                    best = None
-                    for ear in (left_ear, right_ear):
-                        if _wrist_ok(ear, 0.4):
-                            d = np.linalg.norm(w - ear[:2]) / bbox_h
-                            if best is None or d < best:
-                                best = d
-                    if best is not None:
-                        ear_dists.append(best)
-
-                if ear_dists:
-                    thresh = 0.20 if len(wrist_pts) == 2 else 0.17
-                    if min(ear_dists) < thresh:
-                        print(f'[PHONE] Person {person.track_id}: hand-to-ear posture')
-                        return True, 0.75
+                    if ear_dists:
+                        thresh = 0.20 if len(wrist_pts) == 2 else 0.17
+                        if min(ear_dists) < thresh:
+                            print(f'[PHONE] Person {person.track_id}: hand-to-ear posture')
+                            return True, 0.75
 
             except Exception as exc:
                 print(f'[PHONE] Heuristic error: {exc}')
@@ -378,14 +442,91 @@ class TemporalBehaviorEngine:
                         if len(w) >= 3 and w[2] >= 0.8 and w[0] != 0.0:
                             if np.linalg.norm(w[:2] - nose[:2]) / bbox_h < self.EATING_HAND_TO_MOUTH_THRESHOLD:
                                 return True, best_food_conf
-        except Exception:
-            pass
+        except Exception as exc:
+            print(f'[EATING] error track {person.track_id}: {exc}')
         return False, 0.0
 
-    # ── Fight Detection ───────────────────────────────────────────────────────
-    def add_frame_for_fight_detection(self, frame: np.ndarray):
-        if self._fight_detector_3dcnn is not None:
-            self._fight_detector_3dcnn.add_frame(frame)
+    def _limb_contact_evidence(self, a: 'TrackedPerson', b: 'TrackedPerson',
+                               scale_ref: float) -> Tuple[float, bool, float, int, bool]:
+        """
+        Returns (contact_score, strong_wrist_proximity, min_limb_distance,
+                 grappling_contacts, boxes_overlap).
+
+        Grappling (arm-wrestling, interlocked arms) uses wrists AND elbows —
+        wrist-only checks miss most real fights in classroom footage.
+        """
+        ax1, ay1, ax2, ay2 = a.bbox
+        bx1, by1, bx2, by2 = b.bbox
+        center_a = np.array([(ax1 + ax2) / 2.0, (ay1 + ay2) / 2.0])
+        center_b = np.array([(bx1 + bx2) / 2.0, (by1 + by2) / 2.0])
+
+        boxes_overlap = not (ax2 < bx1 or bx2 < ax1 or ay2 < by1 or by2 < ay1)
+
+        wrist_limit = scale_ref * self.FIGHT_WRIST_CROSS_RATIO
+        limb_limit = scale_ref * self.FIGHT_LIMB_CROSS_RATIO
+        contact_score = 0.0
+        strong_wrist = False
+        min_limb_d = float('inf')
+        grappling_contacts = 0
+
+        if (a.keypoints is None or b.keypoints is None or
+                len(a.keypoints) <= 10 or len(b.keypoints) <= 10):
+            return 0.0, False, min_limb_d, 0, boxes_overlap
+
+        # COCO: 5/6 shoulder, 7/8 elbow, 9/10 wrist
+        a_limbs = [(9, 0.35), (10, 0.35), (7, 0.30), (8, 0.30)]
+        b_limbs = [(9, 0.35), (10, 0.35), (7, 0.30), (8, 0.30)]
+
+        try:
+            for ai, a_min_conf in a_limbs:
+                aw = a.keypoints[ai]
+                if len(aw) < 3 or aw[2] < a_min_conf:
+                    continue
+                limit = wrist_limit if ai >= 9 else limb_limit
+
+                for bi, b_min_conf in b_limbs:
+                    bw = b.keypoints[bi]
+                    if len(bw) < 3 or bw[2] < b_min_conf:
+                        continue
+                    d = np.linalg.norm(aw[:2] - bw[:2])
+                    min_limb_d = min(min_limb_d, d)
+                    if d >= limit:
+                        continue
+
+                    grappling_contacts += 1
+                    if ai >= 9 and bi >= 9:
+                        contact_score += 0.35
+                        strong_wrist = True
+                    elif ai >= 9 or bi >= 9:
+                        # wrist-to-elbow / wrist-to-wrist across people — arm wrestling
+                        contact_score += 0.28
+                    else:
+                        contact_score += 0.18
+
+                # Limb projecting into the other person's bbox (reach/grab)
+                if bx1 <= aw[0] <= bx2 and by1 <= aw[1] <= by2:
+                    if np.linalg.norm(aw[:2] - center_b) < np.linalg.norm(aw[:2] - center_a) * 0.9:
+                        grappling_contacts += 1
+                        contact_score += 0.12
+
+            for bi, b_min_conf in b_limbs:
+                bw = b.keypoints[bi]
+                if len(bw) < 3 or bw[2] < b_min_conf:
+                    continue
+                if ax1 <= bw[0] <= ax2 and ay1 <= bw[1] <= ay2:
+                    if np.linalg.norm(bw[:2] - center_a) < np.linalg.norm(bw[:2] - center_b) * 0.9:
+                        grappling_contacts += 1
+                        contact_score += 0.12
+
+        except Exception as exc:
+            print(f'[FIGHT] limb contact error: {exc}')
+
+        return min(contact_score, 0.85), strong_wrist, min_limb_d, grappling_contacts, boxes_overlap
+
+    def _wrist_contact_evidence(self, a, b, scale_ref):
+        """Backward-compatible wrapper."""
+        score, strong, min_d, _, _ = self._limb_contact_evidence(a, b, scale_ref)
+        return score, strong, min_d
 
     def _calculate_motion_speed(self, person: TrackedPerson, scale_ref: float) -> float:
         """
@@ -442,11 +583,8 @@ class TemporalBehaviorEngine:
 
     def _skeleton_fight_score(self, a: 'TrackedPerson', b: 'TrackedPerson') -> float:
         """
-        Skeleton-only fight score in [0, 1]. Requires REAL wrist-contact evidence
-        AND high-velocity motion together. Motion alone (vulnerable to pose-
-        estimation jitter) or proximity/overlap alone (true of any two students
-        sitting next to each other) can never cross the fight threshold on their
-        own — both signals must agree.
+        Skeleton fight score in [0, 1]. Uses wrist + elbow contact (grappling)
+        and mutual upper-body motion. Passing paper still stays below threshold.
         """
         ax1, ay1, ax2, ay2 = a.bbox
         bx1, by1, bx2, by2 = b.bbox
@@ -458,79 +596,53 @@ class TemporalBehaviorEngine:
         if scale_ref <= 0:
             return 0.0
 
-        center_a = np.array([(ax1 + ax2) / 2.0, (ay1 + ay2) / 2.0])
-        center_b = np.array([(bx1 + bx2) / 2.0, (by1 + by2) / 2.0])
-
-        boxes_overlap = not (ax2 < bx1 or bx2 < ax1 or ay2 < by1 or by2 < ay1)
-
-        # Calculate motion speeds (used only AFTER contact is established below)
         speed_a = self._calculate_motion_speed(a, scale_ref)
         speed_b = self._calculate_motion_speed(b, scale_ref)
         max_speed = max(speed_a, speed_b)
+        min_speed = min(speed_a, speed_b)
 
-        # ── Contact evidence (required) ────────────────────────────────────
-        contact_score = 0.0
-        if (a.keypoints is not None and b.keypoints is not None and
-                len(a.keypoints) > 10 and len(b.keypoints) > 10):
-            try:
-                wrist_cross_limit = scale_ref * self.FIGHT_WRIST_CROSS_RATIO
-                min_wrist_d = float('inf')
-
-                for ai in (9, 10):
-                    aw = a.keypoints[ai]
-                    if len(aw) >= 3 and aw[2] > 0.3:
-                        if bx1 <= aw[0] <= bx2 and by1 <= aw[1] <= by2:
-                            dist_to_own = np.linalg.norm(aw[:2] - center_a)
-                            dist_to_other = np.linalg.norm(aw[:2] - center_b)
-                            if dist_to_other < dist_to_own:
-                                contact_score += 0.30
-                        for bi in (9, 10):
-                            bw = b.keypoints[bi]
-                            if len(bw) >= 3 and bw[2] > 0.3:
-                                d = np.linalg.norm(aw[:2] - bw[:2])
-                                min_wrist_d = min(min_wrist_d, d)
-
-                for bi in (9, 10):
-                    bw = b.keypoints[bi]
-                    if len(bw) >= 3 and bw[2] > 0.3:
-                        if ax1 <= bw[0] <= ax2 and ay1 <= bw[1] <= ay2:
-                            dist_to_own = np.linalg.norm(bw[:2] - center_b)
-                            dist_to_other = np.linalg.norm(bw[:2] - center_a)
-                            if dist_to_other < dist_to_own:
-                                contact_score += 0.30
-
-                if min_wrist_d < wrist_cross_limit:
-                    contact_score += 0.15
-
-            except Exception:
-                pass
+        contact_score, strong_wrist, min_limb_d, grappling_n, overlap = (
+            self._limb_contact_evidence(a, b, scale_ref))
 
         if contact_score <= 0.0:
-            # No physical contact evidence at all -> this cannot be scored as a
-            # fight no matter how "fast" the keypoints appear to be moving.
-            # Two people simply standing/sitting close (bbox overlap) with no
-            # hand contact is the normal classroom case, not a fight.
             print(f"[FIGHT-SKEL] Pair {a.track_id}-{b.track_id}: no contact evidence, "
                   f"speeds=({speed_a:.2f}, {speed_b:.2f}) -> score=0.00")
             return 0.0
 
-        score = min(contact_score, 0.55)
+        score = min(contact_score, 0.60)
 
-        # Motion only adds to the score once contact evidence already exists.
-        if max_speed >= 1.5:
-            score += 0.45
-        elif max_speed >= 1.0:
-            score += 0.25
-        elif max_speed >= 0.6:
-            score += 0.10
+        # ── Grappling path (arm-wrestling / interlocked arms) ─────────────────
+        if grappling_n >= 2 and overlap:
+            if grappling_n >= 3:
+                # Sustained multi-limb contact — real grappling even if motion is slow
+                score += 0.20
+            if min_speed >= 0.25 or max_speed >= 0.35:
+                score += 0.12
+            if min_speed >= 0.45 and max_speed >= 0.65:
+                score += 0.15
 
-        # Static/slow contact (e.g. resting a hand on a desk near a neighbor)
-        # is capped well below the fight threshold.
-        if max_speed < 0.6:
+        elif strong_wrist:
+            if max_speed >= 1.5 and min_speed >= 0.8:
+                score += 0.45
+            elif max_speed >= 1.2 and min_speed >= 0.6:
+                score += 0.28
+            elif max_speed >= 0.8:
+                score += 0.12
+        else:
+            # Single reach into neighbor — still capped below threshold unless fast
+            if max_speed >= 1.6 and min_speed >= 1.2:
+                score += 0.30
+            elif max_speed >= 1.3 and min_speed >= 1.0:
+                score += 0.15
+            else:
+                score = min(score, 0.45)
+
+        if max_speed < 0.35 and grappling_n < 2:
             score = min(score, 0.35)
 
         print(f"[FIGHT-SKEL] Pair {a.track_id}-{b.track_id}: contact={contact_score:.2f}, "
-              f"overlap={boxes_overlap}, speeds=({speed_a:.2f}, {speed_b:.2f}), score={score:.2f}")
+              f"grapple={grappling_n}, overlap={overlap}, min_limb_d={min_limb_d:.1f}, "
+              f"speeds=({speed_a:.2f}, {speed_b:.2f}), score={score:.2f}")
 
         return min(score, 1.0)
 
@@ -542,7 +654,6 @@ class TemporalBehaviorEngine:
         Returns list of (person_a_id, person_b_id, confidence, fight_info).
         """
         if len(self.tracked_people) < 2:
-            self._fight_candidate_ids = set()
             return []
 
         people = list(self.tracked_people.values())
@@ -580,30 +691,21 @@ class TemporalBehaviorEngine:
                 if (a.keypoints is not None and b.keypoints is not None and
                         len(a.keypoints) > 10 and len(b.keypoints) > 10):
                     try:
-                        contact_margin = scale_ref * self.FIGHT_WRIST_CROSS_RATIO
-                        for ai in (9, 10):
-                            aw = a.keypoints[ai]
-                            if len(aw) >= 3 and aw[2] > 0.3:
-                                if bx1 <= aw[0] <= bx2 and by1 <= aw[1] <= by2:
-                                    has_crossing = True
-                                for bi in (9, 10):
-                                    bw = b.keypoints[bi]
-                                    if len(bw) >= 3 and bw[2] > 0.3:
-                                        if np.linalg.norm(aw[:2] - bw[:2]) < contact_margin:
-                                            has_crossing = True
-                        for bi in (9, 10):
-                            bw = b.keypoints[bi]
-                            if len(bw) >= 3 and bw[2] > 0.3:
-                                if ax1 <= bw[0] <= ax2 and ay1 <= bw[1] <= ay2:
-                                    has_crossing = True
+                        _, strong_prox, min_d, grapple_n, overlap = (
+                            self._limb_contact_evidence(a, b, scale_ref))
+                        limb_gate = scale_ref * self.FIGHT_LIMB_CROSS_RATIO * 1.15
+                        has_crossing = (
+                            grapple_n >= 2
+                            or strong_prox
+                            or min_d < scale_ref * self.FIGHT_WRIST_CROSS_RATIO * 1.1
+                            or (overlap and grapple_n >= 1 and min_d < limb_gate)
+                        )
                     except Exception:
-                        has_crossing = False  # unknown -> do NOT default to "keep"
+                        has_crossing = False
                 if not has_crossing:
                     continue
 
                 candidate_pairs.append((a.track_id, b.track_id, dist, scale_ref))
-
-        self._fight_candidate_ids = {tid for a, b, _, _ in candidate_pairs for tid in (a, b)}
 
         if candidate_pairs:
             print(f'[FIGHT] {len(candidate_pairs)} candidate pair(s): '
@@ -682,6 +784,9 @@ class TemporalBehaviorEngine:
                     continue
 
             cnn_det = self.fight_pair_detectors[pair_key]
+            if not cnn_det.detection_available:
+                continue
+
             cnn_det.add_frame(crop)
 
             if not cnn_det.is_ready():
@@ -723,6 +828,7 @@ class TemporalBehaviorEngine:
 
         person = self.tracked_people[track_id]
         fight_detected, fight_confidence, fight_info = False, 0.0, None
+        raw_confidence = person.last_raw_confidence
 
         if fight_override is not None:
             fight_detected, fight_confidence, fight_info = fight_override
@@ -735,6 +841,7 @@ class TemporalBehaviorEngine:
         # ── Append raw behavior to history ──────────────────────────────────
         if fight_detected:
             person.behavior_history.append('fighting')
+            raw_confidence = fight_confidence
         else:
             # IMPORTANT: merely being a "fight candidate" (i.e. within proximity
             # of another tracked person — true for almost every student in a
@@ -748,17 +855,22 @@ class TemporalBehaviorEngine:
             is_phone, phone_conf = self._detect_phone_usage(person, phone_detections, raw_head, book_detections)
             if is_phone:
                 person.behavior_history.append('using_phone')
+                raw_confidence = phone_conf
             else:
-                is_eating, _ = self._detect_eating(person, food_detections)
+                is_eating, eat_conf = self._detect_eating(person, food_detections)
                 if is_eating:
                     person.behavior_history.append('eating_food')
-                elif raw_head == 'head_down' and self._head_down_is_writing(person, book_detections):
-                    # Head-down + a book/notebook near the hands/face is normal
-                    # writing/reading, not "distraction". Without this check a
-                    # student taking notes gets mislabeled as distracted.
+                    raw_confidence = eat_conf
+                elif (raw_head == 'head_down' or self._head_down_like(person, raw_head)) and (
+                        self._is_writing_posture(person, raw_head, book_detections)):
+                    # Head-down writing / reading at notebook — normal classroom work
                     person.behavior_history.append('focused')
+                    raw_confidence = 0.85
                 else:
                     person.behavior_history.append('focused' if raw_head == 'focused' else 'distracted')
+                    raw_confidence = 0.75 if raw_head == 'focused' else 0.65
+
+        person.last_raw_confidence = raw_confidence
 
         # ── Temporal smoothing ────────────────────────────────────────────────
         # Alert states (phone, fight, eating): confirm on ALERT_CONFIRM_FRAMES consecutive.
@@ -793,10 +905,11 @@ class TemporalBehaviorEngine:
 
         # ── Build result ─────────────────────────────────────────────────────
         if final_behavior == 'fighting':
-            confidence = fight_confidence or 0.8
+            confidence = fight_confidence or raw_confidence or 0.8
             is_alert, is_distracted = True, False
         else:
-            confidence = 0.8
+            confidence = raw_confidence if final_behavior == person.behavior_history[-1] else person.last_raw_confidence
+            confidence = confidence or 0.75
             is_alert     = final_behavior in ALERT_POSES
             is_distracted = final_behavior in DISTRACTED_POSES
 
@@ -811,6 +924,26 @@ class TemporalBehaviorEngine:
             track_id=track_id,
             fight_info=fight_info if final_behavior == 'fighting' else None,
         )
+
+
+# ── Shared YOLO models (one load per process) ────────────────────────────────
+class _SharedYOLOModels:
+    _lock = threading.Lock()
+    _pose_model = None
+    _object_model = None
+
+    @classmethod
+    def get(cls):
+        with cls._lock:
+            if cls._pose_model is None:
+                try:
+                    from ultralytics import YOLO
+                    cls._pose_model = YOLO('yolo11s-pose.pt')
+                    cls._object_model = YOLO('yolo11s.pt')
+                    print('[OK] Shared YOLO pose + object models loaded')
+                except Exception as e:
+                    print(f'[WARN] Shared YOLO model load failed: {e}')
+            return cls._pose_model, cls._object_model
 
 
 # ── Production Stream Processor ──────────────────────────────────────────────
@@ -836,16 +969,14 @@ class ProductionStreamProcessor:
         self.food_detections:  List[Tuple] = []
         self.person_tracks: List[Tuple] = []
         self.behavior_engine = TemporalBehaviorEngine()
-        self._load_models()
+        self._ensure_models()
+
+    def _ensure_models(self):
+        self.yolo_model, self.object_model = _SharedYOLOModels.get()
 
     def _load_models(self):
-        try:
-            from ultralytics import YOLO
-            self.yolo_model   = YOLO('yolo11s-pose.pt')
-            self.object_model = YOLO('yolo11s.pt')
-            print('[OK] Pose + object detection models loaded')
-        except Exception as e:
-            print(f'[WARN] Model load failed: {e}')
+        """Backward-compatible alias."""
+        self._ensure_models()
 
     def _capture_frames(self, camera_url: str):
         cap, reconnect_delay = None, 1.0
@@ -882,7 +1013,8 @@ class ProductionStreamProcessor:
                 frame, ts = None, now
                 with self.lock:
                     if self.frame_buffer:
-                        ts, frame = self.frame_buffer.pop()
+                        ts, frame = self.frame_buffer[-1]
+                        self.frame_buffer.clear()
                 if frame is not None:
                     self._process_single_frame(frame, ts)
                     last_t = now
@@ -941,14 +1073,14 @@ class ProductionStreamProcessor:
         return tracks
 
     def _run_behavior_evaluation(self, frame, person_tracks, phone_dets, food_dets, book_dets, timestamp):
-        """Update engine, run fight detection once, evaluate all persons."""
+        """Update engine, run fight detection once, evaluate current-frame persons."""
+        active_tids = set()
         for tid, x1, y1, x2, y2, conf, kp in person_tracks:
+            active_tids.add(tid)
             self.behavior_engine.update_person(tid, (x1, y1, x2, y2), kp, timestamp)
 
-        self.behavior_engine.add_frame_for_fight_detection(frame)
         self.behavior_engine.cleanup_stale(timestamp)
 
-        # Fight detection runs once per frame
         fight_results = self.behavior_engine._detect_fighting_pairwise(frame)
         fight_map = {}
         for a_id, b_id, conf, info in fight_results:
@@ -956,7 +1088,9 @@ class ProductionStreamProcessor:
             fight_map[b_id] = (conf, info)
 
         results = []
-        for tid in self.behavior_engine.tracked_people:
+        for tid in active_tids:
+            if tid not in self.behavior_engine.tracked_people:
+                continue
             f_conf, f_info = fight_map.get(tid, (0.0, None))
             override = (tid in fight_map, f_conf, f_info) if tid in fight_map else None
             results.append(self.behavior_engine.evaluate_person(
@@ -1007,65 +1141,74 @@ class ClassroomBehaviorDetector:
                  whatsapp_admin=None):
         self.camera_url      = camera_url
         self.camera_id       = camera_id
-        self.server_url      = server_url
+        self.server_url      = server_url.rstrip('/')
         self.alert_cooldown  = alert_cooldown
         self.whatsapp_admin  = whatsapp_admin or os.environ.get('ADMIN_WHATSAPP', '')
-        self.yolo_model      = None
-        self.face_recognizer = None
+        self._face_recognizer = None
         self.known_students  = []
         self.last_alert_time: dict = defaultdict(float)
         self.running         = False
         self.thread          = None
-        self._detect_engine  = TemporalBehaviorEngine()
         self.processor       = ProductionStreamProcessor(process_fps=10)
-        self._load_models()
+        self._api_key        = os.environ.get('DETECTION_API_KEY', '').strip()
 
-    def _load_models(self):
+    @property
+    def behavior_engine(self):
+        return self.processor.behavior_engine
+
+    @property
+    def yolo_model(self):
+        return self.processor.yolo_model
+
+    @property
+    def object_model(self):
+        return self.processor.object_model
+
+    def _init_face_recognition(self):
+        """Load student encodings once — DB direct when Django is up, else HTTP."""
+        if self._face_recognizer is not None:
+            return
         try:
-            from ultralytics import YOLO
-            self.yolo_model   = YOLO('yolo11s-pose.pt')
-            self.object_model = YOLO('yolo11s.pt')
-            print('[OK] Models loaded')
+            from classroom_monitor.face_recognition_helper import StudentFaceRecognizer
+            rec = StudentFaceRecognizer()
+            rec.load_from_db()
+            if rec._known_encodings:
+                self._face_recognizer = rec
+                print(f'[OK] Face recognition: {len(rec._known_encodings)} encodings from DB')
+                return
         except Exception as e:
-            print(f'[WARN] YOLO: {e}')
-            self.yolo_model = self.object_model = None
+            print(f'[WARN] DB face encodings unavailable ({e}), trying HTTP')
 
-    def _load_known_students(self):
+        self._load_known_students_http()
+
+    def _load_known_students_http(self):
         import requests as _req
+        url = f'{self.server_url}/camera-attendance/api/students/encodings/'
+        headers = {}
+        if self._api_key:
+            headers['X-Detection-API-Key'] = self._api_key
         try:
-            r = _req.get(f'{self.server_url}/api/students/encodings/', timeout=5, verify=False)
+            r = _req.get(url, timeout=5, verify=_http_verify_ssl(), headers=headers)
+            r.raise_for_status()
             self.known_students = r.json()
-            print(f'[OK] {len(self.known_students)} student encodings loaded')
+            print(f'[OK] {len(self.known_students)} student encodings loaded via HTTP')
         except Exception as e:
             print(f'[WARN] Could not load students: {e}')
+            self.known_students = []
 
     def detect(self, frame) -> List[Dict]:
         """Detect behaviors in a single frame. Returns list of detection dicts."""
-        if self.yolo_model is None:
+        if self.processor.yolo_model is None:
             return []
         try:
             timestamp     = time.time()
             person_tracks = self.processor._parse_pose_detections(frame)
             phone_dets, food_dets, book_dets = self.processor._parse_object_detections(frame)
-
-            for tid, x1, y1, x2, y2, conf, kp in person_tracks:
-                self._detect_engine.update_person(tid, (x1, y1, x2, y2), kp, timestamp)
-            self._detect_engine.cleanup_stale(timestamp)
-            self._detect_engine.add_frame_for_fight_detection(frame)
-
-            fight_results = self._detect_engine._detect_fighting_pairwise(frame)
-            fight_map = {}
-            for a_id, b_id, conf, info in fight_results:
-                fight_map[a_id] = (conf, info)
-                fight_map[b_id] = (conf, info)
+            results = self.processor._run_behavior_evaluation(
+                frame, person_tracks, phone_dets, food_dets, book_dets, timestamp)
 
             detections = []
-            for tid in self._detect_engine.tracked_people:
-                f_conf, f_info = fight_map.get(tid, (0.0, None))
-                override = (tid in fight_map, f_conf, f_info) if tid in fight_map else None
-                det = self._detect_engine.evaluate_person(
-                    tid, phone_dets, food_dets, frame=None,
-                    fight_override=override, book_detections=book_dets)
+            for det in results:
                 d = {
                     'type': det.type, 'bbox': det.bbox, 'confidence': det.confidence,
                     'color': det.color, 'label': det.label,
@@ -1119,31 +1262,43 @@ class ClassroomBehaviorDetector:
                     'snapshot': snap_b64, 'student_name': student_name,
                     'roll_no': roll_no,
                     'description': f"{sev} {detection['label']} — {tag}",
-                    'send_whatsapp': detection['is_alert'],
                 },
-                timeout=10, verify=False)
+                headers={'X-Detection-API-Key': self._api_key} if self._api_key else {},
+                timeout=10, verify=_http_verify_ssl())
             print(f"[INCIDENT] {detection['label']} | {tag} | {resp.status_code}")
         except Exception as e:
             print(f'[ERROR] report_incident: {e}')
 
     def _recognize_face(self, frame, bbox):
-        if self.face_recognizer is None or not self.known_students:
-            return None, 'Unknown', ''
+        self._init_face_recognition()
         try:
             x1, y1, x2, y2 = bbox
             mid_y = y1 + int((y2 - y1) * 0.55)
             crop  = frame[y1:mid_y, x1:x2]
             if crop.size == 0:
                 crop = frame[y1:y2, x1:x2]
+            if crop.size == 0:
+                return None, 'Unknown', ''
+
+            if self._face_recognizer is not None:
+                sid, name, roll, _dist = self._face_recognizer.match(crop)
+                if sid:
+                    return sid, name, roll
+                return None, name, roll
+
+            if not self.known_students:
+                return None, 'Unknown', ''
+
+            import face_recognition as fr
             rgb  = cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)
-            encs = self.face_recognizer.face_encodings(rgb, num_jitters=1, model='small')
+            encs = fr.face_encodings(rgb, num_jitters=1, model='small')
             if not encs:
                 return None, 'Unknown', ''
             det    = encs[0]
             best_d, best = 1.0, None
             for s in self.known_students:
                 try:
-                    d = self.face_recognizer.face_distance([np.array(json.loads(s['encoding']))], det)[0]
+                    d = fr.face_distance([np.array(json.loads(s['encoding']))], det)[0]
                     if d < best_d:
                         best_d, best = d, s
                 except Exception:
@@ -1212,6 +1367,7 @@ class ClassroomBehaviorDetector:
     def start(self):
         if self.running:
             return
+        self._init_face_recognition()
         self.running = True
         self.thread  = threading.Thread(target=self._detection_loop, daemon=True)
         self.thread.start()

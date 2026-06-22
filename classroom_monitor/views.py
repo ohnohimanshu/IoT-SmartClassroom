@@ -171,6 +171,10 @@ def session_end(request):
 def api_snapshot(request):
     if request.method != 'POST':
         return JsonResponse({'error': 'POST only'}, status=405)
+    from classroom_monitor.api_auth import check_detection_api_key
+    auth_err = check_detection_api_key(request)
+    if auth_err:
+        return auth_err
     try:
         data = json.loads(request.body)
         camera_id = data.get('camera_id')
@@ -436,12 +440,24 @@ def _get_yolo_detector():
     return _SHARED_DETECTOR
 
 
+def _incident_severity(det_type: str) -> str:
+    if det_type == 'fighting':
+        return 'critical'
+    if det_type in ('using_phone', 'eating_food'):
+        return 'high'
+    if det_type in ('distracted', 'looking_away', 'head_down'):
+        return 'medium'
+    return 'low'
+
+
 def _save_incident_direct(det_type, confidence, snapshot_bgr, student,
-                          student_name, roll_no, camera_obj, request_obj=None):
+                          student_name, roll_no, camera_obj, request_obj=None,
+                          fight_info=None, description_extra=''):
     """
     Save IncidentReport to DB and send one alert email per student per incident
     type with a 5-minute cooldown (per student, not global).
     Called directly — no HTTP self-POST, no Twilio. Uses SMTP email.
+    Returns the IncidentReport on success, None on failure.
     """
     try:
         _, buf = cv2.imencode('.jpg', snapshot_bgr, [cv2.IMWRITE_JPEG_QUALITY, 80])
@@ -449,11 +465,16 @@ def _save_incident_direct(det_type, confidence, snapshot_bgr, student,
         ts        = timezone.now().strftime('%Y%m%d_%H%M%S_%f')
         snap_file = CF(buf.tobytes(), name=f'incident_{ts}.jpg')
 
-        severity = ('medium' if det_type in ('using_phone', 'eating_food') else
-                    'low')
+        from classroom_monitor.constants import LABEL_MAP, EMAIL_ALERT_TYPES
+        severity = _incident_severity(det_type)
         tag   = f'{student_name} ({roll_no})' if student else 'Unknown person'
-        from classroom_monitor.behavior_detection import LABEL_MAP
         label = LABEL_MAP.get(det_type, det_type)
+
+        if det_type == 'fighting' and fight_info:
+            opp_id = fight_info.get('person_b_id') if fight_info.get('person_a_id') == student else fight_info.get('person_a_id')
+            tag = f'{tag} vs student track {opp_id}' if student else f'Unknown vs track {opp_id}'
+
+        desc = description_extra or f'{label} — {tag}'
 
         incident = IncidentReport.objects.create(
             student=student,
@@ -462,12 +483,11 @@ def _save_incident_direct(det_type, confidence, snapshot_bgr, student,
             severity=severity,
             confidence=float(confidence),
             snapshot=snap_file,
-            description=f'{label} — {tag}',
-            whatsapp_sent=False,   # field kept for DB compat, unused now
+            description=desc,
+            whatsapp_sent=False,
         )
 
-        # Email only for RED alert poses
-        if det_type in ('using_phone', 'eating_food'):
+        if det_type in EMAIL_ALERT_TYPES:
             _send_incident_email(
                 incident=incident,
                 student=student,
@@ -496,6 +516,7 @@ def _generate_video_stream(video_path, camera_id=0, camera_location='Classroom',
         ClassroomBehaviorDetector, COLOR_MAP, LABEL_MAP,
         ALERT_POSES, DISTRACTED_POSES,
     )
+    from classroom_monitor.constants import EMAIL_ALERT_TYPES
     from classroom_monitor.face_recognition_helper import (
         StudentFaceRecognizer, DLIB_LOCK,
     )
@@ -528,7 +549,8 @@ def _generate_video_stream(video_path, camera_id=0, camera_location='Classroom',
     detect_q    = _queue.Queue(maxsize=1)   # frames  → detect worker
     save_q      = _queue.Queue(maxsize=50)  # incident dicts → DB/WA saver
     stop_event  = threading.Event()
-    cooldown    = {}                        # det_type → last incident timestamp
+    cooldown    = {}                        # (type, track_id) → last saved timestamp
+    pending_keys = set()
 
     # ── Detect worker — YOLO + Haar only, NO dlib ────────────────────────────
     def _detection_worker():
@@ -556,8 +578,8 @@ def _generate_video_stream(video_path, camera_id=0, camera_location='Classroom',
             
             try:
                 close_old_connections()
-                _save_incident_direct(
-                    det_type     = item['type'],  # Expected as a clean string now
+                incident = _save_incident_direct(
+                    det_type     = item['type'],
                     confidence   = item['confidence'],
                     snapshot_bgr = item['snapshot'],
                     student      = item['student'],
@@ -565,12 +587,17 @@ def _generate_video_stream(video_path, camera_id=0, camera_location='Classroom',
                     roll_no      = item['roll'],
                     camera_obj   = camera_obj,
                     request_obj  = request_obj,
+                    fight_info   = item.get('fight_info'),
                 )
+                if incident is not None and item.get('cooldown_key') is not None:
+                    cooldown[item['cooldown_key']] = time.time()
                 tag = f"{item['name']} ({item['roll']})" if item['student'] else 'Unknown'
                 print(f"[INCIDENT] {LABEL_MAP.get(item['type'], item['type'])} | {tag}")
                 close_old_connections()
             except Exception as exc:
                 print(f'[SAVE WORKER] {exc}')
+            finally:
+                pending_keys.discard(item.get('cooldown_key'))
 
     det_thread  = threading.Thread(target=_detection_worker, daemon=True)
     save_thread = threading.Thread(target=_save_worker,      daemon=True)
@@ -695,12 +722,20 @@ def _generate_video_stream(video_path, camera_id=0, camera_location='Classroom',
                     focused = looking_away = head_down = using_phone = eating = not_visible = 0
                     for det in current_dets:
                         dt = det.get('type', 'not_visible')
-                        if dt == 'focused': focused += 1
-                        elif dt == 'looking_away': looking_away += 1
-                        elif dt == 'head_down': head_down += 1
-                        elif dt == 'using_phone': using_phone += 1
-                        elif dt == 'eating_food': eating += 1
-                        else: not_visible += 1
+                        if dt == 'focused':
+                            focused += 1
+                        elif dt == 'distracted':
+                            looking_away += 1
+                        elif dt == 'looking_away':
+                            looking_away += 1
+                        elif dt == 'head_down':
+                            head_down += 1
+                        elif dt == 'using_phone':
+                            using_phone += 1
+                        elif dt == 'eating_food':
+                            eating += 1
+                        else:
+                            not_visible += 1
                     
                     total_detected = focused + looking_away + head_down + using_phone + eating
                     engagement_score = (focused / total_detected * 100) if total_detected > 0 else 0.0
@@ -751,6 +786,8 @@ def _generate_video_stream(video_path, camera_id=0, camera_location='Classroom',
                             continue
                             
                         key = (det['type'], det.get('track_id'))
+                        if key in pending_keys:
+                            continue
                         if (now - cooldown.get(key, 0)) < COOLDOWN_S:
                             continue
 
@@ -761,7 +798,7 @@ def _generate_video_stream(video_path, camera_id=0, camera_location='Classroom',
                             crop = frame[y1:y2, x1:x2]
 
                         try:
-                            sid, name, roll, _ = (recognizer.match(crop) if crop.size > 0 else (None, 'Unknown', '', 1.0))
+                            sid, name, roll, _ = (recognizer.match(crop) if crop.size > 0 else (None, 'Unknown', '', float('nan')))
                             student = None
                             if sid:
                                 try:
@@ -770,23 +807,29 @@ def _generate_video_stream(video_path, camera_id=0, camera_location='Classroom',
                                 except Exception:
                                     pass
 
-                            cooldown[key] = now
-                            
                             snap_with_rects = frame.copy()
                             for d in current_dets:
                                 dx1, dy1, dx2, dy2 = d['bbox']
                                 cv2.rectangle(snap_with_rects, (dx1, dy1), (dx2, dy2), d['color'], 2)
                                 text = f"{d['label']} ({d['confidence']:.2f})"
                                 cv2.putText(snap_with_rects, text, (dx1 + 2, dy1 - 2), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
-                            
-                            save_q.put_nowait({
-                                'type':       det['type'],  # FIXED: Passes clean string, not the tuple
+
+                            item = {
+                                'type':       det['type'],
                                 'confidence': det['confidence'],
                                 'snapshot':   snap_with_rects,
                                 'student':    student,
                                 'name':       name,
                                 'roll':       roll,
-                            })
+                                'fight_info': det.get('fight_info'),
+                                'cooldown_key': key,
+                            }
+                            pending_keys.add(key)
+                            try:
+                                save_q.put(item, timeout=2.0)
+                            except _queue.Full:
+                                pending_keys.discard(key)
+                                print('[STREAM] Incident save queue full — dropping alert')
                         except Exception as e:
                             print(f'[STREAM] Error in face recognition: {e}')
 
@@ -950,6 +993,11 @@ def api_incidents_report(request):
     if request.method != 'POST':
         return JsonResponse({'error': 'POST only'}, status=405)
 
+    from classroom_monitor.api_auth import check_detection_api_key
+    auth_err = check_detection_api_key(request)
+    if auth_err:
+        return auth_err
+
     try:
         data = json.loads(request.body)
 
@@ -991,16 +1039,9 @@ def api_incidents_report(request):
                 pass
 
         # ── 4. Determine severity ─────────────────────────────────────────────
-        alert_types = {'using_phone', 'eating_food', 'fighting'}
+        from classroom_monitor.constants import EMAIL_ALERT_TYPES
         inc_type    = data.get('incident_type', 'other')
-        
-        # Fighting is CRITICAL severity
-        if inc_type == 'fighting':
-            severity = 'critical'
-        elif inc_type in alert_types:
-            severity = 'high'
-        else:
-            severity = 'medium' if inc_type in {'looking_away', 'head_down', 'distracted'} else 'low'
+        severity = _incident_severity(inc_type)
 
         # ── 5. Save to DB ─────────────────────────────────────────────────────
         incident = IncidentReport.objects.create(
@@ -1015,7 +1056,7 @@ def api_incidents_report(request):
         )
 
         # ── 6. Email alert for RED incidents (including fighting) ─────────────
-        if inc_type in alert_types and snapshot_bytes:
+        if inc_type in EMAIL_ALERT_TYPES and snapshot_bytes:
             _send_incident_email(
                 incident=incident,
                 student=student,
@@ -1121,7 +1162,7 @@ def _send_incident_email(incident, student, student_name, roll_no,
         return False
 
     # ── Build recipient list ──────────────────────────────────────────────────
-    from classroom_monitor.behavior_detection import LABEL_MAP
+    from classroom_monitor.constants import LABEL_MAP
     label = LABEL_MAP.get(det_type, det_type.replace('_', ' ').title())
 
     recipients = [admin_to]

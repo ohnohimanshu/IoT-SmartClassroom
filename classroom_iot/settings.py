@@ -38,10 +38,14 @@ SECRET_KEY = os.environ.get(
     'django-insecure-classroom-iot-dev-key-change-in-production'
 )
 DEBUG = os.environ.get('DJANGO_DEBUG', 'True') == 'True'
-ALLOWED_HOSTS = os.environ.get(
-    'DJANGO_ALLOWED_HOSTS',
-    '*, 192.168.1.5, 192.168.1.9, 192.168.137.1, 10.17.5.13, 10.7.31.26'
-).split(', ')
+ALLOWED_HOSTS = [
+    h.strip()
+    for h in os.environ.get(
+        "DJANGO_ALLOWED_HOSTS",
+        "127.0.0.1,localhost,10.7.31.114"
+    ).split(",")
+    if h.strip()
+]
 
 INSTALLED_APPS = [
     'django.contrib.admin',
@@ -116,11 +120,11 @@ LOGIN_URL = '/login/'
 LOGIN_REDIRECT_URL = '/dashboard/'
 
 # SSL/Development settings
-SECURE_SSL_REDIRECT = True  # Redirect all HTTP to HTTPS
-
-# Cookies must only be marked Secure when actually running over HTTPS.
 # Set DJANGO_USE_SSL=true in your environment when using runsslserver.
 _USE_SSL = os.environ.get('DJANGO_USE_SSL', 'false').lower() == 'true'
+SECURE_SSL_REDIRECT = _USE_SSL  # Only redirect HTTP→HTTPS when actually running SSL
+
+# Cookies must only be marked Secure when actually running over HTTPS.
 SESSION_COOKIE_SECURE = _USE_SSL
 CSRF_COOKIE_SECURE = _USE_SSL
 SESSION_COOKIE_HTTPONLY = True
@@ -139,23 +143,13 @@ CSRF_TRUSTED_ORIGINS = [
     'http://localhost:8000',
     'https://localhost:8000',
     # 192.168.x network
-    'http://192.168.1.5:8000',
-    'https://192.168.1.5:8000',
-    'http://192.168.1.9:8000',
-    'https://192.168.1.9:8000',
-    'http://192.168.137.1:8000',
-    'https://192.168.137.1:8000',
-    # 10.17.x network (current IP — check with ipconfig)
-    'http://10.17.5.13:8000',
-    'https://10.17.5.13:8000',
-    # 10.7.x network (previous IP — kept for compatibility)
-    'http://10.7.5.13:8000',
-    'https://10.7.5.13:8000',
-    'http://10.7.31.26:8000',
-    'https://10.7.31.26:8000',
+    'https://10.7.31.114',
+    'http://10.7.31.114:8000',
+    'https://10.7.31.114:8000',
     # 172.x network (WSL/Hyper-V virtual adapter)
     'http://172.22.224.1:8000',
     'https://172.22.224.1:8000',
 ]
+
 SECURE_PROXY_SSL_HEADER = ('HTTP_X_FORWARDED_PROTO', 'https')
 CSRF_FAILURE_VIEW = 'entrance_cam.views.csrf_failure'

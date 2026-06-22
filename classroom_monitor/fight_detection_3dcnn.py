@@ -7,14 +7,26 @@ that understands temporal motion patterns across 16-frame clips.
 
 Architecture: mc3_18 (Mixed Convolutional 3D ResNet-18)
 - Pre-trained on Kinetics-400
-- Fine-tuned on surveillance fight datasets
-- ~91% accuracy on fight/no-fight classification
+- Intended to be fine-tuned on a surveillance/fight dataset that matches
+  your camera setup. Any reported accuracy figure for a fine-tune is only
+  as good as the data it was fine-tuned on -- don't treat a number quoted
+  elsewhere as a guarantee for your own classroom footage.
 
 Usage:
     detector = FightDetector3DCNN()
     for frame in video_stream:
         detector.add_frame(frame)
         is_fighting, confidence = detector.predict()
+
+IMPORTANT (perf fix): the model + its fine-tuned weights are loaded ONCE,
+shared by every FightDetector3DCNN instance via _SharedCNNModel. Each
+instance only owns its own lightweight frame buffer. Previously, every
+caller that constructed a new FightDetector3DCNN() (e.g. one per candidate
+fighting pair) triggered a brand-new full model load + weight load on a
+new background thread -- meaning every newly-formed pair in a busy
+classroom paid the full model-load cost again, and N simultaneous pairs
+held N redundant copies of the model in memory at once. That no longer
+happens: the model loads once, lazily, on first use.
 """
 
 import os
@@ -46,122 +58,78 @@ def _lazy_import_torch():
 KINETICS_MEAN = [0.43216, 0.394666, 0.37645]
 KINETICS_STD = [0.22803, 0.22145, 0.216989]
 
-# BUG 4 FIX: Remove runtime Google Drive download dependency for production
-# Fine-tuned weights should be bundled locally or loaded via environment variable
-# MODEL_WEIGHTS_URL = 'https://drive.google.com/uc?id=1MWDeLnpEaZDrKK-OjmzvYLxfjwp-GDcp'  # Removed
+# Fine-tuned weights should be bundled locally or loaded via environment variable.
+# Runtime download from a remote URL is intentionally NOT supported -- production
+# must point FIGHT_MODEL_WEIGHTS_PATH at a local, validated file.
 MODEL_WEIGHTS_FILENAME = 'fight_mc3_18_finetuned.pth'
 
 
-class FightDetector3DCNN:
+class _SharedCNNModel:
     """
-    3D CNN-based fight detector using mc3_18 architecture.
-    
-    Buffers consecutive frames and classifies 16-frame clips as fight/no-fight.
-    Designed for real-time integration with existing YOLO-based behavior pipeline.
-    
-    Public API:
-        add_frame(frame)          — Feed a BGR frame into the buffer
-        predict()                 — Classify current buffer as fight/no-fight
-        reset()                   — Clear the frame buffer
-        is_ready()                — Check if enough frames are buffered
+    Process-wide singleton holding the loaded 3D CNN model + device.
+
+    All FightDetector3DCNN instances delegate to this class instead of each
+    building/loading their own copy of the model. The model is loaded at
+    most once per process, the first time any FightDetector3DCNN needs it.
     """
-    
-    def __init__(self, 
-                 device: str = 'auto',
-                 sequence_length: int = 16,
-                 confidence_threshold: float = 0.60,
-                 input_size: int = 112):
-        """
-        Initialize the 3D CNN fight detector.
-        
-        Args:
-            device: 'auto' (detect GPU), 'cuda', or 'cpu'
-            sequence_length: Number of frames per clip (default 16)
-            confidence_threshold: Minimum confidence to flag as fight
-            input_size: Spatial size for model input (112x112)
-        """
-        self.sequence_length = sequence_length
-        self.confidence_threshold = confidence_threshold
-        self.input_size = input_size
-        
-        # Frame buffer (ring buffer of preprocessed frames)
-        self._frame_buffer = deque(maxlen=sequence_length)
-        self._raw_frame_count = 0
-        
-        # Model state
-        self._model = None
-        self._device = None
-        self._device_str = device
-        self._model_loaded = False
-        self._model_lock = threading.Lock()
-        
-        # Prediction cache (avoid redundant inference)
-        self._last_prediction = (False, 0.0)
-        self._frames_since_prediction = 0
-        self._predict_every_n = 8  # Run inference every 8 new frames
-        
-        # Load model in background to avoid blocking
-        self._load_thread = threading.Thread(target=self._load_model, daemon=True)
-        self._load_thread.start()
-    
-    def _get_device(self):
-        """Determine the best available device."""
+    _lock = threading.Lock()
+    _load_started = False
+    _model = None
+    _device = None
+    _model_loaded = False
+    _model_name = None
+
+    @classmethod
+    def ensure_loading_started(cls, device_str: str):
+        """Kick off background loading exactly once per process."""
+        with cls._lock:
+            if cls._load_started:
+                return
+            cls._load_started = True
+        threading.Thread(target=cls._load, args=(device_str,), daemon=True).start()
+
+    @classmethod
+    def is_ready(cls) -> bool:
+        with cls._lock:
+            return cls._model_loaded and cls._model is not None
+
+    @classmethod
+    def get(cls):
+        """Returns (model, device) -- caller should check is_ready() first."""
+        with cls._lock:
+            return cls._model, cls._device
+
+    @classmethod
+    def _get_device(cls, device_str: str):
         torch, _, _ = _lazy_import_torch()
-        
-        if self._device_str == 'auto':
-            if torch.cuda.is_available():
-                return torch.device('cuda')
-            else:
-                return torch.device('cpu')
-        return torch.device(self._device_str)
-    
-    def _download_weights(self, save_path: str) -> bool:
+        if device_str == 'auto':
+            return torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
+        return torch.device(device_str)
+
+    @classmethod
+    def _validate_weights_file(cls, weights_path: str) -> bool:
         """
-        BUG 4 FIX: Optional one-time bootstrap download - separated from runtime detection.
-        
-        This method is kept for setup/bootstrap scripts only. Production runtime should 
-        NEVER depend on downloading weights from Google Drive. Fine-tuned weights should 
-        be bundled with the application or loaded from a validated local path.
-        
-        Returns True if download succeeded.
-        """
-        print('[FIGHT-3DCNN] WARNING: Runtime download is deprecated for production use')
-        print('[FIGHT-3DCNN] Use FIGHT_MODEL_WEIGHTS_PATH env var to specify pre-downloaded weights')
-        
-        try:
-            import gdown
-            print('[FIGHT-3DCNN] Attempting bootstrap weight download (one-time setup only)...')
-            # Note: MODEL_WEIGHTS_URL removed - would need to be restored for bootstrap script
-            # gdown.download(MODEL_WEIGHTS_URL, save_path, quiet=False)
-            print('[FIGHT-3DCNN] Bootstrap download not available - weights URL removed for security')
-            return False
-        except ImportError:
-            print('[FIGHT-3DCNN] gdown not installed, cannot bootstrap download')
-            return False
-        except Exception as e:
-            print(f'[FIGHT-3DCNN] Bootstrap download failed: {e}')
-            return False
-    
-    def _validate_weights_file(self, weights_path: str) -> bool:
-        """
-        BUG 4 FIX: Validate fine-tuned weights file before loading.
-        
+        Validate fine-tuned weights file before loading.
+
         Checks file existence, minimum size, and basic format validation.
-        Prevents loading of corrupt/incomplete files that would produce meaningless predictions.
+        Prevents loading of corrupt/incomplete files that would produce
+        meaningless predictions.
+
+        Note: this loads the checkpoint with weights_only=False to support
+        dict-wrapped checkpoints (e.g. {'model_state_dict': ...}). Only ever
+        point FIGHT_MODEL_WEIGHTS_PATH at a file you trust -- loading a
+        pickle this way can execute arbitrary code if the file is malicious,
+        so this path should never be user-controllable in a deployed system.
         """
         if not os.path.exists(weights_path):
             return False
-        
-        # Check minimum file size (fine-tuned model should be at least 1MB)
+
         if os.path.getsize(weights_path) < 1_000_000:
             print(f'[FIGHT-3DCNN] Weights file too small: {os.path.getsize(weights_path)} bytes')
             return False
-        
-        # Optional: Add checksum validation here if you have expected checksums
-        # For now, just check that it's a valid torch file
+
         try:
             torch, _, _ = _lazy_import_torch()
-            # Try to load without mapping to check file validity
             state_dict = torch.load(weights_path, map_location='cpu', weights_only=False)
             if not isinstance(state_dict, dict):
                 print('[FIGHT-3DCNN] Invalid weights file format')
@@ -171,15 +139,16 @@ class FightDetector3DCNN:
         except Exception as e:
             print(f'[FIGHT-3DCNN] Weights file validation failed: {e}')
             return False
-    def _build_model(self, num_classes: int = 2):
+
+    @classmethod
+    def _build_model(cls, num_classes: int = 2):
         """
         Build mc3_18 model with custom classification head.
         Falls back to r3d_18 if mc3_18 is unavailable.
         """
         torch, torchvision, _ = _lazy_import_torch()
-        
+
         try:
-            # Try mc3_18 first (Mixed Convolutional — faster)
             from torchvision.models.video import mc3_18, MC3_18_Weights
             model = mc3_18(weights=MC3_18_Weights.KINETICS400_V1)
             model_name = 'mc3_18'
@@ -189,7 +158,6 @@ class FightDetector3DCNN:
                 model = mc3_18(pretrained=True)
                 model_name = 'mc3_18'
             except Exception:
-                # Fallback to r3d_18
                 try:
                     from torchvision.models.video import r3d_18, R3D_18_Weights
                     model = r3d_18(weights=R3D_18_Weights.KINETICS400_V1)
@@ -198,51 +166,45 @@ class FightDetector3DCNN:
                     from torchvision.models.video import r3d_18
                     model = r3d_18(pretrained=True)
                     model_name = 'r3d_18'
-        
-        # Replace classification head: 400 classes → 2 (fight / no-fight)
+
         in_features = model.fc.in_features
         model.fc = torch.nn.Linear(in_features, num_classes)
-        
+
         print(f'[FIGHT-3DCNN] Built {model_name} model (in_features={in_features})')
         return model, model_name
-    
-    def _load_model(self):
+
+    @classmethod
+    def _load(cls, device_str: str):
         """
-        BUG 4 FIX: Load the 3D CNN model with proper weight validation.
-        
-        The old code would silently fall back to randomly-initialized weights if fine-tuned 
-        weights weren't available, making it indistinguishable from a working model.
-        Now we explicitly validate weights and disable the model if proper weights aren't found.
+        Load the 3D CNN model with proper weight validation, ONCE for the
+        whole process. Never silently substitutes a randomly-initialized
+        head as if it were a working model -- if fine-tuned weights aren't
+        found/valid, the model stays disabled and every FightDetector3DCNN
+        instance's predict() will return (False, 0.0).
         """
         try:
             torch, _, _ = _lazy_import_torch()
-            
-            self._device = self._get_device()
-            print(f'[FIGHT-3DCNN] Using device: {self._device}')
-            
-            # Build model architecture
-            model, model_name = self._build_model(num_classes=2)
-            
-            # BUG 4 FIX: Check for fine-tuned weights using environment variable or default path
+
+            device = cls._get_device(device_str)
+            print(f'[FIGHT-3DCNN] Using device: {device}')
+
+            model, model_name = cls._build_model(num_classes=2)
+
             weights_path = os.environ.get('FIGHT_MODEL_WEIGHTS_PATH')
             if not weights_path:
-                # Fallback to default location
                 weights_dir = os.path.join(os.path.dirname(__file__), '..', 'model_weights')
                 weights_path = os.path.join(weights_dir, MODEL_WEIGHTS_FILENAME)
-            
+
             finetuned_loaded = False
-            
-            # BUG 4 FIX: Validate weights before loading
-            if self._validate_weights_file(weights_path):
+
+            if cls._validate_weights_file(weights_path):
                 try:
-                    state_dict = torch.load(weights_path, map_location=self._device, weights_only=False)
-                    # Handle different checkpoint formats
+                    state_dict = torch.load(weights_path, map_location=device, weights_only=False)
                     if isinstance(state_dict, dict) and 'model_state_dict' in state_dict:
                         state_dict = state_dict['model_state_dict']
                     elif isinstance(state_dict, dict) and 'state_dict' in state_dict:
                         state_dict = state_dict['state_dict']
-                    
-                    # Try loading, handle fc layer size mismatch gracefully
+
                     try:
                         model.load_state_dict(state_dict, strict=False)
                         finetuned_loaded = True
@@ -256,165 +218,199 @@ class FightDetector3DCNN:
             else:
                 print(f'[FIGHT-3DCNN] Fine-tuned weights not found or invalid: {weights_path}')
                 print('[FIGHT-3DCNN] Set FIGHT_MODEL_WEIGHTS_PATH env var to specify weights location')
-            
-            # BUG 4 FIX: NEVER silently substitute randomly-initialized head as production model
+
             if not finetuned_loaded:
-                print('[FIGHT-3DCNN] ⚠️  FIGHT DETECTION DISABLED ⚠️')
+                print('[FIGHT-3DCNN] FIGHT DETECTION DISABLED')
                 print('[FIGHT-3DCNN] Fine-tuned weights not available - cannot provide reliable predictions')
                 print('[FIGHT-3DCNN] Model will return fight_detected=False for all predictions')
-                
-                # Set explicit flag to indicate model is not operational
-                with self._model_lock:
-                    self._model = None  # Explicitly disable the model
-                    self._model_loaded = False
+                with cls._lock:
+                    cls._model = None
+                    cls._model_loaded = False
                 return
-            
-            # Only set model as loaded if we have valid fine-tuned weights
-            model = model.to(self._device)
+
+            model = model.to(device)
             model.eval()
-            
-            with self._model_lock:
-                self._model = model
-                self._model_loaded = True
-            
-            print(f'[FIGHT-3DCNN] Model ready on {self._device} with fine-tuned weights')
-        
+
+            with cls._lock:
+                cls._model = model
+                cls._device = device
+                cls._model_name = model_name
+                cls._model_loaded = True
+
+            print(f'[FIGHT-3DCNN] Model ready on {device} with fine-tuned weights (shared across all pairs)')
+
         except Exception as e:
             print(f'[FIGHT-3DCNN] FATAL: Could not load model: {e}')
             import traceback
             traceback.print_exc()
-            # BUG 4 FIX: Ensure model is marked as not loaded on any failure
-            with self._model_lock:
-                self._model = None
-                self._model_loaded = False
-    
+            with cls._lock:
+                cls._model = None
+                cls._model_loaded = False
+
+
+class FightDetector3DCNN:
+    """
+    3D CNN-based fight detector using mc3_18 architecture.
+
+    Buffers consecutive frames and classifies 16-frame clips as fight/no-fight.
+    Designed for real-time integration with existing YOLO-based behavior pipeline.
+
+    Each instance owns only its OWN frame buffer (cheap -- a deque of small
+    preprocessed arrays). The actual model is a shared, process-wide singleton
+    (see _SharedCNNModel) loaded at most once, so creating many instances
+    (e.g. one per candidate fighting pair) is cheap and does not re-load the
+    model or its weights.
+
+    Public API:
+        add_frame(frame)          — Feed a BGR frame into the buffer
+        predict()                 — Classify current buffer as fight/no-fight
+        reset()                   — Clear the frame buffer
+        is_ready()                — Check if enough frames are buffered
+    """
+
+    def __init__(self,
+                 device: str = 'auto',
+                 sequence_length: int = 16,
+                 confidence_threshold: float = 0.60,
+                 input_size: int = 112):
+        """
+        Initialize the 3D CNN fight detector.
+
+        Args:
+            device: 'auto' (detect GPU), 'cuda', or 'cpu'
+            sequence_length: Number of frames per clip (default 16)
+            confidence_threshold: Minimum confidence to flag as fight
+            input_size: Spatial size for model input (112x112)
+        """
+        self.sequence_length = sequence_length
+        self.confidence_threshold = confidence_threshold
+        self.input_size = input_size
+
+        # Frame buffer (ring buffer of preprocessed frames) -- per-instance,
+        # this is the only thing that legitimately needs to differ per pair.
+        self._frame_buffer = deque(maxlen=sequence_length)
+        self._raw_frame_count = 0
+
+        # Prediction cache (avoid redundant inference)
+        self._last_prediction = (False, 0.0)
+        self._frames_since_prediction = 0
+        self._predict_every_n = 8  # Run inference every 8 new frames
+
+        # Kick off (process-wide, once-only) model loading. Cheap to call
+        # repeatedly -- only the very first call actually starts a thread.
+        self._device_str = device
+        _SharedCNNModel.ensure_loading_started(device)
+
     def _preprocess_frame(self, frame: np.ndarray) -> np.ndarray:
         """
         Preprocess a single BGR frame for the 3D CNN.
-        
+
         Steps:
         1. Resize to input_size x input_size
-        2. Convert BGR → RGB
+        2. Convert BGR to RGB
         3. Normalize to [0, 1]
         4. Apply Kinetics-400 mean/std normalization
-        
+
         Returns: numpy array of shape (3, H, W), float32
         """
         import cv2
-        
-        # Resize
+
         resized = cv2.resize(frame, (self.input_size, self.input_size),
                              interpolation=cv2.INTER_LINEAR)
-        
-        # BGR → RGB, uint8 → float32 [0, 1]
         rgb = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
-        
-        # Kinetics-400 normalization (channel-wise)
         for c in range(3):
             rgb[:, :, c] = (rgb[:, :, c] - KINETICS_MEAN[c]) / KINETICS_STD[c]
-        
-        # HWC → CHW
         return np.transpose(rgb, (2, 0, 1))
-    
+
     def add_frame(self, frame: np.ndarray):
         """
         Add a BGR frame to the internal buffer.
-        
+
         Args:
             frame: BGR numpy array from OpenCV (any resolution)
         """
         if frame is None or frame.size == 0:
             return
-        
+
         preprocessed = self._preprocess_frame(frame)
         self._frame_buffer.append(preprocessed)
         self._raw_frame_count += 1
         self._frames_since_prediction += 1
-    
+
     def is_ready(self) -> bool:
         """
-        BUG 4 FIX: Check if the buffer has enough frames AND model is properly loaded with fine-tuned weights.
-        
-        The old version would return True even with randomly-initialized weights, leading to 
-        meaningless predictions being treated as valid fight detection.
+        Check if the buffer has enough frames AND the shared model is
+        properly loaded with fine-tuned weights.
         """
-        return (len(self._frame_buffer) >= self.sequence_length and 
-                self._model_loaded and self._model is not None)
-    
+        return len(self._frame_buffer) >= self.sequence_length and _SharedCNNModel.is_ready()
+
     def predict(self) -> Tuple[bool, float]:
         """
-        Run fight detection on the current frame buffer.
-        
-        BUG 4 FIX: Only returns fight predictions if model is loaded with validated fine-tuned weights.
-        If fine-tuned weights are not available, always returns (False, 0.0) to indicate fight 
-        detection is unavailable, rather than producing meaningless predictions from random weights.
-        
-        Returns:
-            (is_fighting, confidence) tuple
-            - is_fighting: True if fight detected above threshold
-            - confidence: 0.0 to 1.0 probability of fight
+        Run fight detection on the current frame buffer using the shared model.
+
+        Returns (is_fighting, confidence). If fine-tuned weights are not loaded,
+        returns (False, 0.0) — check ``detection_available`` to distinguish
+        "no fight" from "detector disabled".
         """
-        # Return cached result if not enough new frames
+        if not self.detection_available:
+            return False, 0.0
+
         if self._frames_since_prediction < self._predict_every_n:
             return self._last_prediction
-        
-        # BUG 4 FIX: Strict ready check - model must be loaded with fine-tuned weights
+
         if not self.is_ready():
             return False, 0.0
-        
-        with self._model_lock:
-            if self._model is None:
-                # BUG 4 FIX: Model explicitly disabled due to missing fine-tuned weights
-                return False, 0.0
-        
+
+        model, device = _SharedCNNModel.get()
+        if model is None:
+            return False, 0.0
+
         try:
             torch, _, _ = _lazy_import_torch()
-            
-            # Stack frames: list of (3, H, W) → (3, T, H, W)
+
             frames_list = list(self._frame_buffer)
-            # Shape: (T, C, H, W)
-            clip = np.stack(frames_list, axis=0)
-            # Reshape to (C, T, H, W) — PyTorch 3D CNN expects this
-            clip = np.transpose(clip, (1, 0, 2, 3))
-            
-            # Convert to tensor and add batch dimension: (1, C, T, H, W)
+            clip = np.stack(frames_list, axis=0)            # (T, C, H, W)
+            clip = np.transpose(clip, (1, 0, 2, 3))          # (C, T, H, W)
+
             clip_tensor = torch.from_numpy(clip).unsqueeze(0).float()
-            clip_tensor = clip_tensor.to(self._device)
-            
-            # Inference
+            clip_tensor = clip_tensor.to(device)
+
             with torch.no_grad():
-                output = self._model(clip_tensor)
+                output = model(clip_tensor)
                 probabilities = torch.softmax(output, dim=1)
-                
-                # Class 0 = no-fight, Class 1 = fight
                 fight_prob = probabilities[0, 1].item()
-            
+
             is_fighting = fight_prob >= self.confidence_threshold
             self._last_prediction = (is_fighting, fight_prob)
             self._frames_since_prediction = 0
-            
+
             if is_fighting:
-                print(f'[FIGHT-3DCNN] ⚠ FIGHT DETECTED! confidence={fight_prob:.3f}')
-            
+                print(f'[FIGHT-3DCNN] FIGHT DETECTED! confidence={fight_prob:.3f}')
+
             return is_fighting, fight_prob
-        
+
         except Exception as e:
             print(f'[FIGHT-3DCNN] Prediction error: {e}')
             return False, 0.0
-    
+
     def reset(self):
         """Clear the frame buffer and prediction cache."""
         self._frame_buffer.clear()
         self._raw_frame_count = 0
         self._frames_since_prediction = 0
         self._last_prediction = (False, 0.0)
-    
+
+    @property
+    def detection_available(self) -> bool:
+        """True when shared model loaded with validated fine-tuned weights."""
+        return _SharedCNNModel.is_ready()
+
     @property
     def model_loaded(self) -> bool:
-        """Check if the model has been loaded successfully."""
-        return self._model_loaded
-    
+        """Check if the shared model has been loaded successfully."""
+        return _SharedCNNModel.is_ready()
+
     @property
     def buffer_fill(self) -> float:
-        """Return buffer fill level as 0.0 to 1.0."""
+        """Return this instance's buffer fill level as 0.0 to 1.0."""
         return len(self._frame_buffer) / self.sequence_length
