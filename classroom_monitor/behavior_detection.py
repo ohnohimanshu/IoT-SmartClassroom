@@ -88,7 +88,7 @@ class TemporalBehaviorEngine:
     EATING_HAND_TO_MOUTH_THRESHOLD = 0.15
 
     # Alert smoothing
-    ALERT_CONFIRM_FRAMES  = 1            # phone/eating: immediate confirmation
+    ALERT_CONFIRM_FRAMES  = 2            # phone/eating: 2-in-a-row to confirm
     NORMAL_CONFIRM_FRAMES = 3            # focused/distracted: 3-in-a-row
 
     def __init__(self):
@@ -331,12 +331,15 @@ class TemporalBehaviorEngine:
         book_detections = book_detections or []
         head_is_down = (head_pose == 'head_down') or self._head_down_like(person, head_pose)
 
-        def _wrist_ok(w, min_conf=0.25) -> bool:
+        def _book_near(pt) -> bool:
+            return self._point_near_book(pt, bbox_h, book_detections)
+
+        def _wrist_ok(w, min_conf=0.4) -> bool:
             return w is not None and len(w) >= 3 and w[2] >= min_conf and w[0] != 0.0
 
-        # ── Strategy 1: YOLO-detected phone object IN person's bbox (very aggressive) ──
+        # ── Strategy 1: YOLO-detected phone object (prioritize this!) ──
         if phone_detections:
-            min_phone_conf = 0.15  # Very low confidence threshold
+            min_phone_conf = 0.25  # Balanced confidence threshold
             for (px1, py1, px2, py2, conf) in phone_detections:
                 if conf < min_phone_conf:
                     continue
@@ -344,48 +347,67 @@ class TemporalBehaviorEngine:
                 pc = np.array([(px1 + px2) / 2.0, (py1 + py2) / 2.0])
                 ph, pw = py2 - py1, px2 - px1
                 
-                # Relax size limits: phone can be up to 80% of person's bbox height
-                if max(pw, ph) / bbox_h > 0.8:
+                # Reasonable size limits for phones
+                if max(pw, ph) / bbox_h > 0.6 or min(pw, ph) / bbox_h < 0.05:
                     continue
                 
-                # Check if phone center is anywhere inside or near the person's bounding box
-                if (x1 - bbox_w * 0.1 <= pc[0] <= x2 + bbox_w * 0.1 and 
-                    y1 - bbox_h * 0.1 <= pc[1] <= y2 + bbox_h * 0.1):
+                # Check if phone center is near any wrist or inside bbox
+                near_wrist = False
+                if kp is not None and len(kp) > 10:
+                    for idx in (9, 10):
+                        w = kp[idx]
+                        if _wrist_ok(w, 0.3) and np.linalg.norm(w[:2] - pc) / bbox_h < 0.3:
+                            near_wrist = True
+                            break
+                
+                # If phone is near a wrist OR just inside bbox (fallback)
+                if near_wrist or (x1 <= pc[0] <= x2 and y1 <= pc[1] <= y2):
                     print(f'[PHONE] Person {person.track_id}: YOLO detected phone, conf={conf:.2f}')
                     return True, float(conf)
 
-        # ── Strategy 2: Skeleton heuristic (very aggressive) ──
+        # ── Strategy 2: Skeleton heuristic (only if no writing posture) ──
+        if self._is_writing_posture(person, head_pose, book_detections):
+            return False, 0.0  # Probably writing, not using phone
+
         if kp is not None and kp.size > 0 and len(kp) > 10:
             try:
+                nose        = kp[0]
                 left_wrist  = kp[9]
                 right_wrist = kp[10]
-                lap_thresh  = y1 + bbox_h * 0.5  # Lower lap threshold (more area considered)
+                lap_thresh  = y1 + bbox_h * 0.6  # Lap/desk level
                 
-                wrist_pts = [w[:2] for w in (left_wrist, right_wrist) if _wrist_ok(w, 0.2)]
+                wrist_pts = [w[:2] for w in (left_wrist, right_wrist) if _wrist_ok(w, 0.4)]
                 
                 if not wrist_pts:
                     return False, 0.0
 
-                # If head is down and any hand is in lower half → very likely phone use
-                if head_is_down:
-                    for w in wrist_pts:
-                        if w[1] > lap_thresh:
-                            print(f'[PHONE] Person {person.track_id}: head down + hand low')
+                # Check for cupped hands at lap (typical phone-holding posture)
+                if len(wrist_pts) == 2 and head_is_down:
+                    both_low = all(w[1] > lap_thresh for w in wrist_pts)
+                    spread = np.linalg.norm(wrist_pts[0] - wrist_pts[1]) / bbox_h
+                    if both_low and spread < 0.25:  # Hands close together at lap
+                        if not any(_book_near(w) for w in wrist_pts):  # No book nearby
+                            print(f'[PHONE] Person {person.track_id}: cupped hands at lap')
                             return True, 0.65
 
-                # Both wrists close together at any height + head down → phone use
-                if len(wrist_pts) == 2 and head_is_down:
-                    spread = np.linalg.norm(wrist_pts[0] - wrist_pts[1]) / bbox_h
-                    if spread < 0.3:  # Very relaxed spread threshold
-                        print(f'[PHONE] Person {person.track_id}: two hands close together')
-                        return True, 0.70
-
-                # Any hand in mid/lower torso → phone use
-                for w in wrist_pts:
+                # Check for single hand at mid-torso (single-handed phone use)
+                if len(wrist_pts) == 1 and head_is_down:
+                    w = wrist_pts[0]
                     y_ratio = (w[1] - y1) / bbox_h
-                    if 0.4 <= y_ratio <= 0.9:
-                        print(f'[PHONE] Person {person.track_id}: hand in mid/lower torso')
+                    if 0.55 <= y_ratio <= 0.8 and not _book_near(w):
+                        print(f'[PHONE] Person {person.track_id}: single hand at mid-torso')
                         return True, 0.60
+
+                # Check for hand-to-ear (phone call)
+                if head_pose != 'head_down' and len(nose) >= 3 and nose[2] >= 0.7:
+                    left_ear = kp[3] if len(kp) > 3 else None
+                    right_ear = kp[4] if len(kp) > 4 else None
+                    for w in wrist_pts:
+                        for ear in (left_ear, right_ear):
+                            if ear is not None and len(ear) >= 3 and ear[2] >= 0.4:
+                                if np.linalg.norm(w - ear[:2]) / bbox_h < 0.22:
+                                    print(f'[PHONE] Person {person.track_id}: hand to ear')
+                                    return True, 0.70
 
             except Exception as exc:
                 print(f'[PHONE] Heuristic error: {exc}')
@@ -544,6 +566,7 @@ class ProductionStreamProcessor:
         self.result_buffer: deque = deque(maxlen=2)
         self.yolo_model   = None
         self.object_model = None
+        self.roboflow_model = None  # Cache Roboflow model
         self.running      = False
         self.lock         = threading.Lock()
         self.stop_event   = threading.Event()
@@ -603,27 +626,72 @@ class ProductionStreamProcessor:
             time.sleep(0.001)
 
     def _parse_object_detections(self, frame: np.ndarray):
-        """Run object model and return (phone_dets, food_dets, book_dets)."""
+        """Run object models: Roboflow (local) for phones, YOLO for food/books."""
         phone_dets, food_dets, book_dets = [], [], []
-        if self.object_model is None:
-            return phone_dets, food_dets, book_dets
+        
+        # Use YOLO for food and books (still needed)
+        if self.object_model is not None:
+            try:
+                for result in self.object_model(frame, verbose=False, conf=0.25, iou=0.45):
+                    if result.boxes is None:
+                        continue
+                    for i in range(len(result.boxes)):
+                        cls  = int(result.boxes.cls[i])
+                        conf = float(result.boxes.conf[i])
+                        x1, y1, x2, y2 = map(int, result.boxes.xyxy[i])
+                        det = (x1, y1, x2, y2, conf)
+                        if cls in self._FOOD_CLS:
+                            food_dets.append(det)
+                        elif cls in self._BOOK_CLS:
+                            book_dets.append(det)
+            except Exception as e:
+                print(f'[WARN] YOLO object detection failed: {e}')
+        
+        # Use Roboflow LOCAL for phone detection (cached model)
         try:
-            for result in self.object_model(frame, verbose=False, conf=0.05, iou=0.3):
-                if result.boxes is None:
-                    continue
-                for i in range(len(result.boxes)):
-                    cls  = int(result.boxes.cls[i])
-                    conf = float(result.boxes.conf[i])
-                    x1, y1, x2, y2 = map(int, result.boxes.xyxy[i])
-                    det = (x1, y1, x2, y2, conf)
-                    if cls in self._PHONE_CLS:
-                        phone_dets.append(det)
-                    elif cls in self._FOOD_CLS:
-                        food_dets.append(det)
-                    elif cls in self._BOOK_CLS:
-                        book_dets.append(det)
+            api_key = os.environ.get('ROBOFLOW_API_KEY', '')
+            if api_key:
+                # Load model once and cache it
+                if self.roboflow_model is None:
+                    from roboflow import Roboflow
+                    rf = Roboflow(api_key=api_key)
+                    project = rf.workspace().project("classroom-cell-phone-detection")
+                    self.roboflow_model = project.version(18).model
+                    print('[OK] Roboflow model loaded and cached locally')
+                
+                # Predict locally
+                result = self.roboflow_model.predict(frame, confidence=20, overlap=30).json()
+                
+                for prediction in result.get('predictions', []):
+                    x1 = int(prediction['x'] - prediction['width'] / 2)
+                    y1 = int(prediction['y'] - prediction['height'] / 2)
+                    x2 = int(prediction['x'] + prediction['width'] / 2)
+                    y2 = int(prediction['y'] + prediction['height'] / 2)
+                    conf = prediction['confidence']
+                    phone_dets.append((x1, y1, x2, y2, conf))
+                
+                if phone_dets:
+                    print(f'[ROBOFLOW-LOCAL] Found {len(phone_dets)} phone(s)')
+        except ImportError:
+            print('[WARN] roboflow package not installed, falling back to YOLO for phones')
         except Exception as e:
-            print(f'[WARN] Object detection failed: {e}')
+            print(f'[WARN] Roboflow local detection failed: {e}')
+        
+        # If Roboflow didn't find phones, try YOLO as fallback
+        if not phone_dets and self.object_model is not None:
+            try:
+                for result in self.object_model(frame, verbose=False, conf=0.35, iou=0.45):
+                    if result.boxes is None:
+                        continue
+                    for i in range(len(result.boxes)):
+                        cls  = int(result.boxes.cls[i])
+                        if cls in self._PHONE_CLS:
+                            conf = float(result.boxes.conf[i])
+                            x1, y1, x2, y2 = map(int, result.boxes.xyxy[i])
+                            phone_dets.append((x1, y1, x2, y2, conf))
+            except Exception as e:
+                print(f'[WARN] YOLO phone fallback failed: {e}')
+        
         return phone_dets, food_dets, book_dets
 
     def _parse_pose_detections(self, frame: np.ndarray):

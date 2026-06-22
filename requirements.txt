@@ -20,6 +20,7 @@ ultralytics==8.3.55
 # HTTP
 requests==2.32.3
 urllib3==2.3.0
+roboflow>=1.1.46
 
 # 3D CNN fight detection (mc3_18 / r3d_18)
 torch>=2.0.0
