@@ -84,6 +84,25 @@ class TemporalBehaviorEngine:
     PHONE_SIZE_MAX_RATIO         = 0.85   # Phone max dimension < 85% of person bbox_h
     PHONE_SIZE_MIN_RATIO         = 0.03   # Phone min dimension > 3% of person bbox_h
     PHONE_BBOX_EXPAND            = 0.20   # Expand person bbox by 20% when checking containment
+
+    # Strategy-1 (YOLO) spread veto used to fire on a flat 0.32 with no
+    # escape hatch — vetoing real one-handed phone detections whenever the
+    # off-hand happened to be visible and naturally spread away from the
+    # body. It now reuses PHONE_TWO_HAND_SPREAD_VETO below as the trigger
+    # point (consistent with Strategy 2's own definition of "spread enough
+    # to suspect writing") and pairs it with a tight-grip + idle-far-hand
+    # override, so the FIX is the override carve-out, not a loosened
+    # absolute number that would also blind it to genuine two-hand writing.
+    PHONE_TIGHT_GRIP_RATIO       = 0.18   # phone within this of a WRIST = hand is gripping it
+
+    # Strategy-2 (pose-only fallback) two-hand writing-posture veto. Also
+    # reused by Strategy 1 (see above) as the spread-veto trigger point.
+    PHONE_TWO_HAND_SPREAD_VETO   = 0.30
+    # When both wrists ARE visible but one sits far off to the side (resting,
+    # not gripping anything) while the other stays centered, treat it as a
+    # one-handed hold rather than forcing the symmetric two-hand veto.
+    PHONE_IDLE_HAND_OFFSET_RATIO = 0.35
+    PHONE_SINGLE_HAND_CENTER_RATIO = 0.28  # phone-holding hand stays roughly centered
     WRITING_DESK_Y_MIN           = 0.70   # Writing starts lower (clean separation)
     LOW_CONFIDENCE_THRESHOLD     = 0.5    # Confidence threshold for keypoints
     HEAD_DOWN_CONSECUTIVE_FRAMES = 3
@@ -324,6 +343,51 @@ class TemporalBehaviorEngine:
         ix2, iy2 = min(px2, epx2), min(py2, epy2)
         return ix1 < ix2 and iy1 < iy2
 
+    # ── Single-hand phone scoring (pose-only fallback) ─────────────────────────
+    def _score_single_hand_phone(self, wrist: np.ndarray, head_is_down: bool,
+                                  motion_conf: float, bbox_h: float, y1: float,
+                                  x1: float, x2: float) -> Tuple[bool, float]:
+        """
+        Score a ONE-handed phone hold from a single wrist keypoint.
+
+        Used in two situations:
+          1. Only one wrist keypoint is confident at all (the other hand is
+             occluded, off-screen, or simply at the student's side where the
+             pose model doesn't track it well).
+          2. Both wrists are confident, but one is clearly idle/resting off
+             to the side (see the caller) — only the active wrist is passed
+             in here.
+
+        Deliberately stricter than the two-hand cupped case (threshold 0.58
+        vs 0.55, lower base score) since there is only one corroborating
+        hand position instead of two. Still conservative: requires the wrist
+        to be in the lap/desk zone before any score accrues at all.
+        """
+        y_frac = (wrist[1] - y1) / bbox_h
+        if not (self.PHONE_SINGLE_HAND_Y_MIN < y_frac < self.PHONE_SINGLE_HAND_Y_MAX):
+            return False, 0.0
+
+        lateral_offset = self._wrist_lateral_offset(wrist, x1, x2)
+
+        score = 0.28  # lower base than two-hand cupped (0.30) — one fewer signal available
+        if lateral_offset < self.PHONE_SINGLE_HAND_CENTER_RATIO:
+            score += 0.18   # held close to centerline, not reaching sideways for something else
+        if head_is_down:
+            score += 0.14
+        if motion_conf < 0.10:
+            score += 0.10   # idle hold rather than active gesture
+
+        if score >= 0.58:
+            final_conf = min(score, 0.68)
+            print(f'[PHONE] S2 single-hand PASS score={score:.2f} '
+                  f'y_frac={y_frac:.2f} lateral={lateral_offset:.2f} '
+                  f'head_down={head_is_down} motion_conf={motion_conf:.2f}')
+            return True, final_conf
+
+        print(f'[PHONE] S2 single-hand REJECT score={score:.2f} (threshold 0.58) '
+              f'y_frac={y_frac:.2f} lateral={lateral_offset:.2f}')
+        return False, 0.0
+
 
     # ── Phone Detection — Industry-Grade Multi-Signal Fusion ──────────────────
     def _detect_phone_usage(self, person: TrackedPerson,
@@ -344,7 +408,9 @@ class TemporalBehaviorEngine:
              - Fused confidence = YOLO conf + proximity bonus + head bonus.
           2. Pose heuristic fallback (secondary, when YOLO has no phone):
              - Two cupped wrists in lap (both low, close together, no book).
-             - Single centered wrist in lap zone with head down.
+             - Single wrist in lap zone, centered, head down, low motion —
+               covers the common one-handed-phone case, including when the
+               other hand is visible but idle/resting off to the side.
         """
         x1, y1, x2, y2 = person.bbox
         bbox_h = y2 - y1
@@ -416,16 +482,40 @@ class TemporalBehaviorEngine:
                           f'book-confirmed writing posture — skipping')
                     continue
 
-                # Spread veto: both wrists clearly apart = writing, not phone
+                # Spread veto: both wrists clearly apart AND neither one is
+                # tightly gripping the phone = writing, not phone.
                 # Only apply when both wrists are detected with reasonable confidence.
+                #
+                # FIX: a tight grip on the near wrist (best_proximity very small,
+                # matched keypoint is a WRIST not an elbow) combined with the FAR
+                # wrist sitting well off the body centerline (genuinely idle/
+                # resting, not a second hand symmetrically engaged at the desk)
+                # is direct evidence of a one-handed phone hold — the previous
+                # flat 0.32 spread veto had no escape hatch for this extremely
+                # common pose. Requiring BOTH the tight grip AND an idle far
+                # hand (rather than tight grip alone) avoids re-opening a
+                # different false positive: a pen/eraser near one wrist during
+                # genuine two-hand writing, where the far wrist is still
+                # forward and engaged rather than resting at the student's side.
                 spread_veto = False
                 if kp is not None and len(kp) > 10:
                     lw, rw = kp[9], kp[10]
                     if (_wrist_ok(lw, 0.40) and _wrist_ok(rw, 0.40)):
                         wrist_spread = float(
                             np.linalg.norm(lw[:2] - rw[:2]) / bbox_h)
-                        if wrist_spread > 0.32:  # both hands on notebook
-                            spread_veto = True
+                        if wrist_spread > self.PHONE_TWO_HAND_SPREAD_VETO:
+                            tightly_gripped = (
+                                best_kp_idx in (9, 10)
+                                and best_proximity < self.PHONE_TIGHT_GRIP_RATIO
+                            )
+                            far_wrist = rw if best_kp_idx == 9 else lw
+                            far_is_idle = (
+                                _wrist_ok(far_wrist, 0.40)
+                                and self._wrist_lateral_offset(far_wrist[:2], x1, x2)
+                                    > self.PHONE_IDLE_HAND_OFFSET_RATIO
+                            )
+                            if not (tightly_gripped and far_is_idle):
+                                spread_veto = True
                 if spread_veto:
                     print(f'[PHONE] Person {person.track_id}: YOLO phone present but '
                           f'wrists spread in writing posture — skipping')
@@ -461,27 +551,36 @@ class TemporalBehaviorEngine:
         #   - No veto for spread wrists (writing = hands spread; phone = hands cupped).
         #   - No veto for high wrist-motion variance (writing = constant pen movement).
         #
-        # NEW approach — three hard vetoes, then multi-signal scoring:
+        # What went wrong AFTER that fix (false negatives — real phones missed):
+        #   - Single-wrist detection was removed entirely instead of being fixed,
+        #     so `if len(wrist_pts) < 2: return False` rejected every one-handed
+        #     phone user — by far the common case, since the off-hand is usually
+        #     resting at the student's side or simply outside the pose model's
+        #     confident range.
+        #   - Veto V2 used a flat two-wrist spread check with no distinction
+        #     between "two hands genuinely spread for writing" and "one centered
+        #     hand holding a phone while the other idle hand happens to be
+        #     spread away" — the latter is a completely normal one-handed-phone
+        #     pose that got vetoed too.
         #
-        #   Veto V1: Book/notebook detected near any wrist      → definitively writing
-        #   Veto V2: Both wrists spread > 0.30 × bbox_h        → writing posture
-        #   Veto V3: Wrist-motion variance in writing range     → active pen movement
+        # Current approach — vetoes first, then route to the right scoring path:
         #
-        #   Score signals (threshold 0.55 required before flagging):
-        #     +0.22  Both wrists cupped in lap zone (spread < 0.22, both below 60%)
-        #            — the most distinctive phone-holding signal
-        #     +0.12  Head looking down at lap (reinforces lap phone)
-        #     +0.10  Wrist motion is very low (phone idle ≠ active writing)
-        #     −0.12  Wrists moderately spread (0.22–0.30) — weak writing indicator
+        #   Veto V1: Book/notebook detected near any visible wrist → definitively writing
+        #   Veto V2: Active wrist-motion variance (pen-on-paper)   → definitively writing
+        #            (checked up front since it applies to either path below)
         #
-        #   Score range:  base 0.30 + max signals 0.44 = 0.74 max
-        #   Minimum path: base 0.30 + cupped 0.22 + head_down 0.12 = 0.64  ✓
-        #   Writing path: vetoed before scoring in almost all real cases
+        #   Then:
+        #     • 1 wrist visible             → _score_single_hand_phone() on it
+        #     • 2 wrists, one clearly idle   → _score_single_hand_phone() on the
+        #       active one (idle = lateral offset > 0.35; active = offset < 0.28)
+        #     • 2 wrists, both engaged       → symmetric two-hand path:
+        #         Veto: spread > 0.30 × bbox_h (notebook posture)
+        #         Score (threshold 0.55): +0.22 cupped-in-lap, +0.12 head down,
+        #         +0.10 low motion, −0.12 moderately spread (0.22–0.30)
         #
-        # NOTE: Single-wrist and mid-body heuristics are intentionally removed.
-        #   They are indistinguishable from a writing/resting student by pose alone.
-        #   When YOLO misses a single-handed phone, the object-detection pipeline
-        #   (Strategy 1 with Roboflow fallback) is the correct tool.
+        #   Single-hand scoring is intentionally stricter (threshold 0.58 — see
+        #   _score_single_hand_phone) since there's only one corroborating hand
+        #   position instead of two.
 
         if kp is not None and kp.size > 0 and len(kp) > 10:
             try:
@@ -495,30 +594,59 @@ class TemporalBehaviorEngine:
                     if _wrist_ok(w, 0.45):
                         wrist_pts.append(w[:2].copy())
 
-                if len(wrist_pts) < 2:
-                    # Cannot reliably distinguish phone from writing with only one wrist.
-                    # Single-wrist detection requires YOLO to see the actual phone object.
+                if not wrist_pts:
+                    # No wrist visible at all — nothing to reason from.
                     return False, 0.0
 
-                # ── Veto V1: Book/notebook near hands ────────────────────────
+                # ── Veto V1: Book/notebook near any visible hand ──────────────
                 if any(_book_near(w) for w in wrist_pts):
                     return False, 0.0
 
-                # ── Veto V2: Wrists spread apart — writing posture ────────────
-                # Two hands on a notebook are always spread; two hands holding a
-                # phone are always cupped. This is the single strongest discriminator.
-                spread = float(np.linalg.norm(wrist_pts[0] - wrist_pts[1]) / bbox_h)
-                if spread > 0.30:  # > 30% of body height = notebook writing posture
-                    return False, 0.0
-
-                # ── Veto V3: Active wrist motion = pen movement ───────────────
+                # ── Veto V2: Active wrist motion = pen movement ───────────────
                 # is_writing_motion is True when variance > 400 px² — i.e., the wrist
                 # has been tracing wide arcs consistent with pen-on-paper movement.
+                # Checked up front since it applies regardless of how many wrists
+                # are visible.
                 is_writing_motion, motion_conf = self._calculate_wrist_motion_variance(person)
                 if is_writing_motion:
                     return False, 0.0
 
-                # ── Multi-signal confidence scoring ───────────────────────────
+                # ── Only one wrist visible ─────────────────────────────────────
+                # Can't use the two-wrist spread discriminator with just one
+                # point, so reason from this wrist alone via the dedicated
+                # single-hand scorer instead of rejecting outright.
+                if len(wrist_pts) == 1:
+                    return self._score_single_hand_phone(
+                        wrist_pts[0], head_is_down, motion_conf, bbox_h, y1, x1, x2)
+
+                # ── Both wrists visible — check for an asymmetric one-handed
+                # hold before forcing the symmetric two-hand path below. ──────
+                # Holding a phone in one hand while the other rests naturally
+                # at the student's side produces exactly this pattern: one
+                # wrist near the body centerline, one wrist well off to the
+                # side, and a wide overall spread that a flat threshold alone
+                # would mistake for two-hand writing.
+                spread = float(np.linalg.norm(wrist_pts[0] - wrist_pts[1]) / bbox_h)
+                offsets = [self._wrist_lateral_offset(w, x1, x2) for w in wrist_pts]
+                active_idx = int(np.argmin(offsets))
+                idle_idx = 1 - active_idx
+                one_hand_idle = (
+                    spread > self.PHONE_TWO_HAND_SPREAD_VETO
+                    and offsets[idle_idx] > self.PHONE_IDLE_HAND_OFFSET_RATIO
+                    and offsets[active_idx] < self.PHONE_SINGLE_HAND_CENTER_RATIO
+                )
+                if one_hand_idle:
+                    return self._score_single_hand_phone(
+                        wrist_pts[active_idx], head_is_down, motion_conf, bbox_h, y1, x1, x2)
+
+                # ── Veto: Wrists spread apart — genuine two-hand writing posture ──
+                # Two hands on a notebook are always spread; two hands holding a
+                # phone are always cupped. This is the strongest discriminator
+                # once the asymmetric one-idle-hand case above has been ruled out.
+                if spread > self.PHONE_TWO_HAND_SPREAD_VETO:
+                    return False, 0.0
+
+                # ── Multi-signal confidence scoring (symmetric two-hand case) ──
                 score = 0.30  # base — must be lifted by corroborating signals
 
                 # Signal S1 (strongest): Both wrists cupped in lap zone
