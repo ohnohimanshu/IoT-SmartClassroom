@@ -73,15 +73,17 @@
           <div class="small text-muted">Engagement</div>
         </div>
         <div class="col-md-8">
-          {% if session.snapshots.first %}
-          <img id="snapshot-{{ session.pk }}" src="{{ session.snapshots.first.frame_image.url }}" 
-               class="img-fluid rounded" style="max-height:180px;object-fit:cover">
-          {% else %}
-          <div class="text-center py-4 text-muted" style="background:#f1f5f9;border-radius:12px">
-            <i class="bi bi-image fs-2 d-block mb-2 opacity-30"></i>
-            Waiting for first snapshot...
+          <div id="snapshot-container-{{ session.pk }}">
+            {% if session.snapshots.first %}
+            <img id="snapshot-{{ session.pk }}" src="{{ session.snapshots.first.frame_image.url }}" 
+                 class="img-fluid rounded" style="max-height:180px;object-fit:cover">
+            {% else %}
+            <div class="text-center py-4 text-muted" style="background:#f1f5f9;border-radius:12px" id="snapshot-{{ session.pk }}-div">
+              <i class="bi bi-image fs-2 d-block mb-2 opacity-30"></i>
+              Waiting for first snapshot...
+            </div>
+            {% endif %}
           </div>
-          {% endif %}
         </div>
       </div>
       
@@ -198,6 +200,7 @@ function updateSessionStats() {
         const ring = document.getElementById(`ring-{{ session.pk }}`);
         const scoreEl = document.getElementById(`score-{{ session.pk }}`);
         const modalScoreEl = document.getElementById(`modal-score-{{ session.pk }}`);
+        const snapshotContainer = document.getElementById(`snapshot-container-{{ session.pk }}`);
         
         if (ring && scoreEl) {
           const offset = 314.16 - (314.16 * score / 100);
@@ -208,6 +211,21 @@ function updateSessionStats() {
           
           scoreEl.textContent = score.toFixed(0) + '%';
           if (modalScoreEl) modalScoreEl.textContent = score.toFixed(0);
+        }
+
+        // Refresh snapshot image
+        if (snapshotContainer) {
+          // Fetch session detail to get latest snapshot
+          fetch(window.location.pathname)
+            .then(response => response.text())
+            .then(html => {
+              const parser = new DOMParser();
+              const doc = parser.parseFromString(html, "text/html");
+              const newSnapshotContainer = doc.getElementById(`snapshot-container-{{ session.pk }}`);
+              if (newSnapshotContainer) {
+                snapshotContainer.innerHTML = newSnapshotContainer.innerHTML;
+              }
+            });
         }
       }
     });

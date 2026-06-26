@@ -712,14 +712,12 @@ def _generate_video_stream(video_path, camera_id=0, camera_location='Classroom',
                 if (now - last_snapshot_save) >= SNAPSHOT_INTERVAL:
                     last_snapshot_save = now
                     
-                    focused = looking_away = head_down = using_phone = eating = not_visible = 0
+                    focused = looking_away = head_down = using_phone = eating = hand_raised = not_visible = 0
                     for det in current_dets:
                         dt = det.get('type', 'not_visible')
                         if dt == 'focused':
                             focused += 1
-                        elif dt == 'distracted':
-                            looking_away += 1
-                        elif dt == 'looking_away':
+                        elif dt in ('distracted', 'looking_away'):
                             looking_away += 1
                         elif dt == 'head_down':
                             head_down += 1
@@ -727,13 +725,15 @@ def _generate_video_stream(video_path, camera_id=0, camera_location='Classroom',
                             using_phone += 1
                         elif dt == 'eating_food':
                             eating += 1
+                        elif dt == 'hand_raised':
+                            hand_raised += 1
                         else:
                             not_visible += 1
                     
-                    total_detected = focused + looking_away + head_down + using_phone + eating
+                    total_detected = focused + looking_away + head_down + using_phone + eating + hand_raised
                     engagement_score = (focused / total_detected * 100) if total_detected > 0 else 0.0
                     
-                    def _save_snapshot_bg(f_copy, f_count, l_away, h_down, u_phone, eat, n_vis, t_det, e_score):
+                    def _save_snapshot_bg(f_copy, f_count, l_away, h_down, u_phone, eat, h_raised, n_vis, t_det, e_score):
                         try:
                             from django.db import close_old_connections
                             close_old_connections()
@@ -760,7 +760,7 @@ def _generate_video_stream(video_path, camera_id=0, camera_location='Classroom',
                     
                     snapshot_thread = threading.Thread(
                         target=_save_snapshot_bg, 
-                        args=(frame.copy(), focused, looking_away, head_down, using_phone, eating, not_visible, total_detected, engagement_score),
+                        args=(frame.copy(), focused, looking_away, head_down, using_phone, eating, hand_raised, not_visible, total_detected, engagement_score),
                         daemon=True
                     )
                     snapshot_thread.start()
@@ -827,7 +827,7 @@ def _generate_video_stream(video_path, camera_id=0, camera_location='Classroom',
 
                 # ── Draw annotations ──────────────────────────────────────────
                 annotated  = frame.copy()
-                focused = distracted = phone = eating = 0
+                focused = distracted = phone = eating = hand_raised = 0
 
                 max_annotations = min(len(current_dets), 20)
                 for det in current_dets[:max_annotations]:
@@ -836,6 +836,7 @@ def _generate_video_stream(video_path, camera_id=0, camera_location='Classroom',
                     elif dt in ('looking_away','head_down', 'distracted'): distracted += 1
                     elif dt == 'using_phone': phone     += 1
                     elif dt == 'eating_food': eating    += 1
+                    elif dt == 'hand_raised': hand_raised +=1
 
                     x1, y1, x2, y2 = det['bbox']
                     color     = det.get('color', COLOR_MAP.get(dt, (120,120,120)))
@@ -845,17 +846,17 @@ def _generate_video_stream(video_path, camera_id=0, camera_location='Classroom',
                     cv2.putText(annotated, label, (x1+4, max(y1-8,18)), cv2.FONT_HERSHEY_SIMPLEX, 0.52, color, 2)
 
                 # Summary bar
-                total = focused + distracted + phone + eating
+                total = focused + distracted + phone + eating + hand_raised
                 score = (focused / total * 100) if total > 0 else 0.0
-                bar   = f'Focused:{focused}  Distracted:{distracted}  Phone:{phone}  Eating:{eating}  Score:{score:.0f}%'
+                bar   = f'Focused:{focused}  Distracted:{distracted}  Phone:{phone}  Eating:{eating}  Hand Raised:{hand_raised}  Score:{score:.0f}%'
                 bar_w = min(len(bar)*9+14, annotated.shape[1])
                 cv2.rectangle(annotated, (0,0), (bar_w,26), (20,20,20), -1)
                 cv2.putText(annotated, bar, (6,18), cv2.FONT_HERSHEY_SIMPLEX, 0.48, (255,255,255), 1)
 
                 # Colour legend
                 fh, fw = annotated.shape[:2]
-                for li, (ltxt, lclr) in enumerate([('Focused', (0,200,60)), ('Distracted', (0,165,255)), ('Alert', (0,0,220))]):
-                    lx = fw-130; ly = 12+li*20
+                for li, (ltxt, lclr) in enumerate([('Focused', (0,200,60)), ('Distracted', (0,165,255)), ('Alert', (0,0,220)), ('Hand Raised', (255,255,0))]):
+                    lx = fw-150; ly = 12+li*20
                     cv2.rectangle(annotated, (lx,ly-10), (lx+14,ly+4), lclr, -1)
                     cv2.putText(annotated, ltxt, (lx+18,ly+3), cv2.FONT_HERSHEY_SIMPLEX, 0.42, lclr, 1)
 
