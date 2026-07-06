@@ -1,0 +1,144 @@
+{% extends "entrance_cam/base.html" %}
+{% block title %}Video Analysis{% endblock %}
+{% block page_title %}Video Engagement Analysis{% endblock %}
+
+{% block content %}
+<div class="row g-4">
+
+  {# ── Upload card ──────────────────────────────────────────────────────── #}
+  <div class="col-xl-4">
+    <div class="form-card h-100">
+      <div class="section-hdr mb-3">
+        <h5><i class="bi bi-cloud-upload me-2" style="color:#0891b2"></i>Upload Video</h5>
+      </div>
+      <form method="post" action="{% url 'classroom_video_upload' %}" enctype="multipart/form-data">
+        {% csrf_token %}
+        <div class="mb-3">
+          {{ form.title.label_tag }}
+          {{ form.title }}
+          {% if form.title.errors %}<div class="text-danger small mt-1">{{ form.title.errors|join:", " }}</div>{% endif %}
+        </div>
+        <div class="mb-3">
+          {{ form.video_file.label_tag }}
+          {{ form.video_file }}
+          {% if form.video_file.errors %}<div class="text-danger small mt-1">{{ form.video_file.errors|join:", " }}</div>{% endif %}
+          <div class="form-text">MP4 or AVI, any length. Analysis samples 1 frame every 2 s.</div>
+        </div>
+        <div class="mb-3">
+          {{ form.notes.label_tag }}
+          {{ form.notes }}
+        </div>
+        <button type="submit" class="btn w-100" style="background:#0891b2;color:#fff;border:none;border-radius:8px">
+          <i class="bi bi-upload me-1"></i>Upload & Analyse
+        </button>
+      </form>
+    </div>
+  </div>
+
+  {# ── Video list ───────────────────────────────────────────────────────── #}
+  <div class="col-xl-8">
+    <div class="form-card">
+      <div class="section-hdr mb-3">
+        <h5><i class="bi bi-collection-play me-2" style="color:#0891b2"></i>Uploaded Videos</h5>
+      </div>
+
+      {% if videos %}
+      <div class="table-responsive">
+        <table class="table table-hover align-middle mb-0">
+          <thead style="background:#f8fafc">
+            <tr>
+              <th>Title</th>
+              <th>Uploaded</th>
+              <th>Duration</th>
+              <th>Status</th>
+              <th class="text-end">Engagement</th>
+              <th></th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for v in videos %}
+            <tr id="video-row-{{ v.pk }}">
+              <td>
+                <a href="{% url 'classroom_video_detail' v.pk %}" class="fw-600 text-decoration-none" style="color:#1e293b">
+                  {{ v.title }}
+                </a>
+                {% if v.notes %}<div class="small text-muted">{{ v.notes|truncatechars:60 }}</div>{% endif %}
+              </td>
+              <td class="small text-muted">{{ v.uploaded_at|date:"d M Y, H:i" }}</td>
+              <td class="small text-muted">
+                {% if v.duration_seconds %}{{ v.duration_seconds }}s{% else %}—{% endif %}
+              </td>
+              <td>
+                {% if v.status == 'completed' %}
+                  <span class="badge" style="background:#dcfce7;color:#166534">Completed</span>
+                {% elif v.status == 'processing' %}
+                  <span class="badge" style="background:#fef9c3;color:#854d0e" id="badge-{{ v.pk }}">
+                    <span class="spinner-border spinner-border-sm me-1"></span>Processing…
+                  </span>
+                {% elif v.status == 'failed' %}
+                  <span class="badge" style="background:#fee2e2;color:#dc2626">Failed</span>
+                {% else %}
+                  <span class="badge" style="background:#e2e8f0;color:#475569">Uploading</span>
+                {% endif %}
+              </td>
+              <td class="text-end">
+                {% if v.status == 'completed' %}
+                  <span id="score-{{ v.pk }}" class="fw-700" style="color:{% if v.average_engagement_score >= 70 %}#16a34a{% elif v.average_engagement_score >= 40 %}#d97706{% else %}#dc2626{% endif %}">
+                    {{ v.average_engagement_score|floatformat:1 }}%
+                  </span>
+                {% else %}
+                  <span id="score-{{ v.pk }}" class="text-muted">—</span>
+                {% endif %}
+              </td>
+              <td class="text-end">
+                <a href="{% url 'classroom_video_detail' v.pk %}" class="btn btn-sm me-1" style="background:#cffafe;color:#0891b2;border:none;border-radius:6px">
+                  <i class="bi bi-eye"></i>
+                </a>
+                <form method="post" action="{% url 'classroom_video_delete' v.pk %}" style="display:inline"
+                      onsubmit="return confirm('Delete this video and all analysis data?')">
+                  {% csrf_token %}
+                  <button type="submit" class="btn btn-sm" style="background:#fee2e2;color:#dc2626;border:none;border-radius:6px">
+                    <i class="bi bi-trash"></i>
+                  </button>
+                </form>
+              </td>
+            </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+      {% else %}
+      <div class="text-center py-5 text-muted">
+        <i class="bi bi-film fs-1 d-block mb-3 opacity-20"></i>
+        <p>No videos yet. Upload one on the left to get started.</p>
+      </div>
+      {% endif %}
+    </div>
+  </div>
+
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+// Poll processing videos every 4 s until they finish
+const processing = [{% for v in videos %}{% if v.status == 'processing' %}{{ v.pk }},{% endif %}{% endfor %}];
+
+function pollStatus(pk) {
+  fetch(`/classroom/videos/${pk}/status/`)
+    .then(r => r.json())
+    .then(d => {
+      if (d.status === 'completed' || d.status === 'failed') {
+        location.reload();
+      } else {
+        const badge = document.getElementById(`badge-${pk}`);
+        if (badge) badge.title = `${d.total_frames_analyzed} frames processed`;
+        setTimeout(() => pollStatus(pk), 4000);
+      }
+    })
+    .catch(() => setTimeout(() => pollStatus(pk), 6000));
+}
+
+processing.forEach(pk => setTimeout(() => pollStatus(pk), 4000));
+</script>
+{% endblock %}
