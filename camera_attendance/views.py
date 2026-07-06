@@ -312,7 +312,7 @@ def api_log_camera_attendance(request):
         )
 
     try:
-        today        = date.today()
+        today        = timezone.now().date()
         emotion      = _validate_emotion(data.get('emotion', 'unknown'))
         score        = _clamp_score(data.get('score', 0.0))
         snapshot_b64 = data.get('snapshot')
@@ -420,6 +420,11 @@ def api_camera_students_encodings(request):
     if request.method != 'GET':
         return JsonResponse({'error': 'GET only'}, status=405)
 
+    from classroom_monitor.api_auth import check_detection_api_key
+    auth_err = check_detection_api_key(request)
+    if auth_err:
+        return auth_err
+
     try:
         students = (
             Student.objects
@@ -499,7 +504,7 @@ def api_camera_live_detections(request):
 
     try:
         camera_id = request.GET.get('camera_id')
-        today     = date.today()
+        today        = timezone.now().date()
 
         qs = CameraAttendanceLog.objects.filter(date=today).select_related('student')
         if camera_id:

@@ -171,6 +171,10 @@ def session_end(request):
 def api_snapshot(request):
     if request.method != 'POST':
         return JsonResponse({'error': 'POST only'}, status=405)
+    from classroom_monitor.api_auth import check_detection_api_key
+    auth_err = check_detection_api_key(request)
+    if auth_err:
+        return auth_err
     try:
         data = json.loads(request.body)
         camera_id = data.get('camera_id')
@@ -436,12 +440,22 @@ def _get_yolo_detector():
     return _SHARED_DETECTOR
 
 
+def _incident_severity(det_type: str) -> str:
+    if det_type in ('using_phone', 'eating_food'):
+        return 'high'
+    if det_type in ('distracted', 'looking_away', 'head_down'):
+        return 'medium'
+    return 'low'
+
+
 def _save_incident_direct(det_type, confidence, snapshot_bgr, student,
-                          student_name, roll_no, camera_obj, request_obj=None):
+                         student_name, roll_no, camera_obj, request_obj=None,
+                         description_extra=''):
     """
     Save IncidentReport to DB and send one alert email per student per incident
     type with a 5-minute cooldown (per student, not global).
     Called directly — no HTTP self-POST, no Twilio. Uses SMTP email.
+    Returns the IncidentReport on success, None on failure.
     """
     try:
         _, buf = cv2.imencode('.jpg', snapshot_bgr, [cv2.IMWRITE_JPEG_QUALITY, 80])
@@ -449,11 +463,12 @@ def _save_incident_direct(det_type, confidence, snapshot_bgr, student,
         ts        = timezone.now().strftime('%Y%m%d_%H%M%S_%f')
         snap_file = CF(buf.tobytes(), name=f'incident_{ts}.jpg')
 
-        severity = ('medium' if det_type in ('using_phone', 'eating_food') else
-                    'low')
+        from classroom_monitor.constants import LABEL_MAP, EMAIL_ALERT_TYPES
+        severity = _incident_severity(det_type)
         tag   = f'{student_name} ({roll_no})' if student else 'Unknown person'
-        from classroom_monitor.behavior_detection import LABEL_MAP
         label = LABEL_MAP.get(det_type, det_type)
+
+        desc = description_extra or f'{label} — {tag}'
 
         incident = IncidentReport.objects.create(
             student=student,
@@ -462,12 +477,11 @@ def _save_incident_direct(det_type, confidence, snapshot_bgr, student,
             severity=severity,
             confidence=float(confidence),
             snapshot=snap_file,
-            description=f'{label} — {tag}',
-            whatsapp_sent=False,   # field kept for DB compat, unused now
+            description=desc,
+            whatsapp_sent=False,
         )
 
-        # Email only for RED alert poses
-        if det_type in ('using_phone', 'eating_food'):
+        if det_type in EMAIL_ALERT_TYPES:
             _send_incident_email(
                 incident=incident,
                 student=student,
@@ -482,23 +496,11 @@ def _save_incident_direct(det_type, confidence, snapshot_bgr, student,
         print(f'[ERROR] _save_incident_direct: {e}')
         return None
 
-
 def _generate_video_stream(video_path, camera_id=0, camera_location='Classroom',
                             request_obj=None):
     """
     MJPEG stream — crash-free on Windows, no HTTP self-calls.
-
-    Thread layout (dlib/face_recognition ONLY on main thread):
-      Main thread    — reads frames, draws boxes, runs face-recog when needed,
-                       yields MJPEG bytes
-      Detect worker  — YOLO + Haar cascade only (no dlib)
-      Incident saver — DB write + WhatsApp (no dlib, receives pre-identified data)
-
-    Why dlib must stay on the main thread on Windows:
-      dlib's CNN face detector uses Intel TBB / BLAS internally and crashes
-      (0xC0000005 access violation) when called from a non-main Windows thread,
-      even with a GIL. We avoid this by keeping all face_recognition calls in
-      the main generator loop, throttled to once per FACEREC_INTERVAL seconds.
+    Fully isolated against dictionary/dataclass structural type mismatches.
     """
     import time
     import threading
@@ -508,6 +510,7 @@ def _generate_video_stream(video_path, camera_id=0, camera_location='Classroom',
         ClassroomBehaviorDetector, COLOR_MAP, LABEL_MAP,
         ALERT_POSES, DISTRACTED_POSES,
     )
+    from classroom_monitor.constants import EMAIL_ALERT_TYPES
     from classroom_monitor.face_recognition_helper import (
         StudentFaceRecognizer, DLIB_LOCK,
     )
@@ -540,7 +543,8 @@ def _generate_video_stream(video_path, camera_id=0, camera_location='Classroom',
     detect_q    = _queue.Queue(maxsize=1)   # frames  → detect worker
     save_q      = _queue.Queue(maxsize=50)  # incident dicts → DB/WA saver
     stop_event  = threading.Event()
-    cooldown    = {}                        # det_type → last incident timestamp
+    cooldown    = {}                        # (type, track_id) → last saved timestamp
+    pending_keys = set()
 
     # ── Detect worker — YOLO + Haar only, NO dlib ────────────────────────────
     def _detection_worker():
@@ -567,9 +571,8 @@ def _generate_video_stream(video_path, camera_id=0, camera_location='Classroom',
                 continue
             
             try:
-                # Clean up old connections before/after DB operations
                 close_old_connections()
-                _save_incident_direct(
+                incident = _save_incident_direct(
                     det_type     = item['type'],
                     confidence   = item['confidence'],
                     snapshot_bgr = item['snapshot'],
@@ -579,11 +582,15 @@ def _generate_video_stream(video_path, camera_id=0, camera_location='Classroom',
                     camera_obj   = camera_obj,
                     request_obj  = request_obj,
                 )
+                if incident is not None and item.get('cooldown_key') is not None:
+                    cooldown[item['cooldown_key']] = time.time()
                 tag = f"{item['name']} ({item['roll']})" if item['student'] else 'Unknown'
                 print(f"[INCIDENT] {LABEL_MAP.get(item['type'], item['type'])} | {tag}")
                 close_old_connections()
             except Exception as exc:
                 print(f'[SAVE WORKER] {exc}')
+            finally:
+                pending_keys.discard(item.get('cooldown_key'))
 
     det_thread  = threading.Thread(target=_detection_worker, daemon=True)
     save_thread = threading.Thread(target=_save_worker,      daemon=True)
@@ -591,214 +598,280 @@ def _generate_video_stream(video_path, camera_id=0, camera_location='Classroom',
     save_thread.start()
 
     # ── Video / camera capture ────────────────────────────────────────────────
-    cap = cv2.VideoCapture(video_path)
-    if not cap.isOpened():
+    cap = None
+    reconnect_attempts = 0
+    max_reconnect_attempts = 5
+    reconnect_delay = 2
+    
+    def _open_camera():
+        try:
+            path = int(video_path) if str(video_path).isdigit() else video_path
+            cv2_cap = cv2.VideoCapture(path)
+            if cv2_cap.isOpened():
+                cv2_cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+                return cv2_cap
+        except Exception as e:
+            print(f'[STREAM] Error opening camera: {e}')
+        return None
+    
+    cap = _open_camera()
+    if cap is None:
+        print(f'[STREAM] Failed to open camera: {video_path}')
         stop_event.set()
         return
 
     src_fps      = cap.get(cv2.CAP_PROP_FPS) or 25.0
     target_fps   = min(src_fps, 25.0)
     frame_delay  = 1.0 / target_fps
-    detect_every = max(1, int(src_fps))     # YOLO once per source-second
+    detect_every = max(1, int(src_fps))
     frame_count  = 0
     last_yield   = time.monotonic()
-    last_facerec = 0.0                      # time of last face-rec attempt
-    last_snapshot_save = 0.0                # time of last engagement snapshot save
+    last_facerec = 0.0
+    last_snapshot_save = 0.0
+    consecutive_errors = 0
+    max_consecutive_errors = 10
 
     try:
         while True:
-            ret, frame = cap.read()
-            if not ret:
-                break
-            frame_count += 1
-
-            # ── Feed detect worker ────────────────────────────────────────────
-            if frame_count % detect_every == 0:
-                try:
-                    detect_q.put_nowait(frame.copy())
-                except _queue.Full:
-                    pass
-
-            # ── Save engagement snapshot periodically ──────────────────────────
-            now = time.time()
-            if (now - last_snapshot_save) >= SNAPSHOT_INTERVAL:
-                last_snapshot_save = now
-                with result_lock:
-                    snap_dets = list(latest_dets)
+            try:
+                if cap is None or not cap.isOpened():
+                    raise RuntimeError("Camera not connected")
+                    
+                ret, frame = cap.read()
+                if not ret or frame is None:
+                    consecutive_errors += 1
+                    if consecutive_errors >= 5:
+                        if cap:
+                            cap.release()
+                        cap = _open_camera()
+                        if cap is None:
+                            reconnect_attempts += 1
+                            if reconnect_attempts >= max_reconnect_attempts:
+                                break
+                            time.sleep(reconnect_delay)
+                        else:
+                            consecutive_errors = 0
+                            reconnect_attempts = 0
+                    time.sleep(0.1) # Prevent CPU spinning on EOF
+                    continue
+                else:
+                    consecutive_errors = 0
+                    reconnect_attempts = 0
+                    
+            except Exception as e:
+                consecutive_errors += 1
+                if consecutive_errors >= max_consecutive_errors:
+                    if cap:
+                        cap.release()
+                    time.sleep(reconnect_delay)
+                    cap = _open_camera()
+                    consecutive_errors = 0
+                    if cap is None:
+                        reconnect_attempts += 1
+                        if reconnect_attempts >= max_reconnect_attempts:
+                            break
+                else:
+                    time.sleep(0.1)
+                continue
                 
-                # Count behaviors
-                focused = 0
-                looking_away = 0
-                head_down = 0
-                using_phone = 0
-                eating = 0
-                not_visible = 0
-                
-                for det in snap_dets:
-                    dt = det.get('type', 'not_visible')
-                    if dt == 'focused':
-                        focused += 1
-                    elif dt == 'looking_away':
-                        looking_away += 1
-                    elif dt == 'head_down':
-                        head_down += 1
-                    elif dt == 'using_phone':
-                        using_phone += 1
-                    elif dt == 'eating_food':
-                        eating += 1
-                    else:
-                        not_visible += 1
-                
-                total_detected = focused + looking_away + head_down + using_phone + eating
-                engagement_score = (focused / total_detected * 100) if total_detected > 0 else 0.0
-                
-                # Save engagement snapshot if there's an active session
-                try:
-                    session = ClassSession.objects.filter(camera_id=camera_id, is_active=True).first()
-                    if session:
-                        # Encode frame
-                        _, buf = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
-                        frame_file = ContentFile(buf.tobytes(), name=f"frame_{session.pk}_{timezone.now().strftime('%Y%m%d_%H%M%S')}.jpg")
-                        
-                        # Create snapshot
-                        snapshot = EngagementSnapshot.objects.create(
-                            session=session,
-                            frame_image=frame_file,
-                            focused_count=focused,
-                            looking_away_count=looking_away,
-                            head_down_count=head_down,
-                            using_phone_count=using_phone,
-                            eating_count=eating,
-                            not_visible_count=not_visible,
-                            total_detected=total_detected,
-                            engagement_score=engagement_score,
-                        )
-                except Exception as e:
-                    print(f'[SNAPSHOT] Error saving engagement snapshot: {e}')
+            # ── PROTECTED INNER LOOP PROCESSING (Prevents all 500 stream crashes) ──
+            try:
+                frame_count += 1
 
-            # ── Face recognition + incident queueing (MAIN THREAD, throttled) ─
-            now = time.time()
-            if (now - last_facerec) >= FACEREC_INTERVAL:
-                last_facerec = now
-                with result_lock:
-                    snap_dets = list(latest_dets)
-
-                for det in snap_dets:
-                    if not (det['is_alert'] or det['is_distracted']):
-                        continue
-                    key = (det['type'], det.get('track_id'))
-                    if (now - cooldown.get(key, 0)) < COOLDOWN_S:
-                        continue
-
-                    x1, y1, x2, y2 = det['bbox']
-                    mid_y = y1 + int((y2 - y1) * 0.55)
-                    crop  = frame[y1:mid_y, x1:x2]
-                    if crop.size == 0:
-                        crop = frame[y1:y2, x1:x2]
-
-                    # dlib call — main thread only, DLIB_LOCK acquired inside match()
-                    sid, name, roll, _ = (recognizer.match(crop)
-                                          if crop.size > 0
-                                          else (None, 'Unknown', '', 1.0))
-
-                    student = None
-                    if sid:
-                        try:
-                            from entrance_cam.models import Student
-                            student = Student.objects.get(pk=sid)
-                        except Exception:
-                            pass
-
-                    cooldown[key] = now
+                if frame_count % detect_every == 0:
                     try:
-                        # Draw rectangles on snapshot before saving
-                        snap_with_rects = frame.copy()
-                        for d in snap_dets:
-                            x1, y1, x2, y2 = d['bbox']
-                            color = d['color']
-                            label = d['label']
-                            conf = d['confidence']
-                            
-                            # Draw rectangle
-                            cv2.rectangle(snap_with_rects, (x1, y1), (x2, y2), color, 2)
-                            
-                            # Draw label with background
-                            text = f"{label} ({conf:.2f})"
-                            font = cv2.FONT_HERSHEY_SIMPLEX
-                            font_scale = 0.5
-                            thickness = 1
-                            text_size = cv2.getTextSize(text, font, font_scale, thickness)[0]
-                            
-                            # Background for text
-                            bg_x1 = x1
-                            bg_y1 = max(0, y1 - text_size[1] - 4)
-                            bg_x2 = x1 + text_size[0] + 4
-                            bg_y2 = y1
-                            cv2.rectangle(snap_with_rects, (bg_x1, bg_y1), (bg_x2, bg_y2), color, -1)
-                            
-                            # Text
-                            cv2.putText(snap_with_rects, text, (x1 + 2, y1 - 2), font, 
-                                       font_scale, (255, 255, 255), thickness)
-                        
-                        save_q.put_nowait({
-                            'type':       key,
-                            'confidence': det['confidence'],
-                            'snapshot':   snap_with_rects,
-                            'student':    student,
-                            'name':       name,
-                            'roll':       roll,
-                        })
+                        detect_q.put_nowait(frame.copy())
                     except _queue.Full:
                         pass
 
-            # ── Draw annotations ──────────────────────────────────────────────
-            annotated  = frame.copy()
-            focused = distracted = phone = eating = 0
+                # Thread safe extraction & absolute dictionary normalization
+                with result_lock:
+                    raw_dets = list(latest_dets)
+                
+                current_dets = []
+                for rd in raw_dets:
+                    if isinstance(rd, dict):
+                        current_dets.append(rd)
+                    else:
+                        try:
+                            current_dets.append({
+                                'type': getattr(rd, 'type', 'focused'),
+                                'bbox': getattr(rd, 'bbox', (0,0,0,0)),
+                                'confidence': getattr(rd, 'confidence', 0.0),
+                                'color': getattr(rd, 'color', (0,200,60)),
+                                'label': getattr(rd, 'label', 'Focused'),
+                                'is_alert': getattr(rd, 'is_alert', False),
+                                'is_distracted': getattr(rd, 'is_distracted', False),
+                                'track_id': getattr(rd, 'track_id', None),
+                            })
+                        except Exception:
+                            pass
 
-            with result_lock:
-                current_dets = list(latest_dets)
+                # ── Save engagement snapshot periodically ─────────────────────
+                now = time.time()
+                if (now - last_snapshot_save) >= SNAPSHOT_INTERVAL:
+                    last_snapshot_save = now
+                    
+                    focused = looking_away = head_down = using_phone = eating = hand_raised = not_visible = 0
+                    for det in current_dets:
+                        dt = det.get('type', 'not_visible')
+                        if dt == 'focused':
+                            focused += 1
+                        elif dt in ('distracted', 'looking_away'):
+                            looking_away += 1
+                        elif dt == 'head_down':
+                            head_down += 1
+                        elif dt == 'using_phone':
+                            using_phone += 1
+                        elif dt == 'eating_food':
+                            eating += 1
+                        elif dt == 'hand_raised':
+                            hand_raised += 1
+                        else:
+                            not_visible += 1
+                    
+                    total_detected = focused + looking_away + head_down + using_phone + eating + hand_raised
+                    engagement_score = (focused / total_detected * 100) if total_detected > 0 else 0.0
+                    
+                    def _save_snapshot_bg(f_copy, f_count, l_away, h_down, u_phone, eat, h_raised, n_vis, t_det, e_score):
+                        try:
+                            from django.db import close_old_connections
+                            close_old_connections()
+                            session = ClassSession.objects.filter(camera_id=camera_id, is_active=True).first()
+                            if session:
+                                ret_b, buf_b = cv2.imencode('.jpg', f_copy, [cv2.IMWRITE_JPEG_QUALITY, 80])
+                                if ret_b and buf_b is not None:
+                                    frame_file = ContentFile(buf_b.tobytes(), name=f"frame_{session.pk}_{timezone.now().strftime('%Y%m%d_%H%M%S')}.jpg")
+                                    EngagementSnapshot.objects.create(
+                                        session=session,
+                                        frame_image=frame_file,
+                                        focused_count=f_count,
+                                        looking_away_count=l_away,
+                                        head_down_count=h_down,
+                                        using_phone_count=u_phone,
+                                        eating_count=eat,
+                                        not_visible_count=n_vis,
+                                        total_detected=t_det,
+                                        engagement_score=e_score,
+                                    )
+                            close_old_connections()
+                        except Exception as e:
+                            print(f'[SNAPSHOT] Error saving engagement snapshot: {e}')
+                    
+                    snapshot_thread = threading.Thread(
+                        target=_save_snapshot_bg, 
+                        args=(frame.copy(), focused, looking_away, head_down, using_phone, eating, hand_raised, not_visible, total_detected, engagement_score),
+                        daemon=True
+                    )
+                    snapshot_thread.start()
 
-            for det in current_dets:
-                dt = det.get('type', 'not_visible')
-                if   dt == 'focused':                         focused   += 1
-                elif dt in ('looking_away','head_down',
-                             'distracted'):                   distracted += 1
-                elif dt == 'using_phone':                     phone     += 1
-                elif dt == 'eating_food':                     eating    += 1
+                # ── Face recognition + incident queueing ──────────────────────
+                now = time.time()
+                if (now - last_facerec) >= FACEREC_INTERVAL:
+                    last_facerec = now
+                    facerec_start = time.time()
+                    
+                    for det in current_dets:
+                        if time.time() - facerec_start > 1.0:
+                            break
+                            
+                        if not (det['is_alert'] or det['is_distracted']):
+                            continue
+                            
+                        key = (det['type'], det.get('track_id'))
+                        if key in pending_keys:
+                            continue
+                        if (now - cooldown.get(key, 0)) < COOLDOWN_S:
+                            continue
 
-                x1, y1, x2, y2 = det['bbox']
-                color     = det.get('color', COLOR_MAP.get(dt, (120,120,120)))
-                label     = det.get('label', LABEL_MAP.get(dt, dt))
-                thickness = 2
-                cv2.rectangle(annotated, (x1,y1), (x2,y2), color, thickness)
-                cv2.putText(annotated, label, (x1+4, max(y1-8,18)),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.52, color, 2)
+                        x1, y1, x2, y2 = det['bbox']
+                        mid_y = y1 + int((y2 - y1) * 0.55)
+                        crop  = frame[y1:mid_y, x1:x2]
+                        if crop.size == 0:
+                            crop = frame[y1:y2, x1:x2]
 
-            # Summary bar
-            total = focused + distracted + phone + eating
-            score = (focused / total * 100) if total > 0 else 0.0
-            bar   = (f'Focused:{focused}  Distracted:{distracted}'
-                     f'  Phone:{phone}  Eating:{eating}  Score:{score:.0f}%')
-            bar_w = min(len(bar)*9+14, annotated.shape[1])
-            cv2.rectangle(annotated, (0,0), (bar_w,26), (20,20,20), -1)
-            cv2.putText(annotated, bar, (6,18),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.48, (255,255,255), 1)
+                        try:
+                            sid, name, roll, _ = (recognizer.match(crop) if crop.size > 0 else (None, 'Unknown', '', float('nan')))
+                            student = None
+                            if sid:
+                                try:
+                                    from entrance_cam.models import Student
+                                    student = Student.objects.get(pk=sid)
+                                except Exception:
+                                    pass
 
-            # Colour legend — top right
-            fh, fw = annotated.shape[:2]
-            for li, (ltxt, lclr) in enumerate([
-                ('Focused',    (0,200,60)),
-                ('Distracted', (0,165,255)),
-                ('Alert',      (0,0,220)),
-            ]):
-                lx = fw-130; ly = 12+li*20
-                cv2.rectangle(annotated, (lx,ly-10), (lx+14,ly+4), lclr, -1)
-                cv2.putText(annotated, ltxt, (lx+18,ly+3),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.42, lclr, 1)
+                            snap_with_rects = frame.copy()
+                            for d in current_dets:
+                                dx1, dy1, dx2, dy2 = d['bbox']
+                                cv2.rectangle(snap_with_rects, (dx1, dy1), (dx2, dy2), d['color'], 2)
+                                text = f"{d['label']} ({d['confidence']:.2f})"
+                                cv2.putText(snap_with_rects, text, (dx1 + 2, dy1 - 2), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
 
+                            item = {
+                                'type':       det['type'],
+                                'confidence': det['confidence'],
+                                'snapshot':   snap_with_rects,
+                                'student':    student,
+                                'name':       name,
+                                'roll':       roll,
+                                'cooldown_key': key,
+                            }
+                            pending_keys.add(key)
+                            try:
+                                save_q.put(item, timeout=2.0)
+                            except _queue.Full:
+                                pending_keys.discard(key)
+                                print('[STREAM] Incident save queue full — dropping alert')
+                        except Exception as e:
+                            print(f'[STREAM] Error in face recognition: {e}')
+
+                # ── Draw annotations ──────────────────────────────────────────
+                annotated  = frame.copy()
+                focused = distracted = phone = eating = hand_raised = 0
+
+                max_annotations = min(len(current_dets), 20)
+                for det in current_dets[:max_annotations]:
+                    dt = det.get('type', 'not_visible')
+                    if   dt == 'focused': focused   += 1
+                    elif dt in ('looking_away','head_down', 'distracted'): distracted += 1
+                    elif dt == 'using_phone': phone     += 1
+                    elif dt == 'eating_food': eating    += 1
+                    elif dt == 'hand_raised': hand_raised +=1
+
+                    x1, y1, x2, y2 = det['bbox']
+                    color     = det.get('color', COLOR_MAP.get(dt, (120,120,120)))
+                    label     = det.get('label', LABEL_MAP.get(dt, dt))
+                    
+                    cv2.rectangle(annotated, (x1,y1), (x2,y2), color, 2)
+                    cv2.putText(annotated, label, (x1+4, max(y1-8,18)), cv2.FONT_HERSHEY_SIMPLEX, 0.52, color, 2)
+
+                # Summary bar
+                total = focused + distracted + phone + eating + hand_raised
+                score = (focused / total * 100) if total > 0 else 0.0
+                bar   = f'Focused:{focused}  Distracted:{distracted}  Phone:{phone}  Eating:{eating}  Hand Raised:{hand_raised}  Score:{score:.0f}%'
+                bar_w = min(len(bar)*9+14, annotated.shape[1])
+                cv2.rectangle(annotated, (0,0), (bar_w,26), (20,20,20), -1)
+                cv2.putText(annotated, bar, (6,18), cv2.FONT_HERSHEY_SIMPLEX, 0.48, (255,255,255), 1)
+
+                # Colour legend
+                fh, fw = annotated.shape[:2]
+                for li, (ltxt, lclr) in enumerate([('Focused', (0,200,60)), ('Distracted', (0,165,255)), ('Alert', (0,0,220)), ('Hand Raised', (255,255,0))]):
+                    lx = fw-150; ly = 12+li*20
+                    cv2.rectangle(annotated, (lx,ly-10), (lx+14,ly+4), lclr, -1)
+                    cv2.putText(annotated, ltxt, (lx+18,ly+3), cv2.FONT_HERSHEY_SIMPLEX, 0.42, lclr, 1)
+
+            except Exception as loop_processing_err:
+                # If calculations fail, fall back gracefully to the unannotated frame
+                print(f'[STREAM LOOP EXCEPTION HANDLED]: {loop_processing_err}')
+                annotated = frame
+
+            # ── Encode and Yield Frame ────────────────────────────────────────
             _, buf = cv2.imencode('.jpg', annotated, [cv2.IMWRITE_JPEG_QUALITY, 72])
-            yield (b'--frame\r\nContent-Type: image/jpeg\r\n\r\n'
-                   + buf.tobytes() + b'\r\n')
+            if buf is not None and len(buf) > 0:
+                try:
+                    yield (b'--frame\r\nContent-Type: image/jpeg\r\n\r\n' + buf.tobytes() + b'\r\n')
+                except (BrokenPipeError, ConnectionResetError, OSError):
+                    break
 
             elapsed = time.monotonic() - last_yield
             wait    = frame_delay - elapsed
@@ -808,10 +881,10 @@ def _generate_video_stream(video_path, camera_id=0, camera_location='Classroom',
 
     finally:
         stop_event.set()
-        cap.release()
-        det_thread.join(timeout=3)
-        save_thread.join(timeout=5)
-
+        if cap is not None:
+            cap.release()
+        det_thread.join(timeout=1)
+        save_thread.join(timeout=1)
 
 def _get_port():
     """Return the Django dev-server port (default 8000). Override via DJANGO_PORT env var."""
@@ -913,6 +986,11 @@ def api_incidents_report(request):
     if request.method != 'POST':
         return JsonResponse({'error': 'POST only'}, status=405)
 
+    from classroom_monitor.api_auth import check_detection_api_key
+    auth_err = check_detection_api_key(request)
+    if auth_err:
+        return auth_err
+
     try:
         data = json.loads(request.body)
 
@@ -954,16 +1032,9 @@ def api_incidents_report(request):
                 pass
 
         # ── 4. Determine severity ─────────────────────────────────────────────
-        alert_types = {'using_phone', 'eating_food', 'fighting'}
+        from classroom_monitor.constants import EMAIL_ALERT_TYPES
         inc_type    = data.get('incident_type', 'other')
-        
-        # Fighting is CRITICAL severity
-        if inc_type == 'fighting':
-            severity = 'critical'
-        elif inc_type in alert_types:
-            severity = 'high'
-        else:
-            severity = 'medium' if inc_type in {'looking_away', 'head_down', 'distracted'} else 'low'
+        severity = _incident_severity(inc_type)
 
         # ── 5. Save to DB ─────────────────────────────────────────────────────
         incident = IncidentReport.objects.create(
@@ -978,7 +1049,7 @@ def api_incidents_report(request):
         )
 
         # ── 6. Email alert for RED incidents (including fighting) ─────────────
-        if inc_type in alert_types and snapshot_bytes:
+        if inc_type in EMAIL_ALERT_TYPES and snapshot_bytes:
             _send_incident_email(
                 incident=incident,
                 student=student,
@@ -1084,7 +1155,7 @@ def _send_incident_email(incident, student, student_name, roll_no,
         return False
 
     # ── Build recipient list ──────────────────────────────────────────────────
-    from classroom_monitor.behavior_detection import LABEL_MAP
+    from classroom_monitor.constants import LABEL_MAP
     label = LABEL_MAP.get(det_type, det_type.replace('_', ' ').title())
 
     recipients = [admin_to]

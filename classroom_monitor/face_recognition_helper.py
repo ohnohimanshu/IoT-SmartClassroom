@@ -2,6 +2,9 @@ import json
 import threading
 import numpy as np
 
+# BUG 5 FIX: Import shared face match tolerance constant
+from .constants import FACE_MATCH_TOLERANCE
+
 # ── Single process-wide lock for ALL dlib / face_recognition calls ────────────
 # This prevents the 0xC0000005 access violation crash on Windows.
 DLIB_LOCK = threading.Lock()
@@ -12,14 +15,13 @@ class StudentFaceRecognizer:
     Match a face crop (BGR numpy array) to registered students.
     All public methods are protected by DLIB_LOCK internally.
 
-    No logic bugs found in this file.
-    Minor improvement: load_from_db() now guards against calling load_from_db
-    re-entrantly if a second call arrives before the first finishes (added
-    a simple loaded-check at the top under a lightweight flag).
+    BUG 5 FIX: Now uses shared FACE_MATCH_TOLERANCE constant instead of separate tolerance.
     """
 
-    def __init__(self, tolerance=0.52):
-        self.tolerance        = tolerance
+    def __init__(self, tolerance=None):
+        # BUG 5 FIX: Use shared constant instead of separate tolerance parameter
+        # Keeping parameter for backward compatibility but defaulting to shared constant
+        self.tolerance = tolerance if tolerance is not None else FACE_MATCH_TOLERANCE
         self._known_encodings = []
         self._known_students  = []
         self._fr              = None
@@ -95,7 +97,7 @@ class StudentFaceRecognizer:
                 rgb       = cv2.cvtColor(face_crop_bgr, cv2.COLOR_BGR2RGB)
                 encodings = self._fr.face_encodings(rgb, num_jitters=1, model='small')
                 if not encodings:
-                    return None, 'Unknown', '', 1.0
+                    return None, 'Unknown', '', float('nan')
 
                 detected  = encodings[0]
                 distances = self._fr.face_distance(self._known_encodings, detected)
@@ -110,7 +112,7 @@ class StudentFaceRecognizer:
 
             except Exception as e:
                 print(f'[ERROR] face match: {e}')
-                return None, 'Unknown', '', 1.0
+                return None, 'Unknown', '', float('nan')
 
     def get_whatsapp(self, student_id):
         for s in self._known_students:

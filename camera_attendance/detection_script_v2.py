@@ -1,45 +1,3 @@
-"""
-Camera Face Detection Script v4 — School Attendance
-====================================================
-Fixes over v3:
-  1. ENTRY/EXIT BUG FIX  — `is_exit` was leaking its value across loop
-                           iterations (a simple variable scoping bug).
-                           Now correctly determined per-student, per-iteration.
-
-  2. DJANGO RACE FIX     — views.py must use select_for_update() inside
-                           transaction.atomic to prevent two simultaneous
-                           POSTs both creating ENTRY records.  See views.py.
-
-  3. MULTI-FRAME CONFIRM — A face must be recognised consistently in
-                           CONFIRM_FRAMES (default 3) consecutive frames
-                           before triggering entry/exit. Eliminates
-                           single-frame false positives from reflections,
-                           photos on walls, or brief obstructions.
-
-  4. PRESENCE WINDOW     — Entry is only triggered when the student's face
-                           is first detected; exit is triggered by absence
-                           for exit_timeout seconds.  The script no longer
-                           re-processes a student who walks past slowly
-                           and is seen for many frames.
-
-  5. STRICTER VALIDATION — Eye cascade requires BOTH eyes.  Face must also
-                           pass a skin-tone heuristic before matching.
-
-  6. QUEUE-SAFE is_exit  — is_exit captured at decision time and closed
-                           over correctly in the emotion callback.
-
-  7. DAILY LOG RELOAD    — students_inside synced from Django every 10 min
-                           so multi-terminal deployments stay consistent.
-
-Usage:
-    python detection_script_v4.py \\
-        --camera-id 1 \\
-        --camera-url "http://192.168.1.10/stream" \\
-        --server "http://localhost:8000" \\
-        --cooldown 60 \\
-        --exit-timeout 90 \\
-        --confirm-frames 3
-"""
 
 import json
 import time
@@ -108,13 +66,16 @@ def load_dependencies():
     try:
         import mediapipe as _mp
         mp = _mp
+        # Verify mediapipe has solutions module
+        if not hasattr(mp, 'solutions'):
+            raise AttributeError("MediaPipe 'solutions' module not available - may be corrupted installation")
         mp_face_detection = mp.solutions.face_detection.FaceDetection(
             model_selection=1,  # 0 for short-range, 1 for full-range
             min_detection_confidence=0.7
         )
         logger.info("✓ MediaPipe Face Detection loaded")
-    except ImportError as e:
-        logger.warning(f"⚠ MediaPipe not installed: {e}")
+    except (ImportError, AttributeError, Exception) as e:
+        logger.warning(f"⚠ MediaPipe not available: {e}")
         logger.warning("  Falling back to Haar cascades (lower accuracy)")
         try:
             global face_cascade, _eye_cascade

@@ -5,5 +5,3 @@ __pycache__/
 *.pyd
 .db.sqlite3
 .env
-media
-uploads

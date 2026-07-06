@@ -1,21 +1,17 @@
-
 #!/bin/bash
-export POSTGRES_HOST=${POSTGRES_HOST:-db}
-export POSTGRES_PORT=${POSTGRES_PORT:-5432}
-# Wait for PostgreSQL to be ready
+set -e
+
 echo "Waiting for PostgreSQL to start..."
 while ! nc -z $POSTGRES_HOST $POSTGRES_PORT; do
   sleep 0.1
 done
 echo "PostgreSQL started"
 
-# Apply database migrations
 echo "Applying database migrations..."
 python manage.py migrate
 
-# Create superuser if not exists
 echo "Creating superuser if not exists..."
-python manage.py shell << END
+python manage.py shell << PYEOF
 from django.contrib.auth import get_user_model
 User = get_user_model()
 if not User.objects.filter(username='himanshu').exists():
@@ -23,8 +19,10 @@ if not User.objects.filter(username='himanshu').exists():
     print("Superuser 'himanshu' created successfully!")
 else:
     print("Superuser 'himanshu' already exists.")
-END
+PYEOF
 
-# Start the Django server (or Gunicorn)
-echo "Starting Django server..."
-exec "$@"
+echo "Generating supervisor configs for camera detection scripts..."
+python generate_supervisor_configs.py || echo "Warning: Could not generate configs (database may not be ready yet)"
+
+echo "Starting supervisor (Django + face detection)..."
+exec /usr/local/bin/supervisord -c /etc/supervisor/supervisord.conf -n

@@ -54,6 +54,10 @@ class CameraAttendanceConfig(AppConfig):
             
             if is_reloader_child or no_reload:
                 print("[INFO] Starting detection script auto-start...", flush=True)
+                
+                # Import signals to enable dynamic reloading on Camera change
+                import camera_attendance.signals
+                
                 # Register cleanup on exit
                 atexit.register(self._cleanup_all_processes)
                 
@@ -171,11 +175,12 @@ class CameraAttendanceConfig(AppConfig):
             return
         
         server_url = self._get_server_url()
-        
-        for camera in active_cameras:
-            self._start_camera_detection(camera, script_path, server_url)
+
+        for idx, camera in enumerate(active_cameras):
+            rebroadcast_port = 8765 + idx
+            self._start_camera_detection(camera, script_path, server_url, rebroadcast_port)
     
-    def _start_camera_detection(self, camera, script_path, server_url):
+    def _start_camera_detection(self, camera, script_path, server_url, rebroadcast_port=8765):
         """Start detection for a single camera."""
         try:
             cmd = [
@@ -183,7 +188,8 @@ class CameraAttendanceConfig(AppConfig):
                 script_path,
                 '--camera-url', str(camera.url),
                 '--camera-id', str(camera.id),
-                '--server', server_url
+                '--server', server_url,
+                '--rebroadcast-port', str(rebroadcast_port)
             ]
             
             print(f"[INFO] Starting detection for camera '{camera.name}' (ID: {camera.id})", flush=True)
@@ -272,8 +278,16 @@ class CameraAttendanceConfig(AppConfig):
                     server_url = self._get_server_url()
                     script_path = os.path.join(os.path.dirname(__file__), 'detection_script_v2.py')
                     script_path = os.path.normpath(script_path)
+                    # Calculate rebroadcast port based on camera index
+                    try:
+                        from .models import Camera as CameraModel
+                        active_cameras = list(CameraModel.objects.filter(is_active=True).order_by('id'))
+                        camera_index = active_cameras.index(camera)
+                        rebroadcast_port = 8765 + camera_index
+                    except ValueError:
+                        rebroadcast_port = 8765
                     
-                    self._start_camera_detection(camera, script_path, server_url)
+                    self._start_camera_detection(camera, script_path, server_url, rebroadcast_port)
                     break
                 else:
                     print(f"[INFO] Detection for camera '{camera.name}' exited normally", flush=True)
@@ -309,3 +323,51 @@ class CameraAttendanceConfig(AppConfig):
                         
                 except Exception as e:
                     print(f"[ERROR] Failed to stop process {process.pid}: {e}", flush=True)
+
+    def reload_camera_detection(self, camera):
+        """Called by signals when a camera is created, updated, or deleted."""
+        print(f"\n[INFO] Reloading detection process for camera '{camera.name}'...", flush=True)
+        import signal
+        import subprocess
+        
+        # 1. Clean up existing process for this camera if any
+        for proc_info in list(detection_processes):
+            if proc_info['camera'].id == camera.id:
+                proc = proc_info['process']
+                print(f"[INFO] Stopping existing process {proc.pid} for camera '{camera.name}'", flush=True)
+                try:
+                    if sys.platform == 'win32':
+                        proc.send_signal(signal.CTRL_BREAK_EVENT)
+                    else:
+                        proc.terminate()
+                    
+                    try:
+                        proc.wait(timeout=3)
+                    except subprocess.TimeoutExpired:
+                        proc.kill()
+                        proc.wait()
+                except Exception as e:
+                    print(f"[WARN] Error stopping process: {e}")
+                
+                detection_processes.remove(proc_info)
+        
+        # 2. Start new process if the camera is still active
+        from .models import Camera
+        try:
+            cam_db = Camera.objects.get(pk=camera.id)
+            if cam_db.is_active:
+                script_path = os.path.normpath(os.path.join(os.path.dirname(__file__), 'detection_script_v2.py'))
+                server_url = self._get_server_url()
+                # Calculate rebroadcast port based on camera index
+                try:
+                    active_cameras = list(Camera.objects.filter(is_active=True).order_by('id'))
+                    camera_index = active_cameras.index(cam_db)
+                    rebroadcast_port = 8765 + camera_index
+                except ValueError:
+                    rebroadcast_port = 8765
+                print(f"[INFO] Restarting detection for camera '{camera.name}'...", flush=True)
+                self._start_camera_detection(cam_db, script_path, server_url, rebroadcast_port)
+            else:
+                print(f"[INFO] Camera '{camera.name}' is inactive. Process stopped.", flush=True)
+        except Camera.DoesNotExist:
+            print(f"[INFO] Camera '{camera.name}' was deleted. Process stopped.", flush=True)

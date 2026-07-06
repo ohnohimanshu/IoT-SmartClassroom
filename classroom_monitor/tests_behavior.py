@@ -25,17 +25,14 @@ class PhoneDetectionTests(SimpleTestCase):
         self.engine = TemporalBehaviorEngine()
 
     def test_yolo_phone_requires_wrist_proximity_not_bbox_only(self):
-        """Phone bbox inside person but far from all wrists/elbows must NOT alert."""
+        """Phone bbox inside person without wrist near phone must NOT alert."""
         bbox = (100, 50, 200, 350)
         kp = _blank_kp()
-        kp[9] = [120, 300, 0.9]   # wrists at bottom of bbox
+        kp[9] = [120, 300, 0.9]
         kp[10] = [180, 300, 0.9]
-        kp[7] = [130, 170, 0.9]   # elbows at mid-height
-        kp[8] = [170, 170, 0.9]
         kp[0] = [150, 80, 0.9]
         person = _person(1, bbox, kp)
-        # Phone at top of bbox — far from all wrists AND elbows
-        phone_dets = [(130, 60, 170, 100, 0.85)]
+        phone_dets = [(130, 200, 170, 240, 0.85)]  # phone mid-torso, not near wrists
         is_phone, conf = self.engine._detect_phone_usage(
             person, phone_dets, 'focused', [])
         self.assertFalse(is_phone)
