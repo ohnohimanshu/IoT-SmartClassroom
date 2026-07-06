@@ -28,4 +28,12 @@ urlpatterns = [
     path('incidents/<int:incident_id>/update/', views.update_incident, name='update_incident'),
     path('incidents/<int:incident_id>/mark-reviewed/', views.mark_reviewed, name='mark_reviewed'),
     path('api/incidents/report/', views.api_incidents_report, name='api_incidents_report'),
+
+    # Video upload & analysis
+    path('videos/', views.video_list, name='classroom_video_list'),
+    path('videos/upload/', views.video_upload, name='classroom_video_upload'),
+    path('videos/<int:pk>/', views.video_detail, name='classroom_video_detail'),
+    path('videos/<int:pk>/delete/', views.video_delete, name='classroom_video_delete'),
+    path('videos/<int:pk>/analyze/', views.video_analyze, name='classroom_video_analyze'),
+    path('videos/<int:pk>/status/', views.video_analysis_status, name='classroom_video_status'),
 ]

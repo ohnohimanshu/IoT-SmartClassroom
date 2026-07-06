@@ -1,0 +1,110 @@
+{% extends "entrance_cam/base.html" %}
+{% block title %}Upload Video{% endblock %}
+{% block page_title %}Upload Classroom Video{% endblock %}
+{% block content %}
+<div class="row justify-content-center">
+  <div class="col-lg-7">
+    <div class="form-card">
+      <div class="section-hdr mb-4">
+        <h5><i class="bi bi-cloud-upload me-2" style="color:#0891b2"></i>Upload Video for Engagement Analysis</h5>
+        <p class="text-muted small mb-0">Supports MP4, AVI, MOV. After uploading, click Analyze to run behavior detection.</p>
+      </div>
+
+      <form method="post" enctype="multipart/form-data" id="upload-form">
+        {% csrf_token %}
+        <div class="mb-3">
+          <label class="form-label fw-600">Title</label>
+          {{ form.title }}
+          {% if form.title.errors %}<div class="text-danger small">{{ form.title.errors }}</div>{% endif %}
+        </div>
+
+        <div class="mb-3">
+          <label class="form-label fw-600">Video File</label>
+          <div id="drop-zone" style="border:2px dashed #cbd5e1;border-radius:12px;padding:40px;text-align:center;cursor:pointer;transition:border-color .2s">
+            <i class="bi bi-film fs-2 d-block mb-2" style="color:#94a3b8"></i>
+            <p class="text-muted mb-1">Drag &amp; drop your video here, or click to browse</p>
+            <p class="small text-muted mb-0" id="file-name">MP4, AVI, MOV accepted</p>
+            {{ form.video_file }}
+          </div>
+          {% if form.video_file.errors %}<div class="text-danger small">{{ form.video_file.errors }}</div>{% endif %}
+        </div>
+
+        <div class="mb-4">
+          <label class="form-label fw-600">Notes <span class="text-muted fw-400">(optional)</span></label>
+          {{ form.notes }}
+        </div>
+
+        <div id="upload-progress" class="mb-3 d-none">
+          <div class="d-flex justify-content-between small text-muted mb-1">
+            <span>Uploading...</span><span id="progress-pct">0%</span>
+          </div>
+          <div class="progress" style="height:8px;border-radius:4px">
+            <div id="progress-bar" class="progress-bar" style="width:0%;background:#0891b2"></div>
+          </div>
+        </div>
+
+        <div class="d-flex gap-2">
+          <button type="submit" id="submit-btn" class="btn" style="background:#0891b2;color:#fff;border:none;border-radius:8px;padding:10px 28px">
+            <i class="bi bi-cloud-upload me-1"></i>Upload
+          </button>
+          <a href="{% url 'classroom_video_list' %}" class="btn" style="background:#f1f5f9;color:#475569;border:none;border-radius:8px;padding:10px 28px">
+            Cancel
+          </a>
+        </div>
+      </form>
+    </div>
+  </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+const dropZone = document.getElementById('drop-zone');
+const fileInput = document.querySelector('input[type="file"]');
+const fileName = document.getElementById('file-name');
+
+// Style file input hidden, let drop zone handle clicks
+fileInput.style.display = 'none';
+dropZone.addEventListener('click', () => fileInput.click());
+
+fileInput.addEventListener('change', () => {
+  if (fileInput.files.length > 0) {
+    fileName.textContent = fileInput.files[0].name;
+    dropZone.style.borderColor = '#0891b2';
+  }
+});
+
+dropZone.addEventListener('dragover', e => { e.preventDefault(); dropZone.style.borderColor = '#0891b2'; });
+dropZone.addEventListener('dragleave', () => dropZone.style.borderColor = '#cbd5e1');
+dropZone.addEventListener('drop', e => {
+  e.preventDefault();
+  dropZone.style.borderColor = '#0891b2';
+  const files = e.dataTransfer.files;
+  if (files.length) {
+    fileInput.files = files;
+    fileName.textContent = files[0].name;
+  }
+});
+
+// Show progress bar on submit
+document.getElementById('upload-form').addEventListener('submit', function(e) {
+  const f = fileInput.files[0];
+  if (!f) return;
+  const progress = document.getElementById('upload-progress');
+  const bar = document.getElementById('progress-bar');
+  const pct = document.getElementById('progress-pct');
+  const btn = document.getElementById('submit-btn');
+  progress.classList.remove('d-none');
+  btn.disabled = true;
+  btn.innerHTML = '<span class="spinner-border spinner-border-sm me-1"></span>Uploading...';
+
+  // Fake smooth progress (real XHR upload would track onprogress)
+  let p = 0;
+  const timer = setInterval(() => {
+    p = Math.min(p + Math.random() * 8, 90);
+    bar.style.width = p + '%';
+    pct.textContent = Math.round(p) + '%';
+  }, 300);
+});
+</script>
+{% endblock %}

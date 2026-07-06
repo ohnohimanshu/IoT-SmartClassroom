@@ -163,6 +163,12 @@
     <a href="{% url 'classroom_camera_list' %}" class="sidebar-link">
       <i class="bi bi-camera-video"></i> Cameras
     </a>
+    <a href="{% url 'classroom_video_list' %}" class="sidebar-link {% if 'videos' in request.path %}active{% endif %}">
+      <i class="bi bi-film"></i> Video Analysis
+    </a>
+    <a href="{% url 'incidents_dashboard' %}" class="sidebar-link {% if 'incidents' in request.path %}active{% endif %}">
+      <i class="bi bi-exclamation-triangle"></i> Incidents
+    </a>
   </nav>
   <div style="padding:16px;border-top:1px solid rgba(255,255,255,0.08)">
     <div style="display:flex;align-items:center;gap:10px;margin-bottom:12px">

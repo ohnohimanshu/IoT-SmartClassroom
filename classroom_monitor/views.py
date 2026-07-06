@@ -1251,3 +1251,211 @@ def _send_incident_email(incident, student, student_name, roll_no,
     except Exception as e:
         print(f'[EMAIL] Send failed: {e}')
         return False
+
+
+# ── Video Upload & Analysis Views ─────────────────────────────────────────────
+
+@login_required
+def video_list(request):
+    videos = ClassroomVideo.objects.all()
+    return render(request, 'classroom_monitor/video_list.html', {'videos': videos})
+
+
+@login_required
+def video_upload(request):
+    if request.method == 'POST':
+        form = ClassroomVideoForm(request.POST, request.FILES)
+        if form.is_valid():
+            video = form.save()
+            messages.success(request, f'Video "{video.title}" uploaded. Click Analyze to process it.')
+            return redirect('classroom_video_list')
+    else:
+        form = ClassroomVideoForm()
+    return render(request, 'classroom_monitor/video_upload.html', {'form': form})
+
+
+@login_required
+def video_detail(request, pk):
+    video = get_object_or_404(ClassroomVideo, pk=pk)
+    frames = video.frames.order_by('frame_number')
+    return render(request, 'classroom_monitor/video_detail.html', {'video': video, 'frames': frames})
+
+
+@login_required
+def video_delete(request, pk):
+    video = get_object_or_404(ClassroomVideo, pk=pk)
+    if request.method == 'POST':
+        video.delete()
+        messages.success(request, 'Video deleted.')
+        return redirect('classroom_video_list')
+    return render(request, 'classroom_monitor/confirm_delete.html', {'obj': video, 'type': 'Video'})
+
+
+@login_required
+def video_analyze(request, pk):
+    """Trigger background analysis of an uploaded video."""
+    video = get_object_or_404(ClassroomVideo, pk=pk)
+    if video.status in ('processing',):
+        return JsonResponse({'status': 'already_processing'})
+
+    video.status = 'processing'
+    video.frames.all().delete()
+    video.save(update_fields=['status'])
+
+    import threading
+    t = threading.Thread(target=_analyze_video_task, args=(video.pk,), daemon=True)
+    t.start()
+
+    return JsonResponse({'status': 'started'})
+
+
+@login_required
+def video_analysis_status(request, pk):
+    video = get_object_or_404(ClassroomVideo, pk=pk)
+    return JsonResponse({
+        'status': video.status,
+        'frames_analyzed': video.total_frames_analyzed,
+        'avg_score': round(video.average_engagement_score, 1),
+        'duration': video.duration_seconds,
+    })
+
+
+def _analyze_video_task(video_pk):
+    """Run in a background thread — reads the video, samples frames, runs YOLO."""
+    import django
+    from django.db import close_old_connections
+    close_old_connections()
+
+    try:
+        video = ClassroomVideo.objects.get(pk=video_pk)
+        video_path = video.video_file.path
+
+        cap = cv2.VideoCapture(video_path)
+        if not cap.isOpened():
+            video.status = 'failed'
+            video.save(update_fields=['status'])
+            return
+
+        src_fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        duration = total_frames / src_fps if src_fps > 0 else 0
+        video.duration_seconds = int(duration)
+        video.save(update_fields=['duration_seconds'])
+
+        # Sample one frame every 5 seconds
+        sample_interval = max(1, int(src_fps * 5))
+
+        detector = _get_yolo_detector()
+
+        frame_number = 0
+        analyzed_count = 0
+        total_score = 0.0
+
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                break
+
+            if frame_number % sample_interval == 0:
+                timestamp_sec = frame_number / src_fps
+
+                try:
+                    dets = detector.detect(frame) if detector else []
+                except Exception as e:
+                    print(f'[VIDEO ANALYZE] detect error: {e}')
+                    dets = []
+
+                focused = looking_away = head_down = using_phone = eating = not_visible = 0
+                for det in dets:
+                    if isinstance(det, dict):
+                        dt = det.get('type', 'not_visible')
+                    else:
+                        dt = getattr(det, 'type', 'not_visible')
+                    if dt == 'focused':
+                        focused += 1
+                    elif dt in ('distracted', 'looking_away'):
+                        looking_away += 1
+                    elif dt == 'head_down':
+                        head_down += 1
+                    elif dt == 'using_phone':
+                        using_phone += 1
+                    elif dt == 'eating_food':
+                        eating += 1
+                    else:
+                        not_visible += 1
+
+                total_det = focused + looking_away + head_down + using_phone + eating
+                score = (focused / total_det * 100) if total_det > 0 else 0.0
+
+                # Save annotated frame image
+                annotated = frame.copy()
+                for det in dets:
+                    if isinstance(det, dict):
+                        x1, y1, x2, y2 = det.get('bbox', (0, 0, 0, 0))
+                        color = det.get('color', (0, 200, 60))
+                        label = det.get('label', det.get('type', ''))
+                    else:
+                        x1, y1, x2, y2 = getattr(det, 'bbox', (0, 0, 0, 0))
+                        color = getattr(det, 'color', (0, 200, 60))
+                        label = getattr(det, 'label', '')
+                    cv2.rectangle(annotated, (x1, y1), (x2, y2), color, 2)
+                    cv2.putText(annotated, label, (x1 + 2, max(y1 - 6, 14)),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+
+                bar = f'Focused:{focused} Away:{looking_away} Phone:{using_phone} Score:{score:.0f}%'
+                cv2.rectangle(annotated, (0, 0), (len(bar) * 9 + 14, 24), (20, 20, 20), -1)
+                cv2.putText(annotated, bar, (6, 16), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1)
+
+                ret_enc, buf = cv2.imencode('.jpg', annotated, [cv2.IMWRITE_JPEG_QUALITY, 75])
+                frame_file = None
+                if ret_enc:
+                    frame_file = ContentFile(
+                        buf.tobytes(),
+                        name=f'vf_{video_pk}_{frame_number}.jpg'
+                    )
+
+                from django.db import close_old_connections as _cc
+                _cc()
+                vf = VideoAnalysisFrame.objects.create(
+                    video=video,
+                    frame_number=frame_number,
+                    timestamp=timestamp_sec,
+                    frame_image=frame_file,
+                    focused_count=focused,
+                    looking_away_count=looking_away,
+                    head_down_count=head_down,
+                    using_phone_count=using_phone,
+                    eating_count=eating,
+                    not_visible_count=not_visible,
+                    total_detected=total_det,
+                    engagement_score=score,
+                )
+
+                analyzed_count += 1
+                total_score += score
+
+                # Update progress periodically
+                if analyzed_count % 5 == 0:
+                    video.total_frames_analyzed = analyzed_count
+                    video.average_engagement_score = total_score / analyzed_count if analyzed_count else 0.0
+                    video.save(update_fields=['total_frames_analyzed', 'average_engagement_score'])
+
+            frame_number += 1
+
+        cap.release()
+
+        video.status = 'completed'
+        video.processed_at = timezone.now()
+        video.total_frames_analyzed = analyzed_count
+        video.average_engagement_score = total_score / analyzed_count if analyzed_count else 0.0
+        video.save()
+
+    except Exception as e:
+        print(f'[VIDEO ANALYZE] Error: {e}')
+        import traceback; traceback.print_exc()
+        try:
+            from django.db import close_old_connections as _cc2
+            _cc2()
+            ClassroomVideo.objects.filter(pk=video_pk).update(status='failed')
+        except Exception:
+            pass

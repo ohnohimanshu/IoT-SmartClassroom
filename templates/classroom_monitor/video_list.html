@@ -1,0 +1,138 @@
+{% extends "entrance_cam/base.html" %}
+{% block title %}Classroom Videos{% endblock %}
+{% block page_title %}Engagement Video Analysis{% endblock %}
+{% block content %}
+<div class="d-flex justify-content-between align-items-center mb-4">
+  <div>
+    <p class="text-muted mb-0">Upload classroom recordings to analyze engagement offline.</p>
+  </div>
+  <a href="{% url 'classroom_video_upload' %}" class="btn" style="background:#0891b2;color:#fff;border:none;border-radius:8px">
+    <i class="bi bi-cloud-upload me-1"></i>Upload Video
+  </a>
+</div>
+
+{% if messages %}
+{% for msg in messages %}
+<div class="alert alert-{{ msg.tags }} alert-dismissible fade show" role="alert">
+  {{ msg }}<button type="button" class="btn-close" data-bs-dismiss="alert"></button>
+</div>
+{% endfor %}
+{% endif %}
+
+{% if videos %}
+<div class="row g-3">
+  {% for video in videos %}
+  <div class="col-xl-4 col-md-6">
+    <div class="stat-card h-100">
+      <div class="d-flex align-items-start justify-content-between mb-2">
+        <h6 class="fw-700 mb-0" style="color:#1e293b">{{ video.title }}</h6>
+        {% if video.status == 'completed' %}
+        <span class="emotion-badge" style="background:#dcfce7;color:#166534">Completed</span>
+        {% elif video.status == 'processing' %}
+        <span class="emotion-badge" style="background:#fef3c7;color:#92400e">Processing</span>
+        {% elif video.status == 'failed' %}
+        <span class="emotion-badge" style="background:#fee2e2;color:#991b1b">Failed</span>
+        {% else %}
+        <span class="emotion-badge" style="background:#e2e8f0;color:#475569">Uploaded</span>
+        {% endif %}
+      </div>
+
+      <div class="small text-muted mb-3">
+        <i class="bi bi-calendar3 me-1"></i>{{ video.uploaded_at|date:"d M Y, H:i" }}
+        {% if video.duration_seconds %}
+        &nbsp;·&nbsp;<i class="bi bi-clock me-1"></i>{{ video.duration_seconds }}s
+        {% endif %}
+      </div>
+
+      {% if video.status == 'completed' %}
+      <div class="row g-2 mb-3">
+        <div class="col-4 text-center">
+          <div class="fw-700" style="color:#0891b2;font-size:1.3rem">{{ video.average_engagement_score|floatformat:0 }}%</div>
+          <div class="small text-muted">Avg Score</div>
+        </div>
+        <div class="col-4 text-center">
+          <div class="fw-700" style="color:#1e293b;font-size:1.3rem">{{ video.total_frames_analyzed }}</div>
+          <div class="small text-muted">Frames</div>
+        </div>
+        <div class="col-4 text-center">
+          <div class="fw-700" style="color:#1e293b;font-size:1.3rem">{{ video.total_students_detected }}</div>
+          <div class="small text-muted">Students</div>
+        </div>
+      </div>
+      {% endif %}
+
+      <div class="d-flex gap-2 mt-auto pt-2" style="border-top:1px solid #e2e8f0">
+        {% if video.status == 'completed' %}
+        <a href="{% url 'classroom_video_detail' video.pk %}" class="btn flex-fill btn-sm" style="background:#cffafe;color:#0891b2;border:none;border-radius:8px">
+          <i class="bi bi-bar-chart me-1"></i>View Results
+        </a>
+        {% elif video.status == 'uploading' or video.status == 'failed' %}
+        <button class="btn flex-fill btn-sm analyze-btn" data-pk="{{ video.pk }}"
+                style="background:#0891b2;color:#fff;border:none;border-radius:8px">
+          <i class="bi bi-cpu me-1"></i>Analyze
+        </button>
+        {% else %}
+        <button class="btn flex-fill btn-sm" disabled style="border-radius:8px">
+          <span class="spinner-border spinner-border-sm me-1"></span>Processing...
+        </button>
+        {% endif %}
+        <form method="post" action="{% url 'classroom_video_delete' video.pk %}" style="margin:0">
+          {% csrf_token %}
+          <button type="submit" class="btn btn-sm" style="background:#fee2e2;color:#dc2626;border:none;border-radius:8px"
+                  onclick="return confirm('Delete this video?')">
+            <i class="bi bi-trash"></i>
+          </button>
+        </form>
+      </div>
+    </div>
+  </div>
+  {% endfor %}
+</div>
+{% else %}
+<div class="form-card text-center py-5">
+  <i class="bi bi-film fs-1 d-block mb-3 opacity-20"></i>
+  <h5 class="fw-700 text-muted">No Videos Yet</h5>
+  <p class="text-muted">Upload a classroom video to analyze engagement.</p>
+  <a href="{% url 'classroom_video_upload' %}" class="btn mt-2" style="background:#0891b2;color:#fff;border:none;border-radius:8px">
+    <i class="bi bi-cloud-upload me-1"></i>Upload Video
+  </a>
+</div>
+{% endif %}
+
+{% endblock %}
+
+{% block scripts %}
+<script>
+document.querySelectorAll('.analyze-btn').forEach(btn => {
+  btn.addEventListener('click', function () {
+    const pk = this.dataset.pk;
+    this.disabled = true;
+    this.innerHTML = '<span class="spinner-border spinner-border-sm me-1"></span>Starting...';
+    fetch(`/classroom/videos/${pk}/analyze/`, { method: 'GET' })
+      .then(r => r.json())
+      .then(d => {
+        if (d.status === 'started' || d.status === 'already_processing') {
+          this.innerHTML = '<span class="spinner-border spinner-border-sm me-1"></span>Processing...';
+          pollStatus(pk, this);
+        }
+      })
+      .catch(() => { this.disabled = false; this.innerHTML = '<i class="bi bi-cpu me-1"></i>Analyze'; });
+  });
+});
+
+function pollStatus(pk, btn) {
+  const interval = setInterval(() => {
+    fetch(`/classroom/videos/${pk}/status/`)
+      .then(r => r.json())
+      .then(d => {
+        if (d.status === 'completed' || d.status === 'failed') {
+          clearInterval(interval);
+          location.reload();
+        } else {
+          if (btn) btn.innerHTML = `<span class="spinner-border spinner-border-sm me-1"></span>Frames: ${d.frames_analyzed}`;
+        }
+      });
+  }, 3000);
+}
+</script>
+{% endblock %}
