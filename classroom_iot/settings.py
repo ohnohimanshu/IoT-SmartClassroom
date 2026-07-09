@@ -153,3 +153,9 @@ CSRF_TRUSTED_ORIGINS = [
 
 SECURE_PROXY_SSL_HEADER = ('HTTP_X_FORWARDED_PROTO', 'https')
 CSRF_FAILURE_VIEW = 'entrance_cam.views.csrf_failure'
+
+# ── File Upload Limits ─────────────────────────────────────────────────────────
+# Allow large video uploads (500 MB). nginx must also have client_max_body_size
+# set to the same or higher value in its server block.
+DATA_UPLOAD_MAX_MEMORY_SIZE = 524288000  # 500 MB
+FILE_UPLOAD_MAX_MEMORY_SIZE = 524288000  # 500 MB
