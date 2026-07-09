@@ -154,7 +154,7 @@
       <i class="bi bi-collection"></i> All Sessions
     </a>
     <div class="nav-section">Classroom</div>
-    <a href="{% url 'classroom_dashboard' %}" class="sidebar-link {% if 'classroom' in request.path %}active{% endif %}">
+    <a href="{% url 'classroom_dashboard' %}" class="sidebar-link {% if request.resolver_match.url_name == 'classroom_dashboard' %}active{% endif %}">
       <i class="bi bi-easel2"></i> Engagement Monitor
     </a>
     <a href="{% url 'classroom_session_list' %}" class="sidebar-link">
