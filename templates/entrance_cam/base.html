@@ -29,19 +29,15 @@
   .sidebar-brand h4 { color: #fff; margin: 0; font-size: 1rem; font-weight: 700; }
   .sidebar-brand small { color: rgba(255,255,255,0.45); font-size: 0.72rem; }
   .sidebar-nav { flex: 1; padding: 12px 0; overflow-y: auto; }
-  /* Hide scrollbar for sidebar */
-  .sidebar-nav::-webkit-scrollbar { width: 0px; }
+  .sidebar-nav::-webkit-scrollbar { width: 4px; }
   .sidebar-nav::-webkit-scrollbar-track { background: transparent; }
-  .sidebar-nav::-webkit-scrollbar-thumb { background: transparent; }
-  .sidebar-nav {
-    -ms-overflow-style: none;  /* IE and Edge */
-    scrollbar-width: none;  /* Firefox */
-  }
-  .nav-section { padding: 8px 16px 4px; font-size: 0.65rem; color: rgba(255,255,255,0.3); text-transform: uppercase; letter-spacing: 1px; }
+  .sidebar-nav::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.2); border-radius: 4px; }
+  .sidebar-nav { scrollbar-width: thin; scrollbar-color: rgba(255,255,255,0.2) transparent; }
+  .nav-section { padding: 6px 16px 2px; font-size: 0.65rem; color: rgba(255,255,255,0.3); text-transform: uppercase; letter-spacing: 1px; }
   .sidebar-link {
     display: flex; align-items: center; gap: 10px;
-    padding: 10px 20px; color: rgba(255,255,255,0.65);
-    text-decoration: none; font-size: 0.875rem; border-radius: 0;
+    padding: 8px 20px; color: rgba(255,255,255,0.65);
+    text-decoration: none; font-size: 0.85rem; border-radius: 0;
     transition: all 0.15s;
   }
   .sidebar-link:hover, .sidebar-link.active {
