@@ -189,7 +189,7 @@ class ProductionStreamProcessor:
         if self.object_model is not None:
             try:
                 for result in self.object_model(
-                    crop, verbose=False, conf=0.3, iou=0.45
+                    crop, verbose=False, conf=0.55, iou=0.45
                 ):
                     if result.boxes is None:
                         continue
@@ -207,35 +207,10 @@ class ProductionStreamProcessor:
             except Exception as e:
                 print(f'[WARN] YOLO object detection failed (track {track_id}): {e}')
 
-        # ── Roboflow fallback — crop only, only when YOLO missed ──────────────
-        if not phone_dets:
-            api_key = os.environ.get('ROBOFLOW_API_KEY', '').strip()
-            if api_key:
-                try:
-                    if self.roboflow_model is None:
-                        from roboflow import Roboflow
-                        rf = Roboflow(api_key=api_key)
-                        project = rf.workspace().project(
-                            "classroom-cell-phone-detection"
-                        )
-                        self.roboflow_model = project.version(18).model
-                        print('[OK] Roboflow model loaded')
-
-                    result = self.roboflow_model.predict(
-                        crop, confidence=30, overlap=30
-                    ).json()
-                    for pred in result.get('predictions', []):
-                        lx1 = int(pred['x'] - pred['width']  / 2)
-                        ly1 = int(pred['y'] - pred['height'] / 2)
-                        lx2 = int(pred['x'] + pred['width']  / 2)
-                        ly2 = int(pred['y'] + pred['height'] / 2)
-                        phone_dets.append((lx1, ly1, lx2, ly2, pred['confidence']))
-                    if phone_dets:
-                        print(f'[ROBOFLOW] Track {track_id}: {len(phone_dets)} phone(s)')
-                except ImportError:
-                    pass   # roboflow not installed — silent skip
-                except Exception as e:
-                    print(f'[WARN] Roboflow failed (track {track_id}): {e}')
+        # ── Roboflow fallback — disabled: too noisy on classroom crops ────────
+        # Roboflow models trained on phone datasets fire heavily on books,
+        # notebooks and papers when given close-cropped person images.
+        # Re-enable only if you have a model fine-tuned on your classroom data.
 
         # Remap all local coords → global frame coords
         return (

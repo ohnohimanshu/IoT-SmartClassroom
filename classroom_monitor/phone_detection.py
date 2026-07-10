@@ -119,10 +119,21 @@ class PhoneDetector:
 
     @staticmethod
     def _phone_size_sane(pw: float, ph: float, bbox_h: float) -> bool:
-        """Reject phone bboxes that are absurdly large or tiny vs the person."""
-        if bbox_h <= 0:
+        """
+        Reject phone bboxes that are:
+        - absurdly large or tiny relative to the person
+        - nearly square (books/notebooks are square; phones are rectangular)
+        """
+        if bbox_h <= 0 or pw <= 0 or ph <= 0:
             return False
-        return 0.03 <= min(pw, ph) / bbox_h and max(pw, ph) / bbox_h <= 0.7
+        # Size check relative to person height
+        if not (0.04 <= min(pw, ph) / bbox_h <= 0.55):
+            return False
+        # Aspect ratio: phone must be at least 1.4:1 (portrait or landscape)
+        aspect = max(pw, ph) / min(pw, ph)
+        if aspect < 1.4:
+            return False
+        return True
 
     # ── Core detection ────────────────────────────────────────────────────────
 
@@ -237,30 +248,29 @@ class PhoneDetector:
         return self._accumulate(state)
 
     def _accumulate(self, state: DetectionState) -> Tuple[bool, float]:
-        """Two-path probabilistic accumulator over the sliding window."""
+        """
+        Path A only accumulator.
+        Does NOT fire until the window is at least half populated —
+        prevents early sparse frames from producing artificially high ratios.
+        """
         window = state.window_length or 1
+        hits   = sum(state.yolo_phone_history)
+        filled = len(state.yolo_phone_history)
 
-        # Path A — fraction of frames in window with a YOLO/RF phone hit
-        path_a = sum(state.yolo_phone_history) / window
+        # Require at least half the window to be populated before deciding
+        if filled < max(4, window // 2):
+            return False, 0.0
 
-        # Path B — head-down density × mean wrist-centre proximity
-        head_density = (
-            sum(state.head_down_history) / window
-            if state.head_down_history else 0.0
-        )
-        wrist_density = (
-            sum(state.wrist_proximity_history) / len(state.wrist_proximity_history)
-            if state.wrist_proximity_history else 0.0
-        )
-        path_b = head_density * wrist_density
-
-        confidence = PATH_A_WEIGHT * path_a + PATH_B_WEIGHT * path_b
+        # Density = hits / full window length (not just filled frames)
+        # This naturally suppresses low hit counts in a partly-filled window
+        path_a     = hits / window
+        confidence = path_a   # PATH_A_WEIGHT=1.0, PATH_B_WEIGHT=0.0
         is_phone   = confidence >= PHONE_CONFIRM_THRESHOLD
 
         if is_phone:
             print(
                 f'[PHONE] Track {state.track_id}: '
-                f'conf={confidence:.3f} (A={path_a:.2f} B={path_b:.2f})'
+                f'conf={confidence:.3f} hits={hits}/{filled} window={window}'
             )
 
         return is_phone, round(confidence, 3)
