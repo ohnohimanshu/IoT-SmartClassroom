@@ -23,13 +23,17 @@ from classroom_monitor.head_pose_detection import HeadPoseDetector
 
 
 # ── Tunable configuration ─────────────────────────────────────────────────────
-PHONE_CONFIRM_THRESHOLD = 0.35   # min combined confidence to fire alert
-PATH_A_WEIGHT           = 0.75   # weight for YOLO/RF temporal density
-PATH_B_WEIGHT           = 0.25   # weight for head+wrist behavioural signal
-WINDOW_SECONDS          = 2.5    # sliding window duration in seconds
+# Threshold is high: Path B alone (max 0.20) can NEVER fire an alert by itself.
+# Only sustained YOLO hits (Path A) can push confidence above threshold.
+PHONE_CONFIRM_THRESHOLD = 0.50   # requires ~67% of frames to have a YOLO hit
+PATH_A_WEIGHT           = 1.00   # Path A is the only reliable signal
+PATH_B_WEIGHT           = 0.00   # Path B disabled — too many false positives in classrooms
+WINDOW_SECONDS          = 3.0    # longer window = more evidence required
 STALE_TIMEOUT           = 3.0    # seconds before DetectionState is purged
-YOLO_PHONE_CONF         = 0.30   # min YOLO phone confidence to count as a hit
-MIN_WRIST_CONF          = 0.40   # min keypoint confidence to use a wrist
+YOLO_PHONE_CONF         = 0.55   # high confidence threshold — reject book/paper misclassifications
+MIN_WRIST_CONF          = 0.45   # min keypoint confidence to use a wrist
+# Min YOLO hits required in window before Path B can even contribute (future use)
+MIN_YOLO_HITS_FOR_PATH_B = 3
 
 
 # ── Per-track sliding-window state ────────────────────────────────────────────
@@ -193,75 +197,42 @@ class PhoneDetector:
             if not (in_x and in_y):
                 continue
 
-            # Prefer wrist/elbow proximity confirmation
+            # Phone centre must be in the lower 65% of the person bbox
+            # (rules out books held up to read, papers on desks at head level)
+            phone_rel_y = (pc[1] - y1) / bbox_h
+            if phone_rel_y < 0.35:
+                continue
+
+            # Require wrist/elbow proximity confirmation — tightened to 0.28
             if person.keypoints is not None and len(person.keypoints) > 10:
                 for idx in (9, 10, 7, 8):
                     if idx >= len(person.keypoints):
                         continue
                     w = person.keypoints[idx]
-                    if self._wrist_ok(w, 0.4) and np.linalg.norm(w[:2] - pc) / bbox_h < 0.35:
+                    if self._wrist_ok(w, 0.45) and np.linalg.norm(w[:2] - pc) / bbox_h < 0.28:
                         yolo_hit  = True
                         yolo_conf = max(yolo_conf, float(conf))
                         break
-
-            # High-confidence YOLO with strong overlap — trust without keypoints
-            if not yolo_hit and conf >= 0.55:
-                ov_x = max(0, min(px2, x2) - max(px1, x1))
-                ov_y = max(0, min(py2, y2) - max(py1, y1))
-                if ov_x * ov_y / max(pw * ph, 1) > 0.5:
-                    yolo_hit  = True
-                    yolo_conf = max(yolo_conf, float(conf))
+            else:
+                # No keypoints at all — only trust very high confidence + strong overlap
+                if conf >= 0.70:
+                    ov_x = max(0, min(px2, x2) - max(px1, x1))
+                    ov_y = max(0, min(py2, y2) - max(py1, y1))
+                    if ov_x * ov_y / max(pw * ph, 1) > 0.6:
+                        yolo_hit  = True
+                        yolo_conf = max(yolo_conf, float(conf))
 
             if yolo_hit:
                 break
 
         state.yolo_phone_history.append(yolo_hit)
 
-        # ── Path B: Heuristic behavioural signal ──────────────────────────────
-        # Only evaluated when keypoints are available and head is down.
-        # Does NOT directly fire an alert — feeds into accumulator as Path B weight.
-        if (head_is_down
-                and person.keypoints is not None
-                and len(person.keypoints) > 10):
-            try:
-                left_wrist  = person.keypoints[9]
-                right_wrist = person.keypoints[10]
-                wrist_pts = [
-                    w[:2] for w in (left_wrist, right_wrist)
-                    if self._wrist_ok(w, 0.5)
-                ]
-
-                if wrist_pts:
-                    def _book_near(pt) -> bool:
-                        return SharedHelpers.point_near_book(pt, bbox_h, book_detections)
-
-                    for w in wrist_pts:
-                        rel_y  = (w[1] - y1) / bbox_h
-                        prox   = self._wrist_centre_proximity(w, x1, y1, x2, y2)
-
-                        # Centred wrist in torso/lap zone, not near a book
-                        if (0.45 <= rel_y <= 0.90
-                                and prox > 0.55
-                                and not _book_near(w)):
-                            # Boost path B signal by adding a synthetic phone hit
-                            # at lower weight — will be reflected in path_b only
-                            state.wrist_proximity_history[-1] = max(
-                                state.wrist_proximity_history[-1], prox
-                            )
-                            break
-
-                    # Cupped-hands pattern (two wrists close together, both low)
-                    if len(wrist_pts) == 2:
-                        spread = np.linalg.norm(wrist_pts[0] - wrist_pts[1]) / bbox_h
-                        both_low = all((w[1] - y1) / bbox_h > 0.50 for w in wrist_pts)
-                        if both_low and spread < 0.25:
-                            if not any(_book_near(w) for w in wrist_pts):
-                                # Amplify proximity score for cupped grip
-                                state.wrist_proximity_history[-1] = min(
-                                    state.wrist_proximity_history[-1] + 0.3, 1.0
-                                )
-            except Exception as exc:
-                print(f'[PHONE] Path B heuristic error: {exc}')
+        # ── Path B: disabled (PATH_B_WEIGHT = 0.0) ───────────────────────────
+        # Behavioural heuristics (head-down + centred wrist) produce too many
+        # false positives in classroom settings where students write with
+        # their hands centred on notebooks. Path A (YOLO object hits) is the
+        # sole reliable signal. Path B code is retained but does not modify
+        # yolo_phone_history and does not amplify wrist_proximity_history.
 
         return self._accumulate(state)
 

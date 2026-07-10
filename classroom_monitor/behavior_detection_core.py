@@ -58,8 +58,8 @@ class SharedHelpers:
 
     @staticmethod
     def calculate_wrist_motion_variance(person: TrackedPerson) -> Tuple[bool, float]:
-        # Require fewer frames before making a writing judgement (was 10)
-        if len(person.keypoint_history) < 6:
+        # Need at least 4 frames of history before judging writing motion
+        if len(person.keypoint_history) < 4:
             return False, 0.0
 
         wrist_positions = []
@@ -79,9 +79,10 @@ class SharedHelpers:
         variance_y = np.var(wrist_array[:, 1])
         total_variance = variance_x + variance_y
 
-        # Higher threshold so we don't suppress phone detection due to slight movement
-        is_writing = total_variance > 300   # was 150 — too aggressive
-        confidence = min(total_variance / 800, 0.95)
+        # Lowered to 80 — catches writing motion earlier without suppressing
+        # genuine phone usage (a phone held still has near-zero variance)
+        is_writing = total_variance > 80
+        confidence = min(total_variance / 400, 0.95)
         return is_writing, confidence
 
 
@@ -89,8 +90,9 @@ class SharedHelpers:
 class TemporalBehaviorEngine:
     LOW_CONFIDENCE_THRESHOLD     = 0.4
     HEAD_DOWN_CONSECUTIVE_FRAMES = 2
-    ALERT_CONFIRM_FRAMES  = 3    # was 10 — alerts now confirm in ~0.3s at 10fps
-    NORMAL_CONFIRM_FRAMES = 3    # was 5
+    ALERT_CONFIRM_FRAMES  = 8    # phone/eating need 8 consecutive-ish frames to confirm
+    NORMAL_CONFIRM_FRAMES = 4
+    ALERT_MAJORITY        = 0.80 # 80% of confirm window must agree for alert poses
 
     def __init__(self):
         self.tracked_people: Dict[int, TrackedPerson] = {}
@@ -129,13 +131,12 @@ class TemporalBehaviorEngine:
         if len(history) >= 1:
             last = history[-1]
             if last in ALERT_POSES or last == 'hand_raised':
-                # For alert behaviours: confirm over last N frames (majority vote)
-                n = min(self.ALERT_CONFIRM_FRAMES, len(history))
-                recent = history[-n:]
-                alert_count = sum(1 for h in recent if h == last)
-                # Confirm if ≥ 2/3 of recent frames agree (was 100% for all N)
-                if alert_count / n >= 0.67:
-                    final_behavior = last
+                    # For alert behaviours: require strong majority over confirm window
+                    n = min(self.ALERT_CONFIRM_FRAMES, len(history))
+                    recent = history[-n:]
+                    alert_count = sum(1 for h in recent if h == last)
+                    if alert_count / n >= self.ALERT_MAJORITY:
+                        final_behavior = last
             else:
                 if len(history) >= self.NORMAL_CONFIRM_FRAMES:
                     recent = history[-self.NORMAL_CONFIRM_FRAMES:]
