@@ -24,6 +24,13 @@ class PhoneDetector:
     # consecutive re-confirmations. Actual phone use is sustained and will.
     HEURISTIC_CONFIRM_FRAMES = 3
 
+    # Set True temporarily while diagnosing missed/false detections. Prints
+    # WHY a candidate was rejected on both the YOLO-object path and the
+    # pose-only heuristic, so thresholds get tuned against real numbers
+    # instead of guesswork. Turn off once detection quality is confirmed —
+    # this is chatty at scale.
+    DEBUG = True
+
     def __init__(self):
         self.head_pose_detector = HeadPoseDetector()
         # track_id -> consecutive heuristic-hit count
@@ -57,9 +64,12 @@ class PhoneDetector:
             return False, 0.0
 
         # Suppress phone detection only when there is clear, high-variance writing motion
-        is_writing, _ = SharedHelpers.calculate_wrist_motion_variance(person)
+        is_writing, writing_conf = SharedHelpers.calculate_wrist_motion_variance(person)
         if is_writing:
             self._clear_streak(person.track_id)
+            if self.DEBUG:
+                print(f'[PHONE-DEBUG] {person.track_id}: suppressed as writing motion '
+                      f'(writing_conf={writing_conf}) — check this is correct for this student')
             return False, 0.0
 
         head_is_down = (head_pose in ('head_down', 'looking_away')) or \
@@ -76,6 +86,8 @@ class PhoneDetector:
         if phone_detections:
             for (px1, py1, px2, py2, conf) in phone_detections:
                 if conf < 0.25:
+                    if self.DEBUG:
+                        print(f'[PHONE-DEBUG] {person.track_id}: YOLO phone conf={conf:.2f} < 0.25, skipped')
                     continue
 
                 pc  = np.array([(px1 + px2) / 2.0, (py1 + py2) / 2.0])
@@ -83,25 +95,40 @@ class PhoneDetector:
                 pw  = px2 - px1
 
                 # Sanity-check phone bbox size relative to person
-                if max(pw, ph) / bbox_h > 0.7 or min(pw, ph) / bbox_h < 0.03:
+                size_ratio_max = max(pw, ph) / bbox_h
+                size_ratio_min = min(pw, ph) / bbox_h
+                if size_ratio_max > 0.7 or size_ratio_min < 0.03:
+                    if self.DEBUG:
+                        print(f'[PHONE-DEBUG] {person.track_id}: phone bbox size ratio '
+                              f'max={size_ratio_max:.2f} min={size_ratio_min:.2f} out of [0.03,0.7], rejected')
                     continue
 
                 # Phone must be inside or near the person bbox
                 in_person_x = px1 < x2 + 20 and px2 > x1 - 20
                 in_person_y = py1 < y2 + 20 and py2 > y1 - 20
                 if not (in_person_x and in_person_y):
+                    if self.DEBUG:
+                        print(f'[PHONE-DEBUG] {person.track_id}: phone bbox ({px1},{py1},{px2},{py2}) '
+                              f'outside person bbox ({x1},{y1},{x2},{y2}), rejected')
                     continue
 
                 # Check proximity to any wrist or elbow (indices 7,8=elbow 9,10=wrist)
+                matched = False
                 if person.keypoints is not None and len(person.keypoints) > 10:
                     for idx in (9, 10, 7, 8):
                         if idx >= len(person.keypoints):
                             continue
                         w = person.keypoints[idx]
-                        if _wrist_ok(w, 0.4) and np.linalg.norm(w[:2] - pc) / bbox_h < 0.35:
+                        if not _wrist_ok(w, 0.4):
+                            continue
+                        dist = np.linalg.norm(w[:2] - pc) / bbox_h
+                        if dist < 0.35:
                             self._clear_streak(person.track_id)
                             print(f'[PHONE] Person {person.track_id}: YOLO phone near joint {idx}, conf={conf:.2f}')
                             return True, float(conf)
+                        elif self.DEBUG:
+                            print(f'[PHONE-DEBUG] {person.track_id}: joint {idx} dist={dist:.2f} '
+                                  f'(need <0.35) from phone centre, not matched')
 
                 # If keypoints are unreliable but phone bbox overlaps person strongly, trust YOLO
                 if conf >= 0.55:
@@ -109,10 +136,17 @@ class PhoneDetector:
                     overlap_y = max(0, min(py2, y2) - max(py1, y1))
                     overlap_area = overlap_x * overlap_y
                     phone_area   = max((px2 - px1) * (py2 - py1), 1)
-                    if overlap_area / phone_area > 0.5:
+                    overlap_ratio = overlap_area / phone_area
+                    if overlap_ratio > 0.5:
                         self._clear_streak(person.track_id)
                         print(f'[PHONE] Person {person.track_id}: high-conf YOLO phone inside bbox, conf={conf:.2f}')
                         return True, float(conf)
+                    elif self.DEBUG:
+                        print(f'[PHONE-DEBUG] {person.track_id}: high-conf phone (conf={conf:.2f}) '
+                              f'but overlap_ratio={overlap_ratio:.2f} < 0.5, rejected')
+                elif self.DEBUG:
+                    print(f'[PHONE-DEBUG] {person.track_id}: phone conf={conf:.2f} < 0.55, '
+                          f'no wrist match, no fallback overlap check')
 
         # ── Path 2: Heuristic (no YOLO phone, use pose only) ─────────────────
         # No hard object evidence here — this is an inference from posture
@@ -122,6 +156,8 @@ class PhoneDetector:
         # _confirm_or_hold so a single ambiguous frame can't trigger it.
         if person.keypoints is None or person.keypoints.size == 0 or len(person.keypoints) <= 10:
             self._clear_streak(person.track_id)
+            if self.DEBUG:
+                print(f'[PHONE-DEBUG] {person.track_id}: no usable keypoints for heuristic path')
             return False, 0.0
 
         try:
@@ -134,6 +170,8 @@ class PhoneDetector:
 
             if not wrist_pts:
                 self._clear_streak(person.track_id)
+                if self.DEBUG:
+                    print(f'[PHONE-DEBUG] {person.track_id}: no confident wrist keypoints, head_is_down={head_is_down}')
                 return False, 0.0
 
             heuristic_hit = False
@@ -143,28 +181,46 @@ class PhoneDetector:
                 for w in wrist_pts:
                     rel_y = (w[1] - y1) / bbox_h
                     rel_x_offset = abs(w[0] - (x1 + x2) / 2.0) / bbox_w
+                    in_y_zone   = self.PHONE_SINGLE_HAND_Y_MIN <= rel_y <= self.PHONE_SINGLE_HAND_Y_MAX
+                    centred     = rel_x_offset < 0.35
+                    above_desk  = w[1] < desk_thresh
+                    book_block  = _book_near(w)
 
                     # Wrist in mid-torso to lap zone, centred (not at desk edge)
-                    if (self.PHONE_SINGLE_HAND_Y_MIN <= rel_y <= self.PHONE_SINGLE_HAND_Y_MAX
-                            and rel_x_offset < 0.35
-                            and w[1] < desk_thresh   # not at desk level
-                            and not _book_near(w)):
+                    if in_y_zone and centred and above_desk and not book_block:
                         heuristic_hit = True
                         break
+                    elif self.DEBUG:
+                        print(f'[PHONE-DEBUG] {person.track_id}: wrist rel_y={rel_y:.2f} '
+                              f'(need {self.PHONE_SINGLE_HAND_Y_MIN}-{self.PHONE_SINGLE_HAND_Y_MAX}), '
+                              f'rel_x_offset={rel_x_offset:.2f} (need <0.35), '
+                              f'above_desk={above_desk} (wrist_y={w[1]:.0f} vs desk_thresh={desk_thresh:.0f}), '
+                              f'book_near={book_block} — single-hand check failed')
 
             # Two cupped hands at lap level with head down
             if not heuristic_hit and head_is_down and len(wrist_pts) == 2:
                 both_low = all(w[1] > lap_thresh for w in wrist_pts)
                 spread   = np.linalg.norm(wrist_pts[0] - wrist_pts[1]) / bbox_h
-                if both_low and spread < self.PHONE_CUPPED_SPREAD_MAX:
-                    if not any(_book_near(w) for w in wrist_pts):
-                        heuristic_hit = True
+                cupped_ok = spread < self.PHONE_CUPPED_SPREAD_MAX
+                book_block2 = any(_book_near(w) for w in wrist_pts)
+                if both_low and cupped_ok and not book_block2:
+                    heuristic_hit = True
+                elif self.DEBUG:
+                    print(f'[PHONE-DEBUG] {person.track_id}: both_low={both_low}, '
+                          f'spread={spread:.2f} (need <{self.PHONE_CUPPED_SPREAD_MAX}), '
+                          f'book_near={book_block2} — cupped-hands check failed')
+
+            if not head_is_down and self.DEBUG:
+                print(f'[PHONE-DEBUG] {person.track_id}: head_is_down=False, heuristic path skipped entirely')
 
             if heuristic_hit:
                 confirmed, conf = self._confirm_or_hold(person.track_id, 0.58)
                 if confirmed:
                     print(f'[PHONE] Person {person.track_id}: heuristic confirmed '
                           f'after {self._heuristic_streak[person.track_id]} consecutive frames')
+                elif self.DEBUG:
+                    print(f'[PHONE-DEBUG] {person.track_id}: heuristic hit but only '
+                          f'{self._heuristic_streak.get(person.track_id, 0)}/{self.HEURISTIC_CONFIRM_FRAMES} frames so far')
                 return confirmed, conf
             else:
                 self._clear_streak(person.track_id)

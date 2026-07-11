@@ -270,28 +270,40 @@ class ProductionStreamProcessor:
                     raw_behavior = "hand_raised"
                     raw_confidence = hand_conf
                 else:
-                    is_phone, phone_conf = self.phone_detector.detect_phone_usage(person, phone_dets, head_pose, book_dets)
-                    if is_phone:
-                        raw_behavior = "using_phone"
-                        raw_confidence = phone_conf
+                    # A student with head down but actively moving a hand in a
+                    # small, steady writing motion is ENGAGED, not distracted.
+                    # Previously this signal was only used to suppress false
+                    # "using_phone" hits; it fell through to the head-pose
+                    # branch below and got stamped "distracted" purely for
+                    # having their head down — which is what every student
+                    # taking notes does. Recognize writing explicitly first.
+                    is_writing, writing_conf = SharedHelpers.calculate_wrist_motion_variance(person)
+                    if is_writing:
+                        raw_behavior = "focused"
+                        raw_confidence = max(0.65, min(writing_conf, 0.95)) if writing_conf else 0.72
                     else:
-                        is_eating, eating_conf = self.food_detector.detect_eating(person, food_dets)
-                        if is_eating:
-                            raw_behavior = "eating_food"
-                            raw_confidence = eating_conf
+                        is_phone, phone_conf = self.phone_detector.detect_phone_usage(person, phone_dets, head_pose, book_dets)
+                        if is_phone:
+                            raw_behavior = "using_phone"
+                            raw_confidence = phone_conf
                         else:
-                            if head_pose == "focused":
-                                raw_behavior   = "focused"
-                                raw_confidence = 0.75
-                            elif head_pose in ("head_down", "looking_away"):
-                                raw_behavior   = "distracted"
-                                raw_confidence = 0.70
-                            elif head_pose == "not_visible":
-                                raw_behavior   = "not_visible"
-                                raw_confidence = 0.60
+                            is_eating, eating_conf = self.food_detector.detect_eating(person, food_dets)
+                            if is_eating:
+                                raw_behavior = "eating_food"
+                                raw_confidence = eating_conf
                             else:
-                                raw_behavior   = "distracted"
-                                raw_confidence = 0.65
+                                if head_pose == "focused":
+                                    raw_behavior   = "focused"
+                                    raw_confidence = 0.75
+                                elif head_pose in ("head_down", "looking_away"):
+                                    raw_behavior   = "distracted"
+                                    raw_confidence = 0.70
+                                elif head_pose == "not_visible":
+                                    raw_behavior   = "not_visible"
+                                    raw_confidence = 0.60
+                                else:
+                                    raw_behavior   = "distracted"
+                                    raw_confidence = 0.65
                 final_behavior, confidence = self.behavior_engine.evaluate_final_behavior(person, raw_behavior, raw_confidence)
                 is_alert = final_behavior in ALERT_POSES
                 is_distracted = final_behavior in DISTRACTED_POSES
