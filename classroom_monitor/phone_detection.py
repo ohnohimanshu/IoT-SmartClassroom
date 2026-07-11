@@ -1,156 +1,54 @@
-"""
-Phone Detection — Time-Series State Engine
-==========================================
-Replaces brittle full-frame spatial heuristics with a per-track sliding-window
-probabilistic accumulator.
-
-Two confidence paths:
-  Path A (weight 0.75) — temporal density of YOLO / Roboflow phone object hits
-  Path B (weight 0.25) — sustained behavioural anomaly (head-down + centred wrist)
-
-All geometry is expressed relative to the person bounding box (spatial-invariant).
-"""
-
-import threading
-import time
 import numpy as np
-from collections import deque
-from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple
-
+from typing import List, Tuple, Optional, Dict
 from classroom_monitor.behavior_detection_core import TrackedPerson, SharedHelpers
 from classroom_monitor.head_pose_detection import HeadPoseDetector
 
 
-# ── Tunable configuration ─────────────────────────────────────────────────────
-# Threshold is high: Path B alone (max 0.20) can NEVER fire an alert by itself.
-# Only sustained YOLO hits (Path A) can push confidence above threshold.
-PHONE_CONFIRM_THRESHOLD = 0.50   # requires ~67% of frames to have a YOLO hit
-PATH_A_WEIGHT           = 1.00   # Path A is the only reliable signal
-PATH_B_WEIGHT           = 0.00   # Path B disabled — too many false positives in classrooms
-WINDOW_SECONDS          = 3.0    # longer window = more evidence required
-STALE_TIMEOUT           = 3.0    # seconds before DetectionState is purged
-YOLO_PHONE_CONF         = 0.55   # high confidence threshold — reject book/paper misclassifications
-MIN_WRIST_CONF          = 0.45   # min keypoint confidence to use a wrist
-# Min YOLO hits required in window before Path B can even contribute (future use)
-MIN_YOLO_HITS_FOR_PATH_B = 3
-
-
-# ── Per-track sliding-window state ────────────────────────────────────────────
-@dataclass
-class DetectionState:
-    """Holds per-track sliding-window signal histories for one student."""
-    track_id:                int
-    window_length:           int
-    # True  = phone object detected by YOLO/RF in this frame for this person
-    yolo_phone_history:      deque = field(default_factory=deque)
-    # True  = head pose was head_down or looking_away this frame
-    head_down_history:       deque = field(default_factory=deque)
-    # float = wrist-centre proximity score [0,1] this frame (1 = centred on body)
-    wrist_proximity_history: deque = field(default_factory=deque)
-    last_seen:               float = 0.0
-
-    def __post_init__(self):
-        # Re-create deques with correct maxlen after deserialization / init
-        self.yolo_phone_history      = deque(self.yolo_phone_history,      maxlen=self.window_length)
-        self.head_down_history       = deque(self.head_down_history,       maxlen=self.window_length)
-        self.wrist_proximity_history = deque(self.wrist_proximity_history, maxlen=self.window_length)
-
-
-# ── Phone Detector ────────────────────────────────────────────────────────────
 class PhoneDetector:
-    """
-    Stateful per-track phone detector.
+    PHONE_LAP_HEIGHT_FRACTION  = 0.55   # was 0.65 — catch higher lap positions
+    PHONE_CUPPED_SPREAD_MAX    = 0.22   # was 0.15 — slightly wider cupped grip
+    PHONE_SINGLE_HAND_Y_MIN    = 0.45   # wrist-relative-y above this = torso zone
+    PHONE_SINGLE_HAND_Y_MAX    = 0.85
+    WRITING_DESK_Y_MIN         = 0.70   # wrist above this threshold = desk level
 
-    detect_phone_usage() must be called every processed frame with the current
-    track_id and timestamp so the sliding-window histories stay accurate.
-    """
+    # ── Anti-false-positive gate ──────────────────────────────────────────────
+    # Path 2 (pose heuristic, no object evidence) must repeat for this many
+    # consecutive heavy-detection calls on the SAME track before we trust it.
+    # Path 1 (real YOLO phone bbox) is evidence-backed and is never gated —
+    # only the "guess from posture alone" path needs debouncing.
+    #
+    # At ~2 heavy-detection calls/sec (see views.py heavy_every), a value of 3
+    # means ~1.5s of sustained "head down + hand in lap zone" before we call
+    # it phone use. A student writing in a notebook glances down for a frame
+    # or two and moves their pen constantly — that will not survive 3
+    # consecutive re-confirmations. Actual phone use is sustained and will.
+    HEURISTIC_CONFIRM_FRAMES = 3
 
-    def __init__(self, process_fps: int = 10):
-        self._process_fps   = process_fps
-        self._window_length = max(1, round(process_fps * WINDOW_SECONDS))
-        self._states: Dict[int, DetectionState] = {}
-        self._lock          = threading.Lock()
+    def __init__(self):
         self.head_pose_detector = HeadPoseDetector()
+        # track_id -> consecutive heuristic-hit count
+        self._heuristic_streak: Dict[int, int] = {}
 
-    # ── State registry ────────────────────────────────────────────────────────
+    def cleanup_stale(self, active_track_ids: set):
+        """Call once per frame with the set of currently-active track IDs so
+        streak counters for tracks that have disappeared don't linger forever
+        and don't leak onto a reused/new track ID."""
+        stale = set(self._heuristic_streak.keys()) - active_track_ids
+        for tid in stale:
+            self._heuristic_streak.pop(tid, None)
 
-    def _get_or_create_state(self, track_id: int) -> DetectionState:
-        with self._lock:
-            if track_id not in self._states:
-                self._states[track_id] = DetectionState(
-                    track_id=track_id,
-                    window_length=self._window_length,
-                )
-            return self._states[track_id]
+    def _clear_streak(self, track_id):
+        self._heuristic_streak.pop(track_id, None)
 
-    def cleanup_stale(self, active_track_ids: set) -> None:
-        """Remove DetectionState entries for tracks no longer in the frame.
-        Mirrors the same pattern as HeadPoseDetector.cleanup_stale — call
-        alongside behavior_engine.cleanup_stale each frame."""
-        with self._lock:
-            stale = [tid for tid in self._states if tid not in active_track_ids]
-            for tid in stale:
-                del self._states[tid]
-            if stale:
-                print(f'[PHONE] Cleaned up stale states: {stale}')
+    def _confirm_or_hold(self, track_id, base_conf: float) -> Tuple[bool, float]:
+        streak = self._heuristic_streak.get(track_id, 0) + 1
+        self._heuristic_streak[track_id] = streak
+        if streak >= self.HEURISTIC_CONFIRM_FRAMES:
+            return True, base_conf
+        return False, 0.0
 
-    # ── Spatial-invariance helpers ────────────────────────────────────────────
-
-    @staticmethod
-    def _wrist_centre_proximity(wrist, x1: float, y1: float,
-                                x2: float, y2: float) -> float:
-        """
-        Returns [0, 1] representing how centred the wrist is horizontally
-        within the person bbox.
-          1.0 = perfectly centred (holding something in front of body)
-          0.0 = at the horizontal edge of the bbox (writing at a desk)
-        """
-        bbox_w = max(x2 - x1, 1.0)
-        rel_x  = (wrist[0] - x1) / bbox_w          # 0 = left edge, 1 = right edge
-        # Distance from centre (0.5), normalised to [0, 1]
-        proximity = 1.0 - abs(rel_x - 0.5) * 2.0
-        return float(np.clip(proximity, 0.0, 1.0))
-
-    @staticmethod
-    def _wrist_ok(w, min_conf: float = MIN_WRIST_CONF) -> bool:
-        return w is not None and len(w) >= 3 and w[2] >= min_conf and w[0] != 0.0
-
-    @staticmethod
-    def _phone_size_sane(pw: float, ph: float, bbox_h: float) -> bool:
-        """
-        Reject phone bboxes that are:
-        - absurdly large or tiny relative to the person
-        - nearly square (books/notebooks are square; phones are rectangular)
-        """
-        if bbox_h <= 0 or pw <= 0 or ph <= 0:
-            return False
-        # Size check relative to person height
-        if not (0.04 <= min(pw, ph) / bbox_h <= 0.55):
-            return False
-        # Aspect ratio: phone must be at least 1.4:1 (portrait or landscape)
-        aspect = max(pw, ph) / min(pw, ph)
-        if aspect < 1.4:
-            return False
-        return True
-
-    # ── Core detection ────────────────────────────────────────────────────────
-
-    def detect_phone_usage(
-        self,
-        person:           TrackedPerson,
-        phone_detections: List[Tuple],
-        head_pose:        str,
-        book_detections:  Optional[List[Tuple]] = None,
-        track_id:         int = -1,
-        timestamp:        float = 0.0,
-    ) -> Tuple[bool, float]:
-        """
-        Returns (is_phone_detected, confidence).
-
-        Updates the track's sliding-window histories and computes the
-        two-path probabilistic accumulator score.
-        """
+    def detect_phone_usage(self, person: TrackedPerson, phone_detections: List[Tuple],
+                           head_pose: str, book_detections: Optional[List[Tuple]] = None) -> Tuple[bool, float]:
         book_detections = book_detections or []
         x1, y1, x2, y2 = person.bbox
         bbox_h = y2 - y1
@@ -158,126 +56,120 @@ class PhoneDetector:
         if bbox_h <= 0 or bbox_w <= 0:
             return False, 0.0
 
-        # Use person.track_id as fallback if caller did not pass track_id
-        tid = track_id if track_id >= 0 else person.track_id
-        state = self._get_or_create_state(tid)
-        state.last_seen = timestamp or time.monotonic()
-
-        # Writing suppression — high-variance wrist motion means student is writing
+        # Suppress phone detection only when there is clear, high-variance writing motion
         is_writing, _ = SharedHelpers.calculate_wrist_motion_variance(person)
         if is_writing:
-            state.yolo_phone_history.append(False)
-            state.head_down_history.append(False)
-            state.wrist_proximity_history.append(0.0)
-            return self._accumulate(state)
+            self._clear_streak(person.track_id)
+            return False, 0.0
 
-        # Head-down signal
-        head_is_down = (
-            head_pose in ('head_down', 'looking_away')
-            or self.head_pose_detector.is_head_down_like(person, head_pose)
-        )
-        state.head_down_history.append(head_is_down)
+        head_is_down = (head_pose in ('head_down', 'looking_away')) or \
+                       self.head_pose_detector.is_head_down_like(person, head_pose)
 
-        # Best wrist proximity signal
-        best_proximity = 0.0
-        if person.keypoints is not None and len(person.keypoints) > 10:
-            for idx in (9, 10):   # left wrist, right wrist
-                w = person.keypoints[idx]
-                if self._wrist_ok(w):
-                    prox = self._wrist_centre_proximity(w, x1, y1, x2, y2)
-                    best_proximity = max(best_proximity, prox)
-        state.wrist_proximity_history.append(best_proximity)
+        def _book_near(pt) -> bool:
+            return SharedHelpers.point_near_book(pt, bbox_h, book_detections)
 
-        # ── Path A: YOLO / Roboflow phone object hit ──────────────────────────
-        yolo_hit = False
-        yolo_conf = 0.0
+        def _wrist_ok(w, min_conf=0.4) -> bool:
+            return w is not None and len(w) >= 3 and w[2] >= min_conf and w[0] != 0.0
 
-        for (px1, py1, px2, py2, conf) in phone_detections:
-            if conf < YOLO_PHONE_CONF:
-                continue
-            pw, ph = px2 - px1, py2 - py1
-            if not self._phone_size_sane(pw, ph, bbox_h):
-                continue
+        # ── Path 1: YOLO detected a phone object ─────────────────────────────
+        # Real object evidence — never gated by the persistence counter.
+        if phone_detections:
+            for (px1, py1, px2, py2, conf) in phone_detections:
+                if conf < 0.25:
+                    continue
 
-            pc = np.array([(px1 + px2) / 2.0, (py1 + py2) / 2.0])
+                pc  = np.array([(px1 + px2) / 2.0, (py1 + py2) / 2.0])
+                ph  = py2 - py1
+                pw  = px2 - px1
 
-            # Phone must spatially overlap or be near the person bbox
-            in_x = px1 < x2 + 20 and px2 > x1 - 20
-            in_y = py1 < y2 + 20 and py2 > y1 - 20
-            if not (in_x and in_y):
-                continue
+                # Sanity-check phone bbox size relative to person
+                if max(pw, ph) / bbox_h > 0.7 or min(pw, ph) / bbox_h < 0.03:
+                    continue
 
-            # Phone centre must be in the lower 65% of the person bbox
-            # (rules out books held up to read, papers on desks at head level)
-            phone_rel_y = (pc[1] - y1) / bbox_h
-            if phone_rel_y < 0.35:
-                continue
+                # Phone must be inside or near the person bbox
+                in_person_x = px1 < x2 + 20 and px2 > x1 - 20
+                in_person_y = py1 < y2 + 20 and py2 > y1 - 20
+                if not (in_person_x and in_person_y):
+                    continue
 
-            # Require wrist/elbow proximity confirmation — tightened to 0.28
-            if person.keypoints is not None and len(person.keypoints) > 10:
-                for idx in (9, 10, 7, 8):
-                    if idx >= len(person.keypoints):
-                        continue
-                    w = person.keypoints[idx]
-                    if self._wrist_ok(w, 0.45) and np.linalg.norm(w[:2] - pc) / bbox_h < 0.28:
-                        yolo_hit  = True
-                        yolo_conf = max(yolo_conf, float(conf))
+                # Check proximity to any wrist or elbow (indices 7,8=elbow 9,10=wrist)
+                if person.keypoints is not None and len(person.keypoints) > 10:
+                    for idx in (9, 10, 7, 8):
+                        if idx >= len(person.keypoints):
+                            continue
+                        w = person.keypoints[idx]
+                        if _wrist_ok(w, 0.4) and np.linalg.norm(w[:2] - pc) / bbox_h < 0.35:
+                            self._clear_streak(person.track_id)
+                            print(f'[PHONE] Person {person.track_id}: YOLO phone near joint {idx}, conf={conf:.2f}')
+                            return True, float(conf)
+
+                # If keypoints are unreliable but phone bbox overlaps person strongly, trust YOLO
+                if conf >= 0.55:
+                    overlap_x = max(0, min(px2, x2) - max(px1, x1))
+                    overlap_y = max(0, min(py2, y2) - max(py1, y1))
+                    overlap_area = overlap_x * overlap_y
+                    phone_area   = max((px2 - px1) * (py2 - py1), 1)
+                    if overlap_area / phone_area > 0.5:
+                        self._clear_streak(person.track_id)
+                        print(f'[PHONE] Person {person.track_id}: high-conf YOLO phone inside bbox, conf={conf:.2f}')
+                        return True, float(conf)
+
+        # ── Path 2: Heuristic (no YOLO phone, use pose only) ─────────────────
+        # No hard object evidence here — this is an inference from posture
+        # alone, which is exactly what was producing false positives on
+        # students writing in notebooks (head down + one wrist in lap zone
+        # looks identical to phone use from pose alone). Gated by
+        # _confirm_or_hold so a single ambiguous frame can't trigger it.
+        if person.keypoints is None or person.keypoints.size == 0 or len(person.keypoints) <= 10:
+            self._clear_streak(person.track_id)
+            return False, 0.0
+
+        try:
+            left_wrist  = person.keypoints[9]
+            right_wrist = person.keypoints[10]
+            lap_thresh  = y1 + bbox_h * self.PHONE_LAP_HEIGHT_FRACTION
+            desk_thresh = y1 + bbox_h * self.WRITING_DESK_Y_MIN
+
+            wrist_pts = [w[:2] for w in (left_wrist, right_wrist) if _wrist_ok(w, 0.5)]
+
+            if not wrist_pts:
+                self._clear_streak(person.track_id)
+                return False, 0.0
+
+            heuristic_hit = False
+
+            # Single-hand in torso/lap zone with head down
+            if head_is_down and len(wrist_pts) >= 1:
+                for w in wrist_pts:
+                    rel_y = (w[1] - y1) / bbox_h
+                    rel_x_offset = abs(w[0] - (x1 + x2) / 2.0) / bbox_w
+
+                    # Wrist in mid-torso to lap zone, centred (not at desk edge)
+                    if (self.PHONE_SINGLE_HAND_Y_MIN <= rel_y <= self.PHONE_SINGLE_HAND_Y_MAX
+                            and rel_x_offset < 0.35
+                            and w[1] < desk_thresh   # not at desk level
+                            and not _book_near(w)):
+                        heuristic_hit = True
                         break
+
+            # Two cupped hands at lap level with head down
+            if not heuristic_hit and head_is_down and len(wrist_pts) == 2:
+                both_low = all(w[1] > lap_thresh for w in wrist_pts)
+                spread   = np.linalg.norm(wrist_pts[0] - wrist_pts[1]) / bbox_h
+                if both_low and spread < self.PHONE_CUPPED_SPREAD_MAX:
+                    if not any(_book_near(w) for w in wrist_pts):
+                        heuristic_hit = True
+
+            if heuristic_hit:
+                confirmed, conf = self._confirm_or_hold(person.track_id, 0.58)
+                if confirmed:
+                    print(f'[PHONE] Person {person.track_id}: heuristic confirmed '
+                          f'after {self._heuristic_streak[person.track_id]} consecutive frames')
+                return confirmed, conf
             else:
-                # No keypoints at all — only trust very high confidence + strong overlap
-                if conf >= 0.70:
-                    ov_x = max(0, min(px2, x2) - max(px1, x1))
-                    ov_y = max(0, min(py2, y2) - max(py1, y1))
-                    if ov_x * ov_y / max(pw * ph, 1) > 0.6:
-                        yolo_hit  = True
-                        yolo_conf = max(yolo_conf, float(conf))
+                self._clear_streak(person.track_id)
 
-            if yolo_hit:
-                break
+        except Exception as exc:
+            print(f'[PHONE] Heuristic error: {exc}')
 
-        state.yolo_phone_history.append(yolo_hit)
-
-        # ── Path B: disabled (PATH_B_WEIGHT = 0.0) ───────────────────────────
-        # Behavioural heuristics (head-down + centred wrist) produce too many
-        # false positives in classroom settings where students write with
-        # their hands centred on notebooks. Path A (YOLO object hits) is the
-        # sole reliable signal. Path B code is retained but does not modify
-        # yolo_phone_history and does not amplify wrist_proximity_history.
-
-        return self._accumulate(state)
-
-    def _accumulate(self, state: DetectionState) -> Tuple[bool, float]:
-        """
-        Path A only accumulator.
-        Two-gate approach — both must pass before flagging phone use:
-          1. Density: >= PHONE_CONFIRM_THRESHOLD of the full window has YOLO hits.
-          2. Recency: at least 2 of the last 4 frames have hits (prevents a
-             burst of old detections in a cold window from triggering a flag
-             after the object has gone away).
-        Neither gate fires until the window is at least half populated.
-        """
-        window = state.window_length or 1
-        hits   = sum(state.yolo_phone_history)
-        filled = len(state.yolo_phone_history)
-
-        # Require at least half the window to be populated before deciding
-        if filled < max(4, window // 2):
-            return False, 0.0
-
-        # Gate 1: overall density
-        path_a     = hits / window
-        confidence = path_a
-        if confidence < PHONE_CONFIRM_THRESHOLD:
-            return False, 0.0
-
-        # Gate 2: recent activity — phone must still be present, not just
-        # remembered from a burst several seconds ago
-        recent = list(state.yolo_phone_history)[-4:]
-        if sum(recent) < 2:
-            return False, 0.0
-
-        print(
-            f'[PHONE] Track {state.track_id}: '
-            f'conf={confidence:.3f} hits={hits}/{filled} window={window}'
-        )
-        return True, round(confidence, 3)
+        return False, 0.0
