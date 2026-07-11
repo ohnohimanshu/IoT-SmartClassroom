@@ -540,7 +540,8 @@ def _generate_video_stream(video_path, camera_id=0, camera_location='Classroom',
     # ── Thread primitives ─────────────────────────────────────────────────────
     result_lock = threading.Lock()
     latest_dets = []                        # list[dict] — latest detections
-    detect_q    = _queue.Queue(maxsize=1)   # frames  → detect worker
+    detect_q    = _queue.Queue(maxsize=1)   # frames  → full detect worker (heavy)
+    pose_q      = _queue.Queue(maxsize=2)   # frames  → pose-only worker (cheap)
     save_q      = _queue.Queue(maxsize=50)  # incident dicts → DB/WA saver
     stop_event  = threading.Event()
     cooldown    = {}                        # (type, track_id) → last saved timestamp
@@ -560,6 +561,22 @@ def _generate_video_stream(video_path, camera_id=0, camera_location='Classroom',
                     latest_dets.extend(dets)
             except Exception as exc:
                 print(f'[DETECT] {exc}')
+
+    # ── Pose-only worker — keeps ByteTrack IDs alive between heavy detections ─
+    # Calls _parse_pose_detections on every pose_q frame so the tracker sees
+    # consistent motion and doesn't churn IDs. Does NOT run object detection
+    # or fight detection (cheap path only).
+    def _pose_worker():
+        while not stop_event.is_set():
+            try:
+                work_frame = pose_q.get(timeout=0.5)
+            except _queue.Empty:
+                continue
+            try:
+                if detector is not None and detector.processor.yolo_model is not None:
+                    detector.processor._parse_pose_detections(work_frame)
+            except Exception as exc:
+                print(f'[POSE] {exc}')
 
     # ── Save worker — DB write + email alert, NO dlib ──────────────────────────────
     def _save_worker():
@@ -593,8 +610,10 @@ def _generate_video_stream(video_path, camera_id=0, camera_location='Classroom',
                 pending_keys.discard(item.get('cooldown_key'))
 
     det_thread  = threading.Thread(target=_detection_worker, daemon=True)
+    pose_thread = threading.Thread(target=_pose_worker,      daemon=True)
     save_thread = threading.Thread(target=_save_worker,      daemon=True)
     det_thread.start()
+    pose_thread.start()
     save_thread.start()
 
     # ── Video / camera capture ────────────────────────────────────────────────
@@ -623,7 +642,12 @@ def _generate_video_stream(video_path, camera_id=0, camera_location='Classroom',
     src_fps      = cap.get(cv2.CAP_PROP_FPS) or 25.0
     target_fps   = min(src_fps, 25.0)
     frame_delay  = 1.0 / target_fps
-    detect_every = max(1, int(src_fps))
+    # Run pose tracking every 3 frames (~8fps at 25fps source) to keep
+    # ByteTrack IDs stable. Heavy object/fight detection runs every ~0.5s.
+    # Previously both ran at 1fps (every src_fps frames), which caused
+    # track IDs to churn and broke all temporal smoothing logic.
+    pose_every   = max(1, int(src_fps // 8))    # ~3 frames at 25fps
+    heavy_every  = max(1, int(src_fps // 2))    # ~12 frames at 25fps
     frame_count  = 0
     last_yield   = time.monotonic()
     last_facerec = 0.0
@@ -678,7 +702,16 @@ def _generate_video_stream(video_path, camera_id=0, camera_location='Classroom',
             try:
                 frame_count += 1
 
-                if frame_count % detect_every == 0:
+                # Two-tier dispatch:
+                # pose_q  — every pose_every frames (~8fps): keeps ByteTrack IDs stable
+                # detect_q — every heavy_every frames (~2fps): full object+fight pipeline
+                if frame_count % pose_every == 0:
+                    try:
+                        pose_q.put_nowait(frame.copy())
+                    except _queue.Full:
+                        pass
+
+                if frame_count % heavy_every == 0:
                     try:
                         detect_q.put_nowait(frame.copy())
                     except _queue.Full:
@@ -884,6 +917,7 @@ def _generate_video_stream(video_path, camera_id=0, camera_location='Classroom',
         if cap is not None:
             cap.release()
         det_thread.join(timeout=1)
+        pose_thread.join(timeout=1)
         save_thread.join(timeout=1)
 
 def _get_port():

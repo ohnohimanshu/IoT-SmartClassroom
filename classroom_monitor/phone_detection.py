@@ -84,17 +84,16 @@ class PhoneDetector:
                 )
             return self._states[track_id]
 
-    def cleanup_stale(self, current_time: float) -> None:
-        """Remove DetectionState entries for tracks not seen recently."""
+    def cleanup_stale(self, active_track_ids: set) -> None:
+        """Remove DetectionState entries for tracks no longer in the frame.
+        Mirrors the same pattern as HeadPoseDetector.cleanup_stale — call
+        alongside behavior_engine.cleanup_stale each frame."""
         with self._lock:
-            expired = [
-                tid for tid, s in self._states.items()
-                if current_time - s.last_seen > STALE_TIMEOUT
-            ]
-            for tid in expired:
+            stale = [tid for tid in self._states if tid not in active_track_ids]
+            for tid in stale:
                 del self._states[tid]
-                if expired:
-                    print(f'[PHONE] Cleaned up stale states: {expired}')
+            if stale:
+                print(f'[PHONE] Cleaned up stale states: {stale}')
 
     # ── Spatial-invariance helpers ────────────────────────────────────────────
 
@@ -250,8 +249,12 @@ class PhoneDetector:
     def _accumulate(self, state: DetectionState) -> Tuple[bool, float]:
         """
         Path A only accumulator.
-        Does NOT fire until the window is at least half populated —
-        prevents early sparse frames from producing artificially high ratios.
+        Two-gate approach — both must pass before flagging phone use:
+          1. Density: >= PHONE_CONFIRM_THRESHOLD of the full window has YOLO hits.
+          2. Recency: at least 2 of the last 4 frames have hits (prevents a
+             burst of old detections in a cold window from triggering a flag
+             after the object has gone away).
+        Neither gate fires until the window is at least half populated.
         """
         window = state.window_length or 1
         hits   = sum(state.yolo_phone_history)
@@ -261,16 +264,20 @@ class PhoneDetector:
         if filled < max(4, window // 2):
             return False, 0.0
 
-        # Density = hits / full window length (not just filled frames)
-        # This naturally suppresses low hit counts in a partly-filled window
+        # Gate 1: overall density
         path_a     = hits / window
-        confidence = path_a   # PATH_A_WEIGHT=1.0, PATH_B_WEIGHT=0.0
-        is_phone   = confidence >= PHONE_CONFIRM_THRESHOLD
+        confidence = path_a
+        if confidence < PHONE_CONFIRM_THRESHOLD:
+            return False, 0.0
 
-        if is_phone:
-            print(
-                f'[PHONE] Track {state.track_id}: '
-                f'conf={confidence:.3f} hits={hits}/{filled} window={window}'
-            )
+        # Gate 2: recent activity — phone must still be present, not just
+        # remembered from a burst several seconds ago
+        recent = list(state.yolo_phone_history)[-4:]
+        if sum(recent) < 2:
+            return False, 0.0
 
-        return is_phone, round(confidence, 3)
+        print(
+            f'[PHONE] Track {state.track_id}: '
+            f'conf={confidence:.3f} hits={hits}/{filled} window={window}'
+        )
+        return True, round(confidence, 3)

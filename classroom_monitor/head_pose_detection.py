@@ -10,6 +10,14 @@ class HeadPoseDetector:
     def __init__(self):
         self.low_confidence_counters = {}
 
+    def cleanup_stale(self, active_track_ids: set) -> None:
+        """Remove low_confidence_counters for tracks no longer in the frame.
+        Call alongside TemporalBehaviorEngine.cleanup_stale each frame to
+        prevent unbounded growth of stale track state."""
+        stale = set(self.low_confidence_counters) - active_track_ids
+        for tid in stale:
+            self.low_confidence_counters.pop(tid, None)
+
     def calculate_head_pose(self, person: TrackedPerson) -> str:
         kp = person.keypoints
         if kp is None or kp.size == 0 or len(kp) < 3:

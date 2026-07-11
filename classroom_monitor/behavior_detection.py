@@ -276,8 +276,10 @@ class ProductionStreamProcessor:
             self.behavior_engine.update_person(tid, (x1, y1, x2, y2), kp, timestamp)
 
         self.behavior_engine.cleanup_stale(timestamp)
-        # Cleanup phone detector state for tracks that have left the frame
-        self.phone_detector.cleanup_stale(timestamp)
+        # Cleanup phone detector and head pose state for departed tracks
+        self.phone_detector.cleanup_stale(active_tids)
+        # Cleanup head pose low_confidence_counters for departed tracks
+        self.head_pose_detector.cleanup_stale(active_tids)
 
         results = []
         for tid in active_tids:
@@ -603,6 +605,7 @@ class ClassroomBehaviorDetector:
         """
         Single-frame synchronous detection.
         Runs the full per-person RoI pipeline and returns a list of dicts.
+        Also feeds the fight detector so it accumulates frames for its 3D CNN.
         """
         if self.processor.yolo_model is None:
             return []
@@ -630,10 +633,27 @@ class ClassroomBehaviorDetector:
                 food_dets_by_tid[tid]  = f
                 book_dets_by_tid[tid]  = b
 
+            # Fight detection — feed frame into 3D CNN buffer and run inference.
+            # This was previously only called inside _process_single_frame (the
+            # background-loop path), so the live-stream path via detect() never
+            # triggered it. Fixed here.
+            fight_detected = False
+            if self.processor.fight_detector is not None:
+                self.processor.fight_detector.add_frame(frame)
+                fight_result   = self.processor.fight_detector.predict()
+                fight_detected = (
+                    fight_result[0]
+                    if isinstance(fight_result, tuple)
+                    else bool(fight_result)
+                )
+                if fight_detected:
+                    conf = fight_result[1] if isinstance(fight_result, tuple) else 0.0
+                    print(f'[ALERT] Fight detected in live stream (conf={conf:.2f})')
+
             det_objs = self.processor._run_behavior_evaluation(
                 frame, person_tracks,
                 phone_dets_by_tid, food_dets_by_tid, book_dets_by_tid,
-                timestamp,
+                timestamp, fight_detected,
             )
             return [
                 {

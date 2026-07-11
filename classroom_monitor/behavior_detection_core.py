@@ -79,10 +79,17 @@ class SharedHelpers:
         variance_y = np.var(wrist_array[:, 1])
         total_variance = variance_x + variance_y
 
-        # Lowered to 80 — catches writing motion earlier without suppressing
-        # genuine phone usage (a phone held still has near-zero variance)
-        is_writing = total_variance > 80
-        confidence = min(total_variance / 400, 0.95)
+        # Two writing signatures:
+        # 1. High total variance (broad arm movement) — original check, lowered
+        #    from 80 to 40 to catch deliberate but smaller handwriting strokes.
+        # 2. Low-amplitude lateral sweeping: small X-variance with non-trivial
+        #    Y-variance indicates a wrist scanning horizontally across a page,
+        #    which is characteristic of writing even when the strokes are tiny.
+        #    A phone held still has near-zero variance in both axes.
+        lateral_sweep = (variance_x > 8 and variance_y < variance_x * 3
+                         and total_variance > 15)
+        is_writing = total_variance > 40 or lateral_sweep
+        confidence = min(total_variance / 200, 0.95)
         return is_writing, confidence
 
 
