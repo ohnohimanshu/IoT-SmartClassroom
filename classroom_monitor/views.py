@@ -392,21 +392,39 @@ def live_camera_detail(request, camera_id):
 
 # ── Behavior Incident Views ───────────────────────────────────────────────────
 
-# Module-level shared detector (loaded once, reused by all streams)
-_SHARED_DETECTOR = None
+# Per-stream detector registry (keyed by camera / video job — NOT a single
+# global instance). Each ClassroomBehaviorDetector owns its own
+# TemporalBehaviorEngine + HeadPoseDetector + PhoneDetector + FoodDetector +
+# HandRaiseDetector, all of which key their internal state by ByteTrack
+# track_id. Track IDs are assigned independently per tracking session, so two
+# different cameras (or a live camera running at the same time as an
+# uploaded-video analysis job) WILL eventually produce the same numeric
+# track_id for two completely different people. Sharing one detector across
+# streams meant one student's keypoint/behavior history, confidence
+# smoothing, and incident cooldown could silently get overwritten by an
+# unrelated student on a different camera or video. Each key below gets its
+# own isolated detector instance instead.
+#
+# The underlying YOLO model *weights* are still shared process-wide via
+# _SharedYOLOModels inside behavior_detection.py, so creating a new
+# ClassroomBehaviorDetector per key does NOT reload the model from disk —
+# it's cheap after the very first load.
+_DETECTOR_REGISTRY: dict = {}
+_DETECTOR_REGISTRY_LOCK = None  # set below once threading is imported
 
 
 def _prewarm_detector():
-    """Load YOLO in a background thread at Django startup so the first stream
-    request doesn't block for 3-5 seconds."""
+    """Load YOLO model weights in a background thread at Django startup so
+    the first stream request doesn't block for 3-5 seconds. This constructs
+    one throwaway detector purely to trigger the shared model load in
+    _SharedYOLOModels — it is not kept or reused itself, since real streams
+    get their own per-key detector via _get_yolo_detector(key)."""
     import threading
     def _load():
-        global _SHARED_DETECTOR
         try:
             from classroom_monitor.behavior_detection import ClassroomBehaviorDetector
-            _SHARED_DETECTOR = ClassroomBehaviorDetector(
-                camera_url='', camera_id=0, server_url='')
-            print('[OK] Shared detector pre-warmed')
+            ClassroomBehaviorDetector(camera_url='', camera_id=0, server_url='')
+            print('[OK] YOLO models pre-warmed')
         except Exception as e:
             print(f'[WARN] Pre-warm failed: {e}')
     t = threading.Thread(target=_load, daemon=True)
@@ -415,29 +433,52 @@ def _prewarm_detector():
 
 # Kick off pre-warm immediately when views.py is imported by Django
 try:
+    import threading as _threading_bootstrap
+    _DETECTOR_REGISTRY_LOCK = _threading_bootstrap.Lock()
     _prewarm_detector()
 except Exception:
     pass
 
 
-def _get_yolo_detector():
+def _get_yolo_detector(key: str = '_default'):
     """
-    Module-level singleton for the YOLO+Haar detector.
-    Loaded once when the module is first imported, shared across all streams.
-    This prevents the 3-5s YOLO load blocking the HTTP response.
+    Per-stream detector registry. `key` should be something stable and
+    unique per live camera (e.g. f"camera:{camera_id}") or per uploaded-video
+    analysis job (e.g. f"video:{video_pk}") — never shared between two
+    different streams/jobs. Lazily creates and caches one
+    ClassroomBehaviorDetector per key so tracked-person state never leaks
+    across cameras or videos.
     """
-    global _SHARED_DETECTOR
-    try:
-        if _SHARED_DETECTOR is None:
-            from classroom_monitor.behavior_detection import ClassroomBehaviorDetector
-            _SHARED_DETECTOR = ClassroomBehaviorDetector(
-                camera_url='',
-                camera_id=0,
-                server_url='',       # no HTTP self-calls inside detector
-            )
-    except Exception as e:
-        print(f'[WARN] Could not init shared detector: {e}')
-    return _SHARED_DETECTOR
+    global _DETECTOR_REGISTRY, _DETECTOR_REGISTRY_LOCK
+    if _DETECTOR_REGISTRY_LOCK is None:
+        import threading as _threading_lazy
+        _DETECTOR_REGISTRY_LOCK = _threading_lazy.Lock()
+    with _DETECTOR_REGISTRY_LOCK:
+        det = _DETECTOR_REGISTRY.get(key)
+        if det is None:
+            try:
+                from classroom_monitor.behavior_detection import ClassroomBehaviorDetector
+                det = ClassroomBehaviorDetector(
+                    camera_url='',
+                    camera_id=0,
+                    server_url='',       # no HTTP self-calls inside detector
+                )
+                _DETECTOR_REGISTRY[key] = det
+            except Exception as e:
+                print(f'[WARN] Could not init detector for key={key}: {e}')
+                det = None
+    return det
+
+
+def _release_yolo_detector(key: str):
+    """Remove a per-camera/per-video detector from the registry once its
+    stream or job ends, so tracked-person state and memory don't accumulate
+    across repeated open/close cycles of the same camera page."""
+    global _DETECTOR_REGISTRY, _DETECTOR_REGISTRY_LOCK
+    if _DETECTOR_REGISTRY_LOCK is None:
+        return
+    with _DETECTOR_REGISTRY_LOCK:
+        _DETECTOR_REGISTRY.pop(key, None)
 
 
 def _incident_severity(det_type: str) -> str:
@@ -527,8 +568,12 @@ def _generate_video_stream(video_path, camera_id=0, camera_location='Classroom',
         except Exception:
             pass
 
-    # ── Shared detector singleton ─────────────────────────────────────────────
-    detector = _get_yolo_detector()
+    # ── Per-camera detector (own tracker/behavior-engine state) ───────────────
+    # camera_id defaults to 0 for ad-hoc/URL-only streams; make that a unique
+    # key too (keyed by video_path) so two zero-id ad-hoc streams don't share
+    # state either.
+    stream_key = f'camera:{camera_id}' if camera_id else f'adhoc:{video_path}'
+    detector = _get_yolo_detector(stream_key)
     if detector is None:
         from classroom_monitor.behavior_detection import ClassroomBehaviorDetector
         detector = ClassroomBehaviorDetector(camera_url='', camera_id=0, server_url='')
@@ -547,6 +592,15 @@ def _generate_video_stream(video_path, camera_id=0, camera_location='Classroom',
     cooldown    = {}                        # (type, track_id) → last saved timestamp
     pending_keys = set()
 
+    # `detector.processor.yolo_model.track(..., persist=True)` keeps mutable
+    # internal ByteTrack state on the model object. _detection_worker and
+    # _pose_worker run as separate threads and both call into that same
+    # model — without a lock, two threads can enter .track() at the same
+    # time and corrupt tracker state (ID churn, garbage/misaligned
+    # keypoints, occasional exceptions). This lock makes every call into the
+    # tracker mutually exclusive, regardless of which worker makes it.
+    yolo_track_lock = threading.Lock()
+
     # ── Detect worker — YOLO + Haar only, NO dlib ────────────────────────────
     def _detection_worker():
         while not stop_event.is_set():
@@ -555,7 +609,8 @@ def _generate_video_stream(video_path, camera_id=0, camera_location='Classroom',
             except _queue.Empty:
                 continue
             try:
-                dets = detector.detect(work_frame)
+                with yolo_track_lock:
+                    dets = detector.detect(work_frame)
                 with result_lock:
                     latest_dets.clear()
                     latest_dets.extend(dets)
@@ -565,7 +620,14 @@ def _generate_video_stream(video_path, camera_id=0, camera_location='Classroom',
     # ── Pose-only worker — keeps ByteTrack IDs alive between heavy detections ─
     # Calls _parse_pose_detections on every pose_q frame so the tracker sees
     # consistent motion and doesn't churn IDs. Does NOT run object detection
-    # or fight detection (cheap path only).
+    # or fight detection (cheap path only). It DOES feed each track into
+    # behavior_engine.update_person() so keypoint_history actually gets
+    # samples at this worker's higher cadence (~8fps) instead of only at the
+    # heavy-detection cadence (~2fps) — the wrist-motion-variance ("is this
+    # writing or phone-scrolling") heuristic in behavior_detection_core.py
+    # needs that higher sample rate to be a meaningful signal. Previously this
+    # worker discarded its results entirely, so it had zero effect on
+    # tracked-person state.
     def _pose_worker():
         while not stop_event.is_set():
             try:
@@ -574,7 +636,12 @@ def _generate_video_stream(video_path, camera_id=0, camera_location='Classroom',
                 continue
             try:
                 if detector is not None and detector.processor.yolo_model is not None:
-                    detector.processor._parse_pose_detections(work_frame)
+                    with yolo_track_lock:
+                        tracks = detector.processor._parse_pose_detections(work_frame)
+                    ts = time.time()
+                    for tid, x1, y1, x2, y2, conf, kp in tracks:
+                        detector.processor.behavior_engine.update_person(
+                            tid, (x1, y1, x2, y2), kp, ts)
             except Exception as exc:
                 print(f'[POSE] {exc}')
 
@@ -919,6 +986,7 @@ def _generate_video_stream(video_path, camera_id=0, camera_location='Classroom',
         det_thread.join(timeout=1)
         pose_thread.join(timeout=1)
         save_thread.join(timeout=1)
+        _release_yolo_detector(stream_key)
 
 def _get_port():
     """Return the Django dev-server port (default 8000). Override via DJANGO_PORT env var."""
@@ -1379,7 +1447,16 @@ def _analyze_video_task(video_pk):
         # Sample one frame every 5 seconds
         sample_interval = max(1, int(src_fps * 5))
 
-        detector = _get_yolo_detector()
+        # Own detector key per video job — this must NOT be the same
+        # detector instance used by any live camera stream (or another video
+        # job), since track_id-keyed state (keypoint/behavior history,
+        # confidence smoothing) would otherwise get cross-contaminated
+        # between unrelated people. 5-second frame sampling also means
+        # ByteTrack continuity across samples is weak regardless — that's
+        # expected for batch analysis, but it's still important this job's
+        # track IDs never collide with a live stream's.
+        video_detector_key = f'video:{video_pk}'
+        detector = _get_yolo_detector(video_detector_key)
 
         frame_number = 0
         analyzed_count = 0
@@ -1491,5 +1568,10 @@ def _analyze_video_task(video_pk):
             from django.db import close_old_connections as _cc2
             _cc2()
             ClassroomVideo.objects.filter(pk=video_pk).update(status='failed')
+        except Exception:
+            pass
+    finally:
+        try:
+            _release_yolo_detector(f'video:{video_pk}')
         except Exception:
             pass
