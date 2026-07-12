@@ -36,6 +36,7 @@ services:
       DJANGO_SECRET_KEY: django-insecure-classroom-iot-dev-key-change-in-production
       DJANGO_DEBUG: "False"
       DJANGO_ALLOWED_HOSTS: "*, 127.0.0.1, localhost, 10.7.31.114"
+      PYTHONUNBUFFERED: "1"
     depends_on:
       db:
         condition: service_healthy
