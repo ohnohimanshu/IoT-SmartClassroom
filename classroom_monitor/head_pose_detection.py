@@ -7,16 +7,17 @@ class HeadPoseDetector:
     LOW_CONFIDENCE_THRESHOLD = 0.4       # was 0.5 — more lenient keypoint acceptance
     HEAD_DOWN_CONSECUTIVE_FRAMES = 2     # was 3 — detect head-down sooner
 
+    # Used only when exactly one eye is confidently visible. There's no real
+    # inter-eye distance to normalize against in that case, so we approximate
+    # it from bbox width. This ratio and the threshold below are rough
+    # starting points, not derived from footage — tune both against labeled
+    # single-eye-visible frames (glasses glare, side lighting, off-angle
+    # seats) before trusting this path in production.
+    SINGLE_EYE_INTER_EYE_BBOX_RATIO = 0.12
+    SINGLE_EYE_YAW_RATIO_THRESHOLD  = 0.45
+
     def __init__(self):
         self.low_confidence_counters = {}
-
-    def cleanup_stale(self, active_track_ids: set) -> None:
-        """Remove low_confidence_counters for tracks no longer in the frame.
-        Call alongside TemporalBehaviorEngine.cleanup_stale each frame to
-        prevent unbounded growth of stale track state."""
-        stale = set(self.low_confidence_counters) - active_track_ids
-        for tid in stale:
-            self.low_confidence_counters.pop(tid, None)
 
     def calculate_head_pose(self, person: TrackedPerson) -> str:
         kp = person.keypoints
@@ -60,9 +61,20 @@ class HeadPoseDetector:
                     if bbox_h > 10 and inter_eye < bbox_h * 0.07:
                         return 'looking_away'
             else:
-                # Only one eye visible — likely profile, treat as looking away
+                # Only one eye visible/confident — don't assume looking_away
+                # outright, since this also happens for reasons unrelated to
+                # actual head turn (glasses glare, side lighting, a seat's
+                # camera angle). Estimate yaw from the nose's offset from the
+                # single visible eye, scaled by an approximate inter-eye
+                # distance derived from bbox width.
                 if nose_ok:
-                    return 'looking_away'
+                    visible_eye = left_eye if left_eye_ok else right_eye
+                    bbox_w = person.bbox[2] - person.bbox[0]
+                    est_inter_eye = bbox_w * self.SINGLE_EYE_INTER_EYE_BBOX_RATIO
+                    if est_inter_eye > 0.1:
+                        yaw_ratio = abs(nose[0] - visible_eye[0]) / est_inter_eye
+                        if yaw_ratio > self.SINGLE_EYE_YAW_RATIO_THRESHOLD:
+                            return 'looking_away'
 
             return 'focused'
         except Exception as exc:
