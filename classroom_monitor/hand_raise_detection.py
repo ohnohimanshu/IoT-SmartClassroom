@@ -23,21 +23,25 @@ class HandRaiseDetector:
             pixel_thresh = bbox_h * HandRaiseDetector.WRIST_ABOVE_SHOULDER_FRACTION
 
             pairs = [
-                (kp[5] if len(kp) > 5 else None,  kp[9]  if len(kp) > 9  else None),   # left
-                (kp[6] if len(kp) > 6 else None,  kp[10] if len(kp) > 10 else None),   # right
+                (kp[5] if len(kp) > 5 else None,  kp[7] if len(kp) > 7 else None,  kp[9]  if len(kp) > 9  else None),   # left: shoulder, elbow, wrist
+                (kp[6] if len(kp) > 6 else None,  kp[8] if len(kp) > 8 else None,  kp[10] if len(kp) > 10 else None),   # right
             ]
 
-            for shoulder, wrist in pairs:
-                if shoulder is None or wrist is None:
+            for shoulder, elbow, wrist in pairs:
+                if shoulder is None or elbow is None or wrist is None:
                     continue
-                if (len(shoulder) < 3 or len(wrist) < 3):
+                if len(shoulder) < 3 or len(elbow) < 3 or len(wrist) < 3:
                     continue
-                if shoulder[2] < 0.4 or wrist[2] < 0.4:
+                if shoulder[2] < 0.4 or elbow[2] < 0.4 or wrist[2] < 0.4:
                     continue
                 if wrist[0] == 0.0:
                     continue
-                # In image coords y increases downward, so raised wrist has smaller y
-                if wrist[1] < shoulder[1] - pixel_thresh:
+                # In image coords y increases downward, so raised wrist has smaller y.
+                # Require the arm to actually be extended upward — elbow below (i.e.
+                # larger y than) the wrist — not just the wrist happening to be near
+                # shoulder height, which incidental gestures (adjusting hair, elbow
+                # resting on desk with hand near shoulder) can also produce.
+                if wrist[1] < shoulder[1] - pixel_thresh and elbow[1] > wrist[1]:
                     return True, float(wrist[2])
 
         except Exception as exc:

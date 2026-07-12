@@ -19,10 +19,6 @@ class TrackedPerson:
     last_final_behavior: str = 'focused'
     keypoint_history: deque = field(default_factory=lambda: deque(maxlen=30))
     last_raw_confidence: float = 0.0
-    # Confidence last observed for each raw behavior label, so that
-    # switching final_behavior back to a previously-seen label restores
-    # that label's own confidence instead of an unrelated frame's value.
-    confidence_by_label: Dict[str, float] = field(default_factory=dict)
 
 
 @dataclass
@@ -93,10 +89,19 @@ class SharedHelpers:
 class TemporalBehaviorEngine:
     LOW_CONFIDENCE_THRESHOLD     = 0.4
     HEAD_DOWN_CONSECUTIVE_FRAMES = 2
+    ALERT_CONFIRM_FRAMES  = 3    # was 10 — alerts now confirm in ~0.3s at 10fps
+    ALERT_MAJORITY        = 0.67
     NORMAL_CONFIRM_FRAMES = 3    # was 5
-    VOTE_WINDOW    = 8           # trailing window used for the majority vote
-    ALERT_MAJORITY = 0.80        # share required for an alert-type label to win the vote
-    NORMAL_MAJORITY = 0.50       # share required (strictly greater) for a non-alert label
+
+    # 'hand_raised' gets its own, shorter/looser confirm window than
+    # ALERT_POSES (phone/eating). Those guard against false incident
+    # reports/emails and should stay strict; a missed or late-confirmed
+    # hand-raise has no equivalent cost, and real hand-raises are often
+    # only held 1-3s, which the shared ALERT window (at heavy-detection
+    # cadence ~2fps) can miss entirely or confirm only as the hand is
+    # already coming down.
+    HAND_RAISE_CONFIRM_FRAMES = 3
+    HAND_RAISE_MAJORITY       = 0.6
 
     def __init__(self):
         self.tracked_people: Dict[int, TrackedPerson] = {}
@@ -125,81 +130,46 @@ class TemporalBehaviorEngine:
                 del self.tracked_people[tid]
                 self.low_confidence_counters.pop(tid, None)
 
-    def _is_alert_label(self, label: str) -> bool:
-        return label in ALERT_POSES or label == 'hand_raised'
-
-    def _majority_vote(self, history: List[str]) -> Optional[str]:
-        """
-        Single, unified hysteresis vote over the trailing window of raw
-        behavior readings. Applies regardless of what the newest raw
-        reading happens to be, so the confirmation bar for an alert label
-        is always ALERT_MAJORITY (0.80) — never looser depending on which
-        branch happened to run.
-
-        Returns the label that should become the new final_behavior, or
-        None if nothing in the window clears its required bar (in which
-        case the caller keeps the previous final_behavior).
-        """
-        if not history:
-            return None
-
-        last = history[-1]
-
-        # Fast-response shortcut: N consecutive identical non-alert
-        # readings confirm immediately, without waiting to fill the full
-        # vote window. Never applies to alert-type labels — those always
-        # go through the full ALERT_MAJORITY bar below.
-        if not self._is_alert_label(last) and len(history) >= self.NORMAL_CONFIRM_FRAMES:
-            recent = history[-self.NORMAL_CONFIRM_FRAMES:]
-            if len(set(recent)) == 1:
-                return recent[0]
-
-        window = history[-self.VOTE_WINDOW:]
-        top_label, top_count = Counter(window).most_common(1)[0]
-        share = top_count / len(window)
-
-        if self._is_alert_label(top_label):
-            if share >= self.ALERT_MAJORITY:
-                return top_label
-        else:
-            if share > self.NORMAL_MAJORITY:
-                return top_label
-
-        return None
-
     def evaluate_final_behavior(self, person: TrackedPerson, raw_behavior: str, raw_confidence: float) -> Tuple[str, float]:
-        """
-        Update a tracked person's smoothed behavior state from this frame's
-        raw reading and return (final_behavior, confidence).
+        person.behavior_history.append(raw_behavior)
+        person.last_raw_confidence = raw_confidence
 
-        Holds self.lock for the full read-modify-write so this is safe to
-        call from any thread holding a reference to `person`, even after
-        the caller has released the lock it used to originally fetch that
-        person from tracked_people (multiple threads can share a camera's
-        detector instance).
-        """
-        with self.lock:
-            person.behavior_history.append(raw_behavior)
+        final_behavior = person.last_final_behavior
+        history = list(person.behavior_history)
 
-            # Record this label's confidence BEFORE any fallback lookup,
-            # keyed by label rather than overwriting a single scalar, so
-            # switching final_behavior back to a previously-seen label
-            # restores that label's own last confidence rather than an
-            # unrelated frame's value.
-            person.confidence_by_label[raw_behavior] = raw_confidence
-            person.last_raw_confidence = raw_confidence  # kept for introspection/back-compat
-
-            history = list(person.behavior_history)
-            voted = self._majority_vote(history)
-            if voted is not None:
-                person.last_final_behavior = voted
-
-            final_behavior = person.last_final_behavior
-
-            if final_behavior == raw_behavior:
-                confidence = raw_confidence
+        if len(history) >= 1:
+            last = history[-1]
+            if last == 'hand_raised':
+                # Shorter, looser confirm window than ALERT_POSES — see
+                # HAND_RAISE_CONFIRM_FRAMES/HAND_RAISE_MAJORITY comment above.
+                n = min(self.HAND_RAISE_CONFIRM_FRAMES, len(history))
+                recent = history[-n:]
+                raise_count = sum(1 for h in recent if h == last)
+                if raise_count / n >= self.HAND_RAISE_MAJORITY:
+                    final_behavior = last
+            elif last in ALERT_POSES:
+                # For alert behaviours: confirm over last N frames (majority vote)
+                n = min(self.ALERT_CONFIRM_FRAMES, len(history))
+                recent = history[-n:]
+                alert_count = sum(1 for h in recent if h == last)
+                # Confirm if ≥ 2/3 of recent frames agree (was 100% for all N)
+                if alert_count / n >= self.ALERT_MAJORITY:
+                    final_behavior = last
             else:
-                confidence = person.confidence_by_label.get(final_behavior, person.last_raw_confidence)
-            confidence = confidence or 0.75
+                if len(history) >= self.NORMAL_CONFIRM_FRAMES:
+                    recent = history[-self.NORMAL_CONFIRM_FRAMES:]
+                    if len(set(recent)) == 1:
+                        final_behavior = recent[0]
+                    else:
+                        window = history[-8:]
+                        top_label, top_count = Counter(window).most_common(1)[0]
+                        if top_count / len(window) > 0.5:   # was 0.6
+                            final_behavior = top_label
+                else:
+                    final_behavior = last
 
-            return final_behavior, confidence
+        person.last_final_behavior = final_behavior
+
+        confidence = raw_confidence if final_behavior == person.behavior_history[-1] else person.last_raw_confidence
+        confidence = confidence or 0.75
+        return final_behavior, confidence
