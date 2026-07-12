@@ -186,6 +186,40 @@ class ProductionStreamProcessor:
                     last_ts = now
             time.sleep(0.01)
 
+    @staticmethod
+    def _iou(box_a: Tuple, box_b: Tuple) -> float:
+        ax1, ay1, ax2, ay2 = box_a[:4]
+        bx1, by1, bx2, by2 = box_b[:4]
+        ix1, iy1 = max(ax1, bx1), max(ay1, by1)
+        ix2, iy2 = min(ax2, bx2), min(ay2, by2)
+        iw, ih = max(0, ix2 - ix1), max(0, iy2 - iy1)
+        inter = iw * ih
+        if inter <= 0:
+            return 0.0
+        area_a = max(0, ax2 - ax1) * max(0, ay2 - ay1)
+        area_b = max(0, bx2 - bx1) * max(0, by2 - by1)
+        union = area_a + area_b - inter
+        return inter / union if union > 0 else 0.0
+
+    def _merge_phone_detections(self, coco_dets: List[Tuple], roboflow_dets: List[Tuple],
+                                 iou_thresh: float = 0.4) -> List[Tuple]:
+        """Merge COCO generic-object and Roboflow classroom-specific phone
+        detections, deduping overlapping boxes by IoU rather than treating
+        either source as authoritative. On overlap, keep whichever box has
+        the higher confidence."""
+        merged = list(coco_dets)
+        for rdet in roboflow_dets:
+            dup_idx = None
+            for i, cdet in enumerate(merged):
+                if self._iou(rdet, cdet) >= iou_thresh:
+                    dup_idx = i
+                    break
+            if dup_idx is None:
+                merged.append(rdet)
+            elif rdet[4] > merged[dup_idx][4]:
+                merged[dup_idx] = rdet
+        return merged
+
     def _parse_object_detections(self, frame: np.ndarray):
         phone_dets, food_dets, book_dets = [], [], []
         if self.object_model is not None:
@@ -206,31 +240,41 @@ class ProductionStreamProcessor:
                             book_dets.append(det)
             except Exception as e:
                 print(f'[WARN] YOLO object detection failed: {e}')
-        if not phone_dets:
-            try:
-                api_key = os.environ.get('ROBOFLOW_API_KEY', '')
-                if api_key:
-                    if self.roboflow_model is None:
-                        from roboflow import Roboflow
-                        rf = Roboflow(api_key=api_key)
-                        project = rf.workspace().project("classroom-cell-phone-detection")
-                        self.roboflow_model = project.version(18).model
-                        print('[OK] Roboflow model loaded')
-                    result = self.roboflow_model.predict(frame, confidence=30, overlap=30).json()
-                    for prediction in result.get('predictions', []):
-                        x1 = int(prediction['x'] - prediction['width'] / 2)
-                        y1 = int(prediction['y'] - prediction['height'] / 2)
-                        x2 = int(prediction['x'] + prediction['width'] / 2)
-                        y2 = int(prediction['y'] + prediction['height'] / 2)
-                        conf = prediction['confidence']
-                        phone_dets.append((x1, y1, x2, y2, conf))
-                    if phone_dets:
-                        print(f'[ROBOFLOW] Found {len(phone_dets)} phone(s)')
-            except ImportError:
-                print('[WARN] roboflow not installed')
-            except Exception as e:
-                print(f'[WARN] Roboflow failed: {e}')
+
+        # Roboflow's classroom-specific phone model always runs (when
+        # available) rather than only as a fallback when COCO found
+        # nothing — it's purpose-trained for this exact scenario and
+        # shouldn't be gated behind a single low-confidence COCO miss.
+        # Results are merged/deduped with the COCO phone detections by
+        # IoU instead of either source overriding the other outright.
+        roboflow_dets = []
+        try:
+            api_key = os.environ.get('ROBOFLOW_API_KEY', '')
+            if api_key:
+                if self.roboflow_model is None:
+                    from roboflow import Roboflow
+                    rf = Roboflow(api_key=api_key)
+                    project = rf.workspace().project("classroom-cell-phone-detection")
+                    self.roboflow_model = project.version(18).model
+                    print('[OK] Roboflow model loaded')
+                result = self.roboflow_model.predict(frame, confidence=30, overlap=30).json()
+                for prediction in result.get('predictions', []):
+                    x1 = int(prediction['x'] - prediction['width'] / 2)
+                    y1 = int(prediction['y'] - prediction['height'] / 2)
+                    x2 = int(prediction['x'] + prediction['width'] / 2)
+                    y2 = int(prediction['y'] + prediction['height'] / 2)
+                    conf = prediction['confidence']
+                    roboflow_dets.append((x1, y1, x2, y2, conf))
+                if roboflow_dets:
+                    print(f'[ROBOFLOW] Found {len(roboflow_dets)} phone(s)')
+        except ImportError:
+            print('[WARN] roboflow not installed')
+        except Exception as e:
+            print(f'[WARN] Roboflow failed: {e}')
+
+        phone_dets = self._merge_phone_detections(phone_dets, roboflow_dets)
         return phone_dets, food_dets, book_dets
+
 
     def _parse_pose_detections(self, frame: np.ndarray):
         tracks = []
