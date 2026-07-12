@@ -79,6 +79,20 @@ class ProductionStreamProcessor:
     _FOOD_CLS  = {46, 47, 48, 49, 50, 51, 52, 53, 54, 55}
     _BOOK_CLS  = {73}
 
+    # Fight-detection tuning. FIGHT_CONFIRM_FRAMES is the number of
+    # consecutive positive frames from the 3D-CNN classifier required
+    # before a fight becomes a confirmed, incident-reportable behavior.
+    # At process_fps=10, 3 frames ~= 0.3s of sustained signal — tune
+    # against the actual pipeline frame rate.
+    FIGHT_CONFIRM_FRAMES    = 3
+    # Fallback localization (used only if the classifier gives no
+    # spatial info): two people are fight candidates only if their bbox
+    # centers are within this multiple of their average bbox diagonal...
+    FIGHT_PROXIMITY_RATIO   = 1.5
+    # ...AND both show normalized keypoint motion (frame-over-frame
+    # displacement / bbox diagonal) at or above this threshold.
+    FIGHT_MOTION_THRESHOLD  = 0.12
+
     def __init__(self, process_fps: int = 10, buffer_size: int = 5):
         self.process_fps      = process_fps
         self.frame_interval   = 1.0 / process_fps
@@ -95,6 +109,8 @@ class ProductionStreamProcessor:
         self.person_tracks: List[Tuple] = []
         self.behavior_engine  = TemporalBehaviorEngine()
         self.fight_detector   = None
+        self._fight_streak    = 0          # consecutive positive fight_detected frames
+        self._prev_kp_by_tid: Dict[int, np.ndarray] = {}  # last-frame keypoints, for motion heuristic
 
         # Initialize modular detectors
         self.head_pose_detector = HeadPoseDetector()
@@ -238,23 +254,129 @@ class ProductionStreamProcessor:
             print(f'[ERROR] Pose detection: {e}')
         return tracks
 
-    def _run_behavior_evaluation(self, frame, person_tracks, phone_dets, food_dets, book_dets, timestamp, fight_detected=False):
+    @staticmethod
+    def _bbox_center(bbox):
+        x1, y1, x2, y2 = bbox
+        return (x1 + x2) / 2.0, (y1 + y2) / 2.0
+
+    @staticmethod
+    def _bbox_diag(bbox):
+        x1, y1, x2, y2 = bbox
+        return float(np.hypot(x2 - x1, y2 - y1))
+
+    def _keypoint_motion_score(self, tid, kp):
+        """Average frame-over-frame displacement of confident keypoints for a track.
+        Returns 0.0 if there's no usable previous-frame keypoints to compare against."""
+        if kp is None:
+            return 0.0
+        prev_kp = self._prev_kp_by_tid.get(tid)
+        if prev_kp is None or prev_kp.shape != kp.shape:
+            return 0.0
+        diffs = []
+        for i in range(len(kp)):
+            conf_cur  = kp[i][2] if kp.shape[-1] > 2 else 1.0
+            conf_prev = prev_kp[i][2] if prev_kp.shape[-1] > 2 else 1.0
+            if conf_cur < 0.3 or conf_prev < 0.3:
+                continue
+            dx = kp[i][0] - prev_kp[i][0]
+            dy = kp[i][1] - prev_kp[i][1]
+            diffs.append((dx * dx + dy * dy) ** 0.5)
+        if not diffs:
+            return 0.0
+        return float(np.mean(diffs))
+
+    def _localize_fight_participants(self, person_tracks, fight_region):
+        """
+        Determine which track_ids are actually involved in a confirmed fight,
+        instead of tagging every tracked person.
+
+        Priority:
+          1. fight_region gives explicit track_ids  -> use them directly.
+          2. fight_region gives a spatial bbox/region -> flag tracks whose
+             center falls inside it.
+          3. No spatial info at all -> fallback heuristic: flag pairs of
+             people who are both physically close AND both show high
+             frame-over-frame keypoint motion (proxy for a scuffle rather
+             than two people just standing near each other).
+        """
+        track_ids = {t[0] for t in person_tracks}
+
+        if fight_region:
+            if isinstance(fight_region, dict) and 'track_ids' in fight_region:
+                return set(fight_region['track_ids']) & track_ids
+            if isinstance(fight_region, (list, tuple, set)) and fight_region and \
+                    all(isinstance(v, (int, np.integer)) for v in fight_region):
+                return set(fight_region) & track_ids
+            if isinstance(fight_region, (list, tuple)) and len(fight_region) == 4:
+                rx1, ry1, rx2, ry2 = fight_region
+                involved = set()
+                for tid, x1, y1, x2, y2, conf, kp in person_tracks:
+                    cx, cy = self._bbox_center((x1, y1, x2, y2))
+                    if rx1 <= cx <= rx2 and ry1 <= cy <= ry2:
+                        involved.add(tid)
+                if involved:
+                    return involved
+
+        # Fallback: proximity + high relative motion, evaluated pairwise.
+        involved = set()
+        tracks = list(person_tracks)
+        for i in range(len(tracks)):
+            tid_a, ax1, ay1, ax2, ay2, aconf, akp = tracks[i]
+            diag_a = self._bbox_diag((ax1, ay1, ax2, ay2))
+            if diag_a <= 0:
+                continue
+            for j in range(i + 1, len(tracks)):
+                tid_b, bx1, by1, bx2, by2, bconf, bkp = tracks[j]
+                diag_b = self._bbox_diag((bx1, by1, bx2, by2))
+                if diag_b <= 0:
+                    continue
+                cax, cay = self._bbox_center((ax1, ay1, ax2, ay2))
+                cbx, cby = self._bbox_center((bx1, by1, bx2, by2))
+                dist = float(np.hypot(cax - cbx, cay - cby))
+                avg_diag = (diag_a + diag_b) / 2.0
+                if dist > avg_diag * self.FIGHT_PROXIMITY_RATIO:
+                    continue  # not near each other -> not a candidate pair
+                norm_motion_a = self._keypoint_motion_score(tid_a, akp) / diag_a
+                norm_motion_b = self._keypoint_motion_score(tid_b, bkp) / diag_b
+                if norm_motion_a >= self.FIGHT_MOTION_THRESHOLD and \
+                        norm_motion_b >= self.FIGHT_MOTION_THRESHOLD:
+                    involved.add(tid_a)
+                    involved.add(tid_b)
+        return involved
+
+    def _run_behavior_evaluation(self, frame, person_tracks, phone_dets, food_dets, book_dets, timestamp,
+                                  fight_detected=False, fight_region=None):
         active_tids = set()
         for tid, x1, y1, x2, y2, conf, kp in person_tracks:
             active_tids.add(tid)
             self.behavior_engine.update_person(tid, (x1, y1, x2, y2), kp, timestamp)
         self.behavior_engine.cleanup_stale(timestamp)
-        if hasattr(self.head_pose_detector, 'cleanup_stale'):
-            self.head_pose_detector.cleanup_stale(active_tids)
-        if hasattr(self.phone_detector, 'cleanup_stale'):
-            self.phone_detector.cleanup_stale(active_tids)
+
+        # --- Fight signal: multi-frame confirmation + spatial localization ---
+        # Mirrors the hysteresis every other behavior type gets via
+        # evaluate_final_behavior; a single noisy frame can no longer
+        # promote straight to a reportable, emailed alert.
+        self._fight_streak = self._fight_streak + 1 if fight_detected else 0
+        fight_confirmed = self._fight_streak >= self.FIGHT_CONFIRM_FRAMES
+
+        fighting_tids = set()
+        if fight_confirmed:
+            fighting_tids = self._localize_fight_participants(person_tracks, fight_region)
+
+        # Cache this frame's keypoints for next frame's motion comparison.
+        for tid, x1, y1, x2, y2, conf, kp in person_tracks:
+            if kp is not None:
+                self._prev_kp_by_tid[tid] = kp
+        for stale_tid in set(self._prev_kp_by_tid) - active_tids:
+            self._prev_kp_by_tid.pop(stale_tid, None)
+
         results = []
         for tid in active_tids:
             with self.behavior_engine.lock:
                 if tid not in self.behavior_engine.tracked_people:
                     continue
                 person = self.behavior_engine.tracked_people[tid]
-            if fight_detected:
+            if tid in fighting_tids:
                 result = DetectionResult(
                     type='fighting', bbox=person.bbox, confidence=0.9,
                     color=(0,0,255), label='Fighting!', is_alert=True, is_distracted=False,
@@ -270,40 +392,28 @@ class ProductionStreamProcessor:
                     raw_behavior = "hand_raised"
                     raw_confidence = hand_conf
                 else:
-                    # A student with head down but actively moving a hand in a
-                    # small, steady writing motion is ENGAGED, not distracted.
-                    # Previously this signal was only used to suppress false
-                    # "using_phone" hits; it fell through to the head-pose
-                    # branch below and got stamped "distracted" purely for
-                    # having their head down — which is what every student
-                    # taking notes does. Recognize writing explicitly first.
-                    is_writing, writing_conf = SharedHelpers.calculate_wrist_motion_variance(person)
-                    if is_writing:
-                        raw_behavior = "focused"
-                        raw_confidence = max(0.65, min(writing_conf, 0.95)) if writing_conf else 0.72
+                    is_phone, phone_conf = self.phone_detector.detect_phone_usage(person, phone_dets, head_pose, book_dets)
+                    if is_phone:
+                        raw_behavior = "using_phone"
+                        raw_confidence = phone_conf
                     else:
-                        is_phone, phone_conf = self.phone_detector.detect_phone_usage(person, phone_dets, head_pose, book_dets)
-                        if is_phone:
-                            raw_behavior = "using_phone"
-                            raw_confidence = phone_conf
+                        is_eating, eating_conf = self.food_detector.detect_eating(person, food_dets)
+                        if is_eating:
+                            raw_behavior = "eating_food"
+                            raw_confidence = eating_conf
                         else:
-                            is_eating, eating_conf = self.food_detector.detect_eating(person, food_dets)
-                            if is_eating:
-                                raw_behavior = "eating_food"
-                                raw_confidence = eating_conf
+                            if head_pose == "focused":
+                                raw_behavior   = "focused"
+                                raw_confidence = 0.75
+                            elif head_pose in ("head_down", "looking_away"):
+                                raw_behavior   = "distracted"
+                                raw_confidence = 0.70
+                            elif head_pose == "not_visible":
+                                raw_behavior   = "not_visible"
+                                raw_confidence = 0.60
                             else:
-                                if head_pose == "focused":
-                                    raw_behavior   = "focused"
-                                    raw_confidence = 0.75
-                                elif head_pose in ("head_down", "looking_away"):
-                                    raw_behavior   = "distracted"
-                                    raw_confidence = 0.70
-                                elif head_pose == "not_visible":
-                                    raw_behavior   = "not_visible"
-                                    raw_confidence = 0.60
-                                else:
-                                    raw_behavior   = "distracted"
-                                    raw_confidence = 0.65
+                                raw_behavior   = "distracted"
+                                raw_confidence = 0.65
                 final_behavior, confidence = self.behavior_engine.evaluate_final_behavior(person, raw_behavior, raw_confidence)
                 is_alert = final_behavior in ALERT_POSES
                 is_distracted = final_behavior in DISTRACTED_POSES
@@ -320,13 +430,23 @@ class ProductionStreamProcessor:
             person_tracks = self._parse_pose_detections(frame)
             phone_dets, food_dets, book_dets = self._parse_object_detections(frame)
             fight_detected = False
+            fight_region = None  # optional spatial localization from the detector, if it provides any
             if self.fight_detector is not None:
                 self.fight_detector.add_frame(frame)   # buffer frames for 3D CNN
                 fight_result = self.fight_detector.predict()
-                fight_detected = fight_result[0] if isinstance(fight_result, tuple) else bool(fight_result)
+                if isinstance(fight_result, tuple):
+                    fight_detected = bool(fight_result[0])
+                    # Some detector variants may return (detected, confidence, region_or_track_ids)
+                    if len(fight_result) > 2:
+                        fight_region = fight_result[2]
+                else:
+                    fight_detected = bool(fight_result)
                 if fight_detected:
-                    print('[ALERT] Fight detected!')
-            final_results = self._run_behavior_evaluation(frame, person_tracks, phone_dets, food_dets, book_dets, timestamp, fight_detected)
+                    print('[ALERT] Fight signal this frame (pending multi-frame confirmation)')
+            final_results = self._run_behavior_evaluation(
+                frame, person_tracks, phone_dets, food_dets, book_dets, timestamp,
+                fight_detected, fight_region
+            )
             with self.lock:
                 self.phone_detections = phone_dets
                 self.food_detections  = food_dets
@@ -419,17 +539,7 @@ class ClassroomBehaviorDetector:
             timestamp     = time.time()
             person_tracks = self.processor._parse_pose_detections(frame)
             phone_dets, food_dets, book_dets = self.processor._parse_object_detections(frame)
-
-            fight_detected = False
-            if self.processor.fight_detector is not None:
-                self.processor.fight_detector.add_frame(frame)
-                fight_result = self.processor.fight_detector.predict()
-                fight_detected = fight_result[0] if isinstance(fight_result, tuple) else bool(fight_result)
-                if fight_detected:
-                    conf = fight_result[1] if isinstance(fight_result, tuple) else 0.0
-                    print(f'[ALERT] Fight detected! confidence={conf:.2f}')
-
-            det_objs = self.processor._run_behavior_evaluation(frame, person_tracks, phone_dets, food_dets, book_dets, timestamp, fight_detected)
+            det_objs = self.processor._run_behavior_evaluation(frame, person_tracks, phone_dets, food_dets, book_dets, timestamp)
             detections = []
             for d in det_objs:
                 entry = {
