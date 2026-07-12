@@ -18,6 +18,10 @@ class StudentFaceRecognizer:
     BUG 5 FIX: Now uses shared FACE_MATCH_TOLERANCE constant instead of separate tolerance.
     """
 
+    # Below this, crops are too small/blurry for a reliable encoding —
+    # skip the encoder call entirely rather than feed it garbage.
+    MIN_FACE_CROP_SIZE = 60  # pixels, height and width
+
     def __init__(self, tolerance=None):
         # BUG 5 FIX: Use shared constant instead of separate tolerance parameter
         # Keeping parameter for backward compatibility but defaulting to shared constant
@@ -91,11 +95,20 @@ class StudentFaceRecognizer:
         if not self._known_encodings or self._fr is None:
             return None, 'Unknown', '', 1.0
 
+        h, w = face_crop_bgr.shape[:2]
+        if h < self.MIN_FACE_CROP_SIZE or w < self.MIN_FACE_CROP_SIZE:
+            return None, 'Unknown', '', float('nan')
+
         with DLIB_LOCK:
             try:
                 import cv2
                 rgb       = cv2.cvtColor(face_crop_bgr, cv2.COLOR_BGR2RGB)
-                encodings = self._fr.face_encodings(rgb, num_jitters=1, model='small')
+                # 'large' (68-landmark) model instead of 'small' (5-landmark):
+                # this only runs once per FACEREC_INTERVAL (5s), so it's not
+                # hot-path, and classroom footage has enough off-angle/lighting
+                # variation that the extra landmarks matter more than the
+                # latency here. Revisit if profiling shows it's too slow.
+                encodings = self._fr.face_encodings(rgb, num_jitters=1, model='large')
                 if not encodings:
                     return None, 'Unknown', '', float('nan')
 
