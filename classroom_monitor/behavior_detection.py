@@ -137,6 +137,8 @@ class ProductionStreamProcessor:
         self._ensure_models()
 
     def _capture_frames(self, camera_url: str):
+        """DEPRECATED / UNUSED IN THE LIVE PATH — only reachable via start(),
+        which nothing in views.py calls. See start()'s docstring."""
         cap, reconnect_delay = None, 1.0
         while not self.stop_event.is_set():
             try:
@@ -168,6 +170,8 @@ class ProductionStreamProcessor:
             cap.release()
 
     def _process_frames(self):
+        """DEPRECATED / UNUSED IN THE LIVE PATH — only reachable via start(),
+        which nothing in views.py calls. See start()'s docstring."""
         last_ts = 0.0
         while not self.stop_event.is_set():
             now = time.time()
@@ -456,6 +460,24 @@ class ProductionStreamProcessor:
             print(f'[ERROR] Frame processing: {e}')
 
     def start(self, camera_url: str):
+        """
+        DEPRECATED / UNUSED IN THE LIVE PATH.
+
+        Nothing in views.py calls this. The actual live stream
+        (_generate_video_stream in views.py) drives its own manual
+        cv2.VideoCapture loop + its own worker threads and calls
+        detector.detect(frame) -> ProductionStreamProcessor's parsing/
+        evaluation methods directly, frame by frame, on the shared
+        detector singleton (_get_yolo_detector()).
+
+        Do NOT re-enable this (or wire it up in a new call site) against
+        that same shared detector/processor instance: it spins up its
+        own _capture_frames + _process_frames threads, which would open
+        a second capture on the camera and contend with the manual
+        pipeline for the same YOLO model. If you need this pipeline,
+        give it its own ProductionStreamProcessor instance, not the
+        shared one used by _generate_video_stream.
+        """
         if self.running:
             return
         self.running = True
@@ -465,6 +487,7 @@ class ProductionStreamProcessor:
         print('[OK] Stream processor started')
 
     def stop(self):
+        """DEPRECATED / UNUSED IN THE LIVE PATH — see start() docstring above."""
         self.running = False
         self.stop_event.set()
         print('[OK] Stream processor stopped')
@@ -633,6 +656,15 @@ class ClassroomBehaviorDetector:
             return None, 'Unknown', ''
 
     def _detection_loop(self):
+        """
+        DEPRECATED / UNUSED IN THE LIVE PATH.
+
+        Only reachable via start() below, which nothing in views.py calls.
+        The live stream (_generate_video_stream in views.py) calls
+        self.detect(frame) directly per-frame from its own worker thread
+        instead of running this loop. See ProductionStreamProcessor.start()
+        for why this shouldn't be re-enabled against a shared detector.
+        """
         self.processor.start(self.camera_url)
         frame_count, last_ts = 0, 0.0
         while self.running:
@@ -666,6 +698,9 @@ class ClassroomBehaviorDetector:
         self.processor.stop()
 
     def start(self):
+        """DEPRECATED / UNUSED IN THE LIVE PATH — see _detection_loop's docstring.
+        Nothing in views.py calls this; the shared detector singleton
+        (_get_yolo_detector) is driven entirely via .detect(frame) instead."""
         if self.running:
             return
         self._init_face_recognition()
@@ -675,6 +710,7 @@ class ClassroomBehaviorDetector:
         print('[OK] Behavior detection started')
 
     def stop(self):
+        """DEPRECATED / UNUSED IN THE LIVE PATH — see _detection_loop's docstring."""
         self.running = False
         if self.thread:
             self.thread.join(timeout=5)
