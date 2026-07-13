@@ -148,10 +148,15 @@
             </h5>
             <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal"></button>
           </div>
-          <div class="modal-body p-0">
-            <img src="{% url 'classroom_live_stream' session.camera.pk %}"
-                 style="width:100%;max-height:70vh;object-fit:contain"
-                 id="modal-feed-{{ session.pk }}">
+          <div class="modal-body p-0" style="position:relative;min-height:200px">
+            <div id="modal-loading-{{ session.pk }}" style="position:absolute;inset:0;display:flex;align-items:center;justify-content:center;background:#111;color:#888;font-size:0.9rem">
+              <span><i class="bi bi-broadcast-pin me-2"></i>Connecting to stream...</span>
+            </div>
+            <img src=""
+                 style="width:100%;max-height:70vh;object-fit:contain;display:none"
+                 id="modal-feed-{{ session.pk }}"
+                 onload="document.getElementById('modal-loading-{{ session.pk }}').style.display='none';this.style.display='block'"
+                 onerror="document.getElementById('modal-loading-{{ session.pk }}').innerHTML='<span style=&quot;color:#ef4444&quot;><i class=&quot;bi bi-camera-video-off me-2&quot;></i>Stream unavailable — check camera connection</span>'">
           </div>
           <div class="modal-footer" style="border:none;background:#111">
             <span class="text-white small">
@@ -290,6 +295,12 @@ const csrftoken = document.querySelector('meta[name="csrf-token"]')?.content || 
 document.getElementById('liveModal{{ session.pk }}').addEventListener('hidden.bs.modal', function() {
   const img = document.getElementById('modal-feed-{{ session.pk }}');
   img.src = '';
+  img.style.display = 'none';
+  const loader = document.getElementById('modal-loading-{{ session.pk }}');
+  if (loader) {
+    loader.style.display = 'flex';
+    loader.innerHTML = '<span><i class="bi bi-broadcast-pin me-2"></i>Connecting to stream...</span>';
+  }
 });
 document.getElementById('liveModal{{ session.pk }}').addEventListener('shown.bs.modal', function() {
   const img = document.getElementById('modal-feed-{{ session.pk }}');

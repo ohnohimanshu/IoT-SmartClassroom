@@ -26,6 +26,10 @@ urlpatterns = [
     # ── Attendance ────────────────────────────────────────────────────────────
     path('attendance/', views.attendance_list, name='attendance_list'),
 
+    # ── Admin Management ──────────────────────────────────────────────────────
+    path('admins/', views.manage_admins, name='manage_admins'),
+    path('admins/<int:pk>/delete/', views.delete_admin, name='delete_admin'),
+
     # ── ESP32 API endpoints (matching Flask app) ─────────────────────────────
     path('api/esp32/command/', views.api_esp32_command, name='api_esp32_command'),
     path('api/esp32/enroll-result/', views.api_esp32_enroll_result, name='api_esp32_enroll_result'),

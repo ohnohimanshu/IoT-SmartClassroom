@@ -106,3 +106,45 @@ class ESP32DeviceForm(forms.ModelForm):
         if not (ip_address.startswith('http://') or ip_address.startswith('https://')):
             raise ValidationError('IP address must start with http:// or https://')
         return ip_address
+
+class AdminCreationForm(forms.Form):
+    """Form for superuser to create new admin accounts."""
+    username = forms.CharField(
+        max_length=150,
+        widget=forms.TextInput(attrs={'class': 'form-control', 'placeholder': 'Username'}),
+    )
+    email = forms.EmailField(
+        widget=forms.EmailInput(attrs={'class': 'form-control', 'placeholder': 'admin@example.com'}),
+    )
+    password = forms.CharField(
+        widget=forms.PasswordInput(attrs={'class': 'form-control', 'placeholder': 'Password'}),
+        min_length=8,
+    )
+    password_confirm = forms.CharField(
+        label='Confirm Password',
+        widget=forms.PasswordInput(attrs={'class': 'form-control', 'placeholder': 'Confirm Password'}),
+    )
+
+    def clean_username(self):
+        from django.contrib.auth import get_user_model
+        User = get_user_model()
+        username = self.cleaned_data.get('username', '').strip()
+        if User.objects.filter(username=username).exists():
+            raise ValidationError('A user with this username already exists.')
+        return username
+
+    def clean_email(self):
+        from django.contrib.auth import get_user_model
+        User = get_user_model()
+        email = self.cleaned_data.get('email', '').strip().lower()
+        if User.objects.filter(email=email).exists():
+            raise ValidationError('A user with this email already exists.')
+        return email
+
+    def clean(self):
+        cleaned_data = super().clean()
+        pw = cleaned_data.get('password')
+        pw2 = cleaned_data.get('password_confirm')
+        if pw and pw2 and pw != pw2:
+            self.add_error('password_confirm', 'Passwords do not match.')
+        return cleaned_data

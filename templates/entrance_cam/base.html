@@ -165,6 +165,12 @@
     <a href="{% url 'incidents_dashboard' %}" class="sidebar-link {% if 'incidents' in request.path %}active{% endif %}">
       <i class="bi bi-exclamation-triangle"></i> Incidents
     </a>
+    {% if user.is_superuser %}
+    <div class="nav-section">Administration</div>
+    <a href="{% url 'manage_admins' %}" class="sidebar-link {% if 'admins' in request.path %}active{% endif %}">
+      <i class="bi bi-shield-lock"></i> Manage Admins
+    </a>
+    {% endif %}
   </nav>
   <div style="padding:16px;border-top:1px solid rgba(255,255,255,0.08)">
     <div style="display:flex;align-items:center;gap:10px;margin-bottom:12px">
