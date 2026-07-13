@@ -483,6 +483,12 @@ def live_stream(request, camera_id):
     import time as _time
 
     _log = logging.getLogger(__name__)
+
+    # Manual auth check — avoids redirect (302) that makes <img> fire onerror
+    if not request.user.is_authenticated:
+        from django.http import HttpResponse
+        return HttpResponse(status=401)
+
     camera = get_object_or_404(ClassroomCamera, pk=camera_id)
 
     def _stream():
