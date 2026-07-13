@@ -1,0 +1,13 @@
+train: ../train/images
+val: ../valid/images
+test: ../test/images
+
+nc: 2
+names: ['cell-phones', 'person']
+
+roboflow:
+  workspace: himanshus-workspace-a9row
+  project: classroom-cell-phone-detection-lbhmq
+  version: dataset
+  license: CC BY 4.0
+  url: https://universe.roboflow.com/himanshus-workspace-a9row/classroom-cell-phone-detection-lbhmq/dataset/dataset
