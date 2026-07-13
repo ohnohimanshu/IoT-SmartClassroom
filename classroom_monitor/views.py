@@ -704,6 +704,19 @@ def _generate_video_stream(video_path, camera_id=0, camera_location='Classroom',
     if cap is None:
         print(f'[STREAM] Failed to open camera: {video_path}')
         stop_event.set()
+        # Yield a placeholder error frame so the browser shows something
+        # instead of a broken-image icon.
+        try:
+            err_frame = np.zeros((240, 480, 3), dtype=np.uint8)
+            cv2.putText(err_frame, 'Camera unavailable', (60, 110),
+                        cv2.FONT_HERSHEY_SIMPLEX, 1.0, (80, 80, 255), 2)
+            cv2.putText(err_frame, str(video_path)[:60], (20, 155),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (180, 180, 180), 1)
+            _, buf = cv2.imencode('.jpg', err_frame)
+            yield (b'--frame\r\nContent-Type: image/jpeg\r\n\r\n'
+                   + buf.tobytes() + b'\r\n')
+        except Exception:
+            pass
         return
 
     src_fps      = cap.get(cv2.CAP_PROP_FPS) or 25.0

@@ -597,3 +597,67 @@ def api_mark_fingerprint_attendance(request):
         'confidence': confidence
     })
 
+
+
+# ── Admin Management ───────────────────────────────────────────────────────────
+
+@login_required
+def manage_admins(request):
+    """List all admin/staff users. Only accessible to superusers."""
+    if not request.user.is_superuser:
+        messages.error(request, 'Only the superuser can manage admins.')
+        return redirect('dashboard')
+
+    from django.contrib.auth import get_user_model
+    from .forms import AdminCreationForm
+    User = get_user_model()
+
+    admins = User.objects.filter(is_staff=True).order_by('username')
+
+    if request.method == 'POST':
+        form = AdminCreationForm(request.POST)
+        if form.is_valid():
+            new_admin = User.objects.create_user(
+                username=form.cleaned_data['username'],
+                email=form.cleaned_data['email'],
+                password=form.cleaned_data['password'],
+                is_staff=True,
+                is_active=True,
+            )
+            messages.success(request, f'Admin "{new_admin.username}" created successfully.')
+            return redirect('manage_admins')
+    else:
+        form = AdminCreationForm()
+
+    return render(request, 'entrance_cam/manage_admins.html', {
+        'admins': admins,
+        'form': form,
+    })
+
+
+@login_required
+def delete_admin(request, pk):
+    """Delete an admin user. Only superuser can do this."""
+    if not request.user.is_superuser:
+        messages.error(request, 'Only the superuser can delete admins.')
+        return redirect('dashboard')
+
+    from django.contrib.auth import get_user_model
+    User = get_user_model()
+
+    admin_user = get_object_or_404(User, pk=pk, is_staff=True)
+
+    if admin_user.is_superuser:
+        messages.error(request, 'Cannot delete the superuser account.')
+        return redirect('manage_admins')
+
+    if request.method == 'POST':
+        username = admin_user.username
+        admin_user.delete()
+        messages.success(request, f'Admin "{username}" deleted.')
+        return redirect('manage_admins')
+
+    return render(request, 'entrance_cam/confirm_delete.html', {
+        'obj': admin_user,
+        'type': 'Admin',
+    })
