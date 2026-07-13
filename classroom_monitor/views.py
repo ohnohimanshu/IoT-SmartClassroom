@@ -11,9 +11,12 @@ import json
 import base64
 import os
 import time
+import logging
 import cv2
 import numpy as np
 import requests
+
+logger = logging.getLogger(__name__)
 
 from .models import ClassroomCamera, ClassSession, EngagementSnapshot, StudentZoneLog, ClassroomVideo, VideoAnalysisFrame, VideoStudentZone, IncidentReport
 from .forms import ClassroomCameraForm, ClassroomVideoForm
@@ -324,12 +327,19 @@ def generate_frames(camera_url):
 def live_stream(request, camera_id):
     """Live camera stream with behaviour detection overlays."""
     camera = get_object_or_404(ClassroomCamera, pk=camera_id)
-    return StreamingHttpResponse(
-        _generate_video_stream(camera.url, camera_id=camera.pk,
-                               camera_location=camera.location,
-                               request_obj=request),
-        content_type='multipart/x-mixed-replace; boundary=frame'
-    )
+    try:
+        return StreamingHttpResponse(
+            _generate_video_stream(camera.url, camera_id=camera.pk,
+                                   camera_location=camera.location,
+                                   request_obj=request),
+            content_type='multipart/x-mixed-replace; boundary=frame'
+        )
+    except Exception as e:
+        logger.error(f'live_stream error for camera {camera_id}: {e}', exc_info=True)
+        return StreamingHttpResponse(
+            _error_frame('Stream error — check server logs'),
+            content_type='multipart/x-mixed-replace; boundary=frame'
+        )
 
 
 @login_required
@@ -537,6 +547,19 @@ def _save_incident_direct(det_type, confidence, snapshot_bgr, student,
         print(f'[ERROR] _save_incident_direct: {e}')
         return None
 
+def _error_frame(message='Stream unavailable'):
+    """Yield a single MJPEG frame containing an error message."""
+    try:
+        err = np.zeros((240, 480, 3), dtype=np.uint8)
+        cv2.putText(err, message[:60], (20, 110),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (80, 80, 255), 2)
+        _, buf = cv2.imencode('.jpg', err)
+        yield (b'--frame\r\nContent-Type: image/jpeg\r\n\r\n'
+               + buf.tobytes() + b'\r\n')
+    except Exception:
+        pass
+
+
 def _generate_video_stream(video_path, camera_id=0, camera_location='Classroom',
                             request_obj=None):
     """
@@ -547,14 +570,22 @@ def _generate_video_stream(video_path, camera_id=0, camera_location='Classroom',
     import threading
     import queue as _queue
 
-    from classroom_monitor.behavior_detection import (
-        ClassroomBehaviorDetector, COLOR_MAP, LABEL_MAP,
-        ALERT_POSES, DISTRACTED_POSES,
-    )
-    from classroom_monitor.constants import EMAIL_ALERT_TYPES
-    from classroom_monitor.face_recognition_helper import (
-        StudentFaceRecognizer, DLIB_LOCK,
-    )
+    # Guard: if required libraries are missing, stream an error frame instead
+    # of raising an unhandled exception (which causes a 500 before any bytes
+    # are sent to the browser).
+    try:
+        from classroom_monitor.behavior_detection import (
+            ClassroomBehaviorDetector, COLOR_MAP, LABEL_MAP,
+            ALERT_POSES, DISTRACTED_POSES,
+        )
+        from classroom_monitor.constants import EMAIL_ALERT_TYPES
+        from classroom_monitor.face_recognition_helper import (
+            StudentFaceRecognizer, DLIB_LOCK,
+        )
+    except Exception as import_err:
+        print(f'[STREAM] Import failed: {import_err}')
+        yield from _error_frame(f'Import error: {str(import_err)[:50]}')
+        return
 
     FACEREC_INTERVAL = 5.0   # seconds between face-recognition attempts
     COOLDOWN_S       = 90    # seconds between same incident type alerts

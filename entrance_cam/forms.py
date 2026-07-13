@@ -107,8 +107,7 @@ class ESP32DeviceForm(forms.ModelForm):
             raise ValidationError('IP address must start with http:// or https://')
         return ip_address
 
-class
- AdminCreationForm(forms.Form):
+class AdminCreationForm(forms.Form):
     """Form for superuser to create new admin accounts."""
     username = forms.CharField(
         max_length=150,
