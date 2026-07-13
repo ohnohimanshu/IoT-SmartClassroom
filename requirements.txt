@@ -25,9 +25,4 @@ urllib3==2.3.0
 torch>=2.0.0
 torchvision>=0.15.0
 gdown>=5.0.0
-<<<<<<< HEAD
-
-git+https://github.com/ageitgey/face_recognition_models
-=======
 https://github.com/ageitgey/face_recognition_models/archive/refs/heads/master.zip
->>>>>>> b77871c50b9e1493cc263d0b7f84dee883b2cd10
