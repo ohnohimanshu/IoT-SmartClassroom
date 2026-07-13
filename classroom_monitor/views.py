@@ -321,18 +321,6 @@ def generate_frames(camera_url):
 
 
 @login_required
-def live_stream(request, camera_id):
-    """Live camera stream with behaviour detection overlays."""
-    camera = get_object_or_404(ClassroomCamera, pk=camera_id)
-    return StreamingHttpResponse(
-        _generate_video_stream(camera.url, camera_id=camera.pk,
-                               camera_location=camera.location,
-                               request_obj=request),
-        content_type='multipart/x-mixed-replace; boundary=frame'
-    )
-
-
-@login_required
 def live_monitor(request):
     try:
         from entrance_cam.models import Student
@@ -479,6 +467,151 @@ def _release_yolo_detector(key: str):
         return
     with _DETECTOR_REGISTRY_LOCK:
         _DETECTOR_REGISTRY.pop(key, None)
+
+
+@login_required
+def live_stream(request, camera_id):
+    """
+    Simple MJPEG proxy — reads directly from the camera via OpenCV and
+    streams annotated frames to the browser.  The heavy behavior-detection
+    pipeline runs in a background thread; if it fails for any reason the
+    stream still keeps delivering raw frames so the modal always shows video.
+    """
+    import logging
+    import threading
+    import queue as _q
+    import time as _time
+
+    _log = logging.getLogger(__name__)
+    camera = get_object_or_404(ClassroomCamera, pk=camera_id)
+
+    def _stream():
+        url = camera.url.strip()
+        try:
+            src = int(url) if url.isdigit() else url
+        except Exception:
+            src = url
+
+        cap = cv2.VideoCapture(src)
+        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+
+        if not cap.isOpened():
+            err = np.zeros((240, 480, 3), dtype=np.uint8)
+            cv2.putText(err, 'Camera unavailable', (60, 110),
+                        cv2.FONT_HERSHEY_SIMPLEX, 1.0, (80, 80, 255), 2)
+            cv2.putText(err, url[:60], (20, 160),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (180, 180, 180), 1)
+            _, buf = cv2.imencode('.jpg', err)
+            yield (b'--frame\r\nContent-Type: image/jpeg\r\n\r\n'
+                   + buf.tobytes() + b'\r\n')
+            return
+
+        detector = None
+        try:
+            detector = _get_yolo_detector(f'camera:{camera_id}')
+        except Exception as e:
+            _log.warning(f'[STREAM] detector unavailable: {e}')
+
+        result_lock = threading.Lock()
+        latest_dets: list = []
+        detect_q = _q.Queue(maxsize=1)
+        stop_ev = threading.Event()
+
+        def _det_worker():
+            while not stop_ev.is_set():
+                try:
+                    frm = detect_q.get(timeout=0.5)
+                except _q.Empty:
+                    continue
+                try:
+                    dets = detector.detect(frm) if detector else []
+                    with result_lock:
+                        latest_dets.clear()
+                        latest_dets.extend(dets)
+                except Exception as exc:
+                    _log.debug(f'[DET] {exc}')
+
+        det_thread = threading.Thread(target=_det_worker, daemon=True)
+        det_thread.start()
+
+        src_fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
+        frame_delay = 1.0 / min(src_fps, 25.0)
+        heavy_every = max(1, int(src_fps // 2))
+        fc = 0
+        last_yield = _time.monotonic()
+        consecutive_errors = 0
+
+        try:
+            while True:
+                ret, frame = cap.read()
+                if not ret or frame is None:
+                    consecutive_errors += 1
+                    if consecutive_errors > 10:
+                        break
+                    _time.sleep(0.05)
+                    continue
+                consecutive_errors = 0
+                fc += 1
+
+                if fc % heavy_every == 0:
+                    try:
+                        detect_q.put_nowait(frame.copy())
+                    except _q.Full:
+                        pass
+
+                try:
+                    with result_lock:
+                        dets = list(latest_dets)
+                    annotated = frame.copy()
+                    focused = distracted = phone = eating = 0
+                    for det in dets[:20]:
+                        dt = det.get('type', '')
+                        x1, y1, x2, y2 = det.get('bbox', (0, 0, 0, 0))
+                        color = det.get('color', (120, 120, 120))
+                        label = det.get('label', dt)
+                        cv2.rectangle(annotated, (x1, y1), (x2, y2), color, 2)
+                        cv2.putText(annotated, label, (x1 + 4, max(y1 - 8, 18)),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.52, color, 2)
+                        if dt == 'focused':
+                            focused += 1
+                        elif dt in ('distracted', 'looking_away', 'head_down'):
+                            distracted += 1
+                        elif dt == 'using_phone':
+                            phone += 1
+                        elif dt == 'eating_food':
+                            eating += 1
+                    total = focused + distracted + phone + eating
+                    score = (focused / total * 100) if total > 0 else 0.0
+                    bar = f'F:{focused} D:{distracted} Ph:{phone} Eat:{eating}  {score:.0f}%'
+                    cv2.rectangle(annotated, (0, 0), (len(bar) * 9 + 14, 26), (20, 20, 20), -1)
+                    cv2.putText(annotated, bar, (6, 18),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.48, (255, 255, 255), 1)
+                except Exception:
+                    annotated = frame
+
+                _, buf = cv2.imencode('.jpg', annotated, [cv2.IMWRITE_JPEG_QUALITY, 72])
+                if buf is not None:
+                    try:
+                        yield (b'--frame\r\nContent-Type: image/jpeg\r\n\r\n'
+                               + buf.tobytes() + b'\r\n')
+                    except (BrokenPipeError, ConnectionResetError, OSError):
+                        break
+
+                elapsed = _time.monotonic() - last_yield
+                wait = frame_delay - elapsed
+                if wait > 0:
+                    _time.sleep(wait)
+                last_yield = _time.monotonic()
+        finally:
+            stop_ev.set()
+            cap.release()
+            det_thread.join(timeout=1)
+            _release_yolo_detector(f'camera:{camera_id}')
+
+    return StreamingHttpResponse(
+        _stream(),
+        content_type='multipart/x-mixed-replace; boundary=frame',
+    )
 
 
 def _incident_severity(det_type: str) -> str:
