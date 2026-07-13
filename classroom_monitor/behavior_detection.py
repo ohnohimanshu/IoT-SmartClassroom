@@ -58,6 +58,17 @@ class _SharedYOLOModels:
     _lock = threading.Lock()
     _pose_model = None
     _object_model = None
+    # Local, classroom-specific phone detector (no API, no network calls at
+    # inference time). Trained separately from a Roboflow-downloaded dataset
+    # ("classroom-cell-phone-detection") and exported to a local .pt file —
+    # see CLASSROOM_PHONE_MODEL_PATH below. This is intentionally separate
+    # from the cloud Roboflow branch in _parse_object_detections, which stays
+    # as an optional extra source if ROBOFLOW_API_KEY is set, but should not
+    # be relied on for production (network dependency, per-call cost/latency,
+    # and an external service being a single point of failure for a
+    # safety-relevant detector).
+    _phone_model = None
+    _phone_model_load_attempted = False
 
     @classmethod
     def get(cls):
@@ -71,6 +82,33 @@ class _SharedYOLOModels:
                 except Exception as e:
                     print(f'[WARN] Shared YOLO model load failed: {e}')
             return cls._pose_model, cls._object_model
+
+    @classmethod
+    def get_phone_model(cls):
+        """Load the local classroom-specific phone-detection model once per
+        process. Path is configurable via CLASSROOM_PHONE_MODEL_PATH so this
+        is a no-op (returns None, logs a warning once) until you've actually
+        trained and placed a weights file — nothing else in the pipeline
+        depends on this being present."""
+        with cls._lock:
+            if cls._phone_model is None and not cls._phone_model_load_attempted:
+                cls._phone_model_load_attempted = True
+                try:
+                    from ultralytics import YOLO
+                    path = os.environ.get(
+                        'CLASSROOM_PHONE_MODEL_PATH',
+                        os.path.join(os.path.dirname(__file__), 'model_weights', 'classroom_phone_yolo.pt'),
+                    )
+                    if os.path.exists(path):
+                        cls._phone_model = YOLO(path)
+                        print(f'[OK] Local classroom phone model loaded from {path}')
+                    else:
+                        print(f'[WARN] Local classroom phone model not found at {path} — '
+                              f'set CLASSROOM_PHONE_MODEL_PATH or train one (see docs). '
+                              f'Falling back to COCO cell-phone class only.')
+                except Exception as e:
+                    print(f'[WARN] Local classroom phone model load failed: {e}')
+            return cls._phone_model
 
 
 # ── Production Stream Processor ──────────────────────────────────────────────
@@ -101,6 +139,7 @@ class ProductionStreamProcessor:
         self.yolo_model       = None
         self.object_model     = None
         self.roboflow_model   = None
+        self.classroom_phone_model = None
         self.running          = False
         self.lock             = threading.Lock()
         self.stop_event       = threading.Event()
@@ -123,6 +162,7 @@ class ProductionStreamProcessor:
 
     def _ensure_models(self):
         self.yolo_model, self.object_model = _SharedYOLOModels.get()
+        self.classroom_phone_model = _SharedYOLOModels.get_phone_model()
 
     def _init_fight_detector(self):
         try:
@@ -247,6 +287,39 @@ class ProductionStreamProcessor:
         # shouldn't be gated behind a single low-confidence COCO miss.
         # Results are merged/deduped with the COCO phone detections by
         # IoU instead of either source overriding the other outright.
+        # Local, classroom-specific phone model (no API, no network call).
+        # This is the primary/preferred source for phone detections — it was
+        # fine-tuned specifically on classroom camera angles, unlike the
+        # generic COCO "cell phone" class above, and unlike the optional
+        # Roboflow cloud branch below it has no runtime network dependency.
+        local_phone_dets = []
+        if self.classroom_phone_model is not None:
+            try:
+                for result in self.classroom_phone_model(frame, verbose=False, conf=0.35, iou=0.45):
+                    if result.boxes is None:
+                        continue
+                    names = getattr(result, 'names', {}) or {}
+                    for i in range(len(result.boxes)):
+                        cls_id   = int(result.boxes.cls[i])
+                        cls_name = str(names.get(cls_id, cls_id)).lower()
+                        # Most classroom-phone datasets export a single
+                        # relevant class (e.g. "cell-phone" / "phone" /
+                        # "using-phone"). Keep only boxes whose class name
+                        # actually refers to a phone, in case the dataset
+                        # also ships a "person" class alongside it (some do,
+                        # per the dataset notes) — we don't want those
+                        # showing up as phone detections.
+                        if 'phone' not in cls_name:
+                            continue
+                        conf = float(result.boxes.conf[i])
+                        x1, y1, x2, y2 = map(int, result.boxes.xyxy[i])
+                        local_phone_dets.append((x1, y1, x2, y2, conf))
+            except Exception as e:
+                print(f'[WARN] Local classroom phone model inference failed: {e}')
+
+        # Optional cloud fallback/supplement — only runs if you've explicitly
+        # set ROBOFLOW_API_KEY. Not required once the local model above is in
+        # place; kept as an extra signal source, merged the same way.
         roboflow_dets = []
         try:
             api_key = os.environ.get('ROBOFLOW_API_KEY', '')
@@ -272,6 +345,7 @@ class ProductionStreamProcessor:
         except Exception as e:
             print(f'[WARN] Roboflow failed: {e}')
 
+        phone_dets = self._merge_phone_detections(phone_dets, local_phone_dets)
         phone_dets = self._merge_phone_detections(phone_dets, roboflow_dets)
         return phone_dets, food_dets, book_dets
 
