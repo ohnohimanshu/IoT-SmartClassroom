@@ -44,8 +44,8 @@ class StudentFaceRecognizer:
                 try:
                     import face_recognition as fr
                     self._fr = fr
-                except ImportError:
-                    print('[WARN] face_recognition not installed')
+                except (ImportError, Exception) as e:
+                    print(f'[WARN] face_recognition not available: {e}')
                     self._loaded = True
                     return
 

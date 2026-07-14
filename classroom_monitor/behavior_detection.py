@@ -702,8 +702,14 @@ class ClassroomBehaviorDetector:
         for det in detections:
             x1, y1, x2, y2 = det['bbox']
             color, label, conf = det['color'], det['label'], det['confidence']
+            tid = det.get('track_id')
             cv2.rectangle(out, (x1, y1), (x2, y2), color, 2)
-            text = f"{label} ({conf:.2f})"
+            # Track ID included so a debug log line like "[PHONE] Person 44:
+            # ..." can be matched directly to the exact box on screen,
+            # instead of guessing which visible person a log entry refers
+            # to — this came up repeatedly while diagnosing phone-detection
+            # false positives/negatives.
+            text = f"#{tid} {label} ({conf:.2f})" if tid is not None else f"{label} ({conf:.2f})"
             tw, th = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)[0]
             bg_y1 = max(0, y1 - th - 4)
             cv2.rectangle(out, (x1, bg_y1), (x1 + tw + 4, y1), color, -1)
