@@ -1,4 +1,4 @@
-{% extends 'base.html' %}
+{% extends 'entrance_cam/base.html' %}
 {% load static %}
 
 {% block title %}Incident Details{% endblock %}
@@ -46,7 +46,7 @@
                         </div>
                         <div class="col-md-6">
                             <p><strong>Camera:</strong></p>
-                            <p>{{ incident.camera.name }}</p>
+                            <p>{{ incident.camera.name|default:"—" }}</p>
                         </div>
                     </div>
                     
@@ -85,7 +85,6 @@
                         </div>
                         <div class="col-md-6">
                             <p><strong>Email:</strong> {{ incident.student.email|default:"N/A" }}</p>
-                            <p><strong>Phone:</strong> {{ incident.student.phone|default:"N/A" }}</p>
                         </div>
                     </div>
                 </div>

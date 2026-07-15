@@ -11,9 +11,14 @@ import json
 import base64
 import os
 import time
-import cv2
-import numpy as np
 import requests
+
+try:
+    import cv2
+    import numpy as np
+except ImportError:
+    cv2 = None
+    np = None
 
 from .models import ClassroomCamera, ClassSession, EngagementSnapshot, StudentZoneLog, ClassroomVideo, VideoAnalysisFrame, VideoStudentZone, IncidentReport
 from .forms import ClassroomCameraForm, ClassroomVideoForm
@@ -321,6 +326,18 @@ def generate_frames(camera_url):
 
 
 @login_required
+def live_stream(request, camera_id):
+    """Live camera stream with behaviour detection overlays."""
+    camera = get_object_or_404(ClassroomCamera, pk=camera_id)
+    return StreamingHttpResponse(
+        _generate_video_stream(camera.url, camera_id=camera.pk,
+                               camera_location=camera.location,
+                               request_obj=request),
+        content_type='multipart/x-mixed-replace; boundary=frame'
+    )
+
+
+@login_required
 def live_monitor(request):
     try:
         from entrance_cam.models import Student
@@ -380,39 +397,21 @@ def live_camera_detail(request, camera_id):
 
 # ── Behavior Incident Views ───────────────────────────────────────────────────
 
-# Per-stream detector registry (keyed by camera / video job — NOT a single
-# global instance). Each ClassroomBehaviorDetector owns its own
-# TemporalBehaviorEngine + HeadPoseDetector + PhoneDetector + FoodDetector +
-# HandRaiseDetector, all of which key their internal state by ByteTrack
-# track_id. Track IDs are assigned independently per tracking session, so two
-# different cameras (or a live camera running at the same time as an
-# uploaded-video analysis job) WILL eventually produce the same numeric
-# track_id for two completely different people. Sharing one detector across
-# streams meant one student's keypoint/behavior history, confidence
-# smoothing, and incident cooldown could silently get overwritten by an
-# unrelated student on a different camera or video. Each key below gets its
-# own isolated detector instance instead.
-#
-# The underlying YOLO model *weights* are still shared process-wide via
-# _SharedYOLOModels inside behavior_detection.py, so creating a new
-# ClassroomBehaviorDetector per key does NOT reload the model from disk —
-# it's cheap after the very first load.
-_DETECTOR_REGISTRY: dict = {}
-_DETECTOR_REGISTRY_LOCK = None  # set below once threading is imported
+# Module-level shared detector (loaded once, reused by all streams)
+_SHARED_DETECTOR = None
 
 
 def _prewarm_detector():
-    """Load YOLO model weights in a background thread at Django startup so
-    the first stream request doesn't block for 3-5 seconds. This constructs
-    one throwaway detector purely to trigger the shared model load in
-    _SharedYOLOModels — it is not kept or reused itself, since real streams
-    get their own per-key detector via _get_yolo_detector(key)."""
+    """Load YOLO in a background thread at Django startup so the first stream
+    request doesn't block for 3-5 seconds."""
     import threading
     def _load():
+        global _SHARED_DETECTOR
         try:
             from classroom_monitor.behavior_detection import ClassroomBehaviorDetector
-            ClassroomBehaviorDetector(camera_url='', camera_id=0, server_url='')
-            print('[OK] YOLO models pre-warmed')
+            _SHARED_DETECTOR = ClassroomBehaviorDetector(
+                camera_url='', camera_id=0, server_url='')
+            print('[OK] Shared detector pre-warmed')
         except Exception as e:
             print(f'[WARN] Pre-warm failed: {e}')
     t = threading.Thread(target=_load, daemon=True)
@@ -421,203 +420,29 @@ def _prewarm_detector():
 
 # Kick off pre-warm immediately when views.py is imported by Django
 try:
-    import threading as _threading_bootstrap
-    _DETECTOR_REGISTRY_LOCK = _threading_bootstrap.Lock()
     _prewarm_detector()
 except Exception:
     pass
 
 
-def _get_yolo_detector(key: str = '_default'):
+def _get_yolo_detector():
     """
-    Per-stream detector registry. `key` should be something stable and
-    unique per live camera (e.g. f"camera:{camera_id}") or per uploaded-video
-    analysis job (e.g. f"video:{video_pk}") — never shared between two
-    different streams/jobs. Lazily creates and caches one
-    ClassroomBehaviorDetector per key so tracked-person state never leaks
-    across cameras or videos.
+    Module-level singleton for the YOLO+Haar detector.
+    Loaded once when the module is first imported, shared across all streams.
+    This prevents the 3-5s YOLO load blocking the HTTP response.
     """
-    global _DETECTOR_REGISTRY, _DETECTOR_REGISTRY_LOCK
-    if _DETECTOR_REGISTRY_LOCK is None:
-        import threading as _threading_lazy
-        _DETECTOR_REGISTRY_LOCK = _threading_lazy.Lock()
-    with _DETECTOR_REGISTRY_LOCK:
-        det = _DETECTOR_REGISTRY.get(key)
-        if det is None:
-            try:
-                from classroom_monitor.behavior_detection import ClassroomBehaviorDetector
-                det = ClassroomBehaviorDetector(
-                    camera_url='',
-                    camera_id=0,
-                    server_url='',       # no HTTP self-calls inside detector
-                )
-                _DETECTOR_REGISTRY[key] = det
-            except Exception as e:
-                print(f'[WARN] Could not init detector for key={key}: {e}')
-                det = None
-    return det
-
-
-def _release_yolo_detector(key: str):
-    """Remove a per-camera/per-video detector from the registry once its
-    stream or job ends, so tracked-person state and memory don't accumulate
-    across repeated open/close cycles of the same camera page."""
-    global _DETECTOR_REGISTRY, _DETECTOR_REGISTRY_LOCK
-    if _DETECTOR_REGISTRY_LOCK is None:
-        return
-    with _DETECTOR_REGISTRY_LOCK:
-        _DETECTOR_REGISTRY.pop(key, None)
-
-
-@login_required
-def live_stream(request, camera_id):
-    """
-    Simple MJPEG proxy — reads directly from the camera via OpenCV and
-    streams annotated frames to the browser.  The heavy behavior-detection
-    pipeline runs in a background thread; if it fails for any reason the
-    stream still keeps delivering raw frames so the modal always shows video.
-    """
-    import logging
-    import threading
-    import queue as _q
-    import time as _time
-
-    _log = logging.getLogger(__name__)
-
-    # Manual auth check — avoids redirect (302) that makes <img> fire onerror
-    if not request.user.is_authenticated:
-        from django.http import HttpResponse
-        return HttpResponse(status=401)
-
-    camera = get_object_or_404(ClassroomCamera, pk=camera_id)
-
-    def _stream():
-        url = camera.url.strip()
-        try:
-            src = int(url) if url.isdigit() else url
-        except Exception:
-            src = url
-
-        cap = cv2.VideoCapture(src)
-        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-
-        if not cap.isOpened():
-            err = np.zeros((240, 480, 3), dtype=np.uint8)
-            cv2.putText(err, 'Camera unavailable', (60, 110),
-                        cv2.FONT_HERSHEY_SIMPLEX, 1.0, (80, 80, 255), 2)
-            cv2.putText(err, url[:60], (20, 160),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (180, 180, 180), 1)
-            _, buf = cv2.imencode('.jpg', err)
-            yield (b'--frame\r\nContent-Type: image/jpeg\r\n\r\n'
-                   + buf.tobytes() + b'\r\n')
-            return
-
-        detector = None
-        try:
-            detector = _get_yolo_detector(f'camera:{camera_id}')
-        except Exception as e:
-            _log.warning(f'[STREAM] detector unavailable: {e}')
-
-        result_lock = threading.Lock()
-        latest_dets: list = []
-        detect_q = _q.Queue(maxsize=1)
-        stop_ev = threading.Event()
-
-        def _det_worker():
-            while not stop_ev.is_set():
-                try:
-                    frm = detect_q.get(timeout=0.5)
-                except _q.Empty:
-                    continue
-                try:
-                    dets = detector.detect(frm) if detector else []
-                    with result_lock:
-                        latest_dets.clear()
-                        latest_dets.extend(dets)
-                except Exception as exc:
-                    _log.debug(f'[DET] {exc}')
-
-        det_thread = threading.Thread(target=_det_worker, daemon=True)
-        det_thread.start()
-
-        src_fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
-        frame_delay = 1.0 / min(src_fps, 25.0)
-        heavy_every = max(1, int(src_fps // 2))
-        fc = 0
-        last_yield = _time.monotonic()
-        consecutive_errors = 0
-
-        try:
-            while True:
-                ret, frame = cap.read()
-                if not ret or frame is None:
-                    consecutive_errors += 1
-                    if consecutive_errors > 10:
-                        break
-                    _time.sleep(0.05)
-                    continue
-                consecutive_errors = 0
-                fc += 1
-
-                if fc % heavy_every == 0:
-                    try:
-                        detect_q.put_nowait(frame.copy())
-                    except _q.Full:
-                        pass
-
-                try:
-                    with result_lock:
-                        dets = list(latest_dets)
-                    annotated = frame.copy()
-                    focused = distracted = phone = eating = 0
-                    for det in dets[:20]:
-                        dt = det.get('type', '')
-                        x1, y1, x2, y2 = det.get('bbox', (0, 0, 0, 0))
-                        color = det.get('color', (120, 120, 120))
-                        label = det.get('label', dt)
-                        cv2.rectangle(annotated, (x1, y1), (x2, y2), color, 2)
-                        cv2.putText(annotated, label, (x1 + 4, max(y1 - 8, 18)),
-                                    cv2.FONT_HERSHEY_SIMPLEX, 0.52, color, 2)
-                        if dt == 'focused':
-                            focused += 1
-                        elif dt in ('distracted', 'looking_away', 'head_down'):
-                            distracted += 1
-                        elif dt == 'using_phone':
-                            phone += 1
-                        elif dt == 'eating_food':
-                            eating += 1
-                    total = focused + distracted + phone + eating
-                    score = (focused / total * 100) if total > 0 else 0.0
-                    bar = f'F:{focused} D:{distracted} Ph:{phone} Eat:{eating}  {score:.0f}%'
-                    cv2.rectangle(annotated, (0, 0), (len(bar) * 9 + 14, 26), (20, 20, 20), -1)
-                    cv2.putText(annotated, bar, (6, 18),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.48, (255, 255, 255), 1)
-                except Exception:
-                    annotated = frame
-
-                _, buf = cv2.imencode('.jpg', annotated, [cv2.IMWRITE_JPEG_QUALITY, 72])
-                if buf is not None:
-                    try:
-                        yield (b'--frame\r\nContent-Type: image/jpeg\r\n\r\n'
-                               + buf.tobytes() + b'\r\n')
-                    except (BrokenPipeError, ConnectionResetError, OSError):
-                        break
-
-                elapsed = _time.monotonic() - last_yield
-                wait = frame_delay - elapsed
-                if wait > 0:
-                    _time.sleep(wait)
-                last_yield = _time.monotonic()
-        finally:
-            stop_ev.set()
-            cap.release()
-            det_thread.join(timeout=1)
-            _release_yolo_detector(f'camera:{camera_id}')
-
-    return StreamingHttpResponse(
-        _stream(),
-        content_type='multipart/x-mixed-replace; boundary=frame',
-    )
+    global _SHARED_DETECTOR
+    try:
+        if _SHARED_DETECTOR is None:
+            from classroom_monitor.behavior_detection import ClassroomBehaviorDetector
+            _SHARED_DETECTOR = ClassroomBehaviorDetector(
+                camera_url='',
+                camera_id=0,
+                server_url='',       # no HTTP self-calls inside detector
+            )
+    except Exception as e:
+        print(f'[WARN] Could not init shared detector: {e}')
+    return _SHARED_DETECTOR
 
 
 def _incident_severity(det_type: str) -> str:
@@ -686,14 +511,28 @@ def _generate_video_stream(video_path, camera_id=0, camera_location='Classroom',
     import threading
     import queue as _queue
 
+    if cv2 is None or np is None:
+        # OpenCV not installed — yield a plain text error frame and stop
+        import numpy as _np_fallback
+        import cv2 as _cv2_fallback
+        err = _np_fallback.zeros((240, 640, 3), dtype=_np_fallback.uint8)
+        _cv2_fallback.putText(err, 'OpenCV not available — pip install opencv-python-headless',
+                    (10, 120), _cv2_fallback.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 200), 2)
+        _, buf = _cv2_fallback.imencode('.jpg', err)
+        yield (b'--frame\r\nContent-Type: image/jpeg\r\n\r\n' + buf.tobytes() + b'\r\n')
+        return
+
     from classroom_monitor.behavior_detection import (
         ClassroomBehaviorDetector, COLOR_MAP, LABEL_MAP,
         ALERT_POSES, DISTRACTED_POSES,
     )
     from classroom_monitor.constants import EMAIL_ALERT_TYPES
-    from classroom_monitor.face_recognition_helper import (
-        StudentFaceRecognizer, DLIB_LOCK,
-    )
+    try:
+        from classroom_monitor.face_recognition_helper import StudentFaceRecognizer, DLIB_LOCK
+    except Exception as _frimport_err:
+        print(f'[WARN] face_recognition_helper import failed: {_frimport_err}')
+        StudentFaceRecognizer = None
+        DLIB_LOCK = None
 
     FACEREC_INTERVAL = 5.0   # seconds between face-recognition attempts
     COOLDOWN_S       = 90    # seconds between same incident type alerts
@@ -707,19 +546,21 @@ def _generate_video_stream(video_path, camera_id=0, camera_location='Classroom',
         except Exception:
             pass
 
-    # ── Per-camera detector (own tracker/behavior-engine state) ───────────────
-    # camera_id defaults to 0 for ad-hoc/URL-only streams; make that a unique
-    # key too (keyed by video_path) so two zero-id ad-hoc streams don't share
-    # state either.
-    stream_key = f'camera:{camera_id}' if camera_id else f'adhoc:{video_path}'
-    detector = _get_yolo_detector(stream_key)
+    # ── Shared detector singleton ─────────────────────────────────────────────
+    detector = _get_yolo_detector()
     if detector is None:
         from classroom_monitor.behavior_detection import ClassroomBehaviorDetector
         detector = ClassroomBehaviorDetector(camera_url='', camera_id=0, server_url='')
 
     # ── Face recognizer — loads DB once, used ONLY on main thread ─────────────
-    recognizer = StudentFaceRecognizer()
-    recognizer.load_from_db()
+    recognizer = None
+    if StudentFaceRecognizer is not None:
+        try:
+            recognizer = StudentFaceRecognizer()
+            recognizer.load_from_db()
+        except Exception as _fr_err:
+            print(f'[WARN] Face recognizer load failed (stream will run without face ID): {_fr_err}')
+            recognizer = None
 
     # ── Thread primitives ─────────────────────────────────────────────────────
     result_lock = threading.Lock()
@@ -731,15 +572,6 @@ def _generate_video_stream(video_path, camera_id=0, camera_location='Classroom',
     cooldown    = {}                        # (type, track_id) → last saved timestamp
     pending_keys = set()
 
-    # `detector.processor.yolo_model.track(..., persist=True)` keeps mutable
-    # internal ByteTrack state on the model object. _detection_worker and
-    # _pose_worker run as separate threads and both call into that same
-    # model — without a lock, two threads can enter .track() at the same
-    # time and corrupt tracker state (ID churn, garbage/misaligned
-    # keypoints, occasional exceptions). This lock makes every call into the
-    # tracker mutually exclusive, regardless of which worker makes it.
-    yolo_track_lock = threading.Lock()
-
     # ── Detect worker — YOLO + Haar only, NO dlib ────────────────────────────
     def _detection_worker():
         while not stop_event.is_set():
@@ -748,8 +580,7 @@ def _generate_video_stream(video_path, camera_id=0, camera_location='Classroom',
             except _queue.Empty:
                 continue
             try:
-                with yolo_track_lock:
-                    dets = detector.detect(work_frame)
+                dets = detector.detect(work_frame)
                 with result_lock:
                     latest_dets.clear()
                     latest_dets.extend(dets)
@@ -759,14 +590,7 @@ def _generate_video_stream(video_path, camera_id=0, camera_location='Classroom',
     # ── Pose-only worker — keeps ByteTrack IDs alive between heavy detections ─
     # Calls _parse_pose_detections on every pose_q frame so the tracker sees
     # consistent motion and doesn't churn IDs. Does NOT run object detection
-    # or fight detection (cheap path only). It DOES feed each track into
-    # behavior_engine.update_person() so keypoint_history actually gets
-    # samples at this worker's higher cadence (~8fps) instead of only at the
-    # heavy-detection cadence (~2fps) — the wrist-motion-variance ("is this
-    # writing or phone-scrolling") heuristic in behavior_detection_core.py
-    # needs that higher sample rate to be a meaningful signal. Previously this
-    # worker discarded its results entirely, so it had zero effect on
-    # tracked-person state.
+    # or fight detection (cheap path only).
     def _pose_worker():
         while not stop_event.is_set():
             try:
@@ -775,12 +599,7 @@ def _generate_video_stream(video_path, camera_id=0, camera_location='Classroom',
                 continue
             try:
                 if detector is not None and detector.processor.yolo_model is not None:
-                    with yolo_track_lock:
-                        tracks = detector.processor._parse_pose_detections(work_frame)
-                    ts = time.time()
-                    for tid, x1, y1, x2, y2, conf, kp in tracks:
-                        detector.processor.behavior_engine.update_person(
-                            tid, (x1, y1, x2, y2), kp, ts)
+                    detector.processor._parse_pose_detections(work_frame)
             except Exception as exc:
                 print(f'[POSE] {exc}')
 
@@ -843,6 +662,13 @@ def _generate_video_stream(video_path, camera_id=0, camera_location='Classroom',
     if cap is None:
         print(f'[STREAM] Failed to open camera: {video_path}')
         stop_event.set()
+        # Yield a single error frame so StreamingHttpResponse doesn't produce a 500
+        if cv2 is not None and np is not None:
+            err_img = np.zeros((240, 640, 3), dtype=np.uint8)
+            cv2.putText(err_img, f'Camera unavailable: {video_path}',
+                        (20, 120), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 200), 2)
+            _, buf = cv2.imencode('.jpg', err_img)
+            yield (b'--frame\r\nContent-Type: image/jpeg\r\n\r\n' + buf.tobytes() + b'\r\n')
         return
 
     src_fps      = cap.get(cv2.CAP_PROP_FPS) or 25.0
@@ -1030,7 +856,11 @@ def _generate_video_stream(video_path, camera_id=0, camera_location='Classroom',
                             crop = frame[y1:y2, x1:x2]
 
                         try:
-                            sid, name, roll, _ = (recognizer.match(crop) if crop.size > 0 else (None, 'Unknown', '', float('nan')))
+                            sid, name, roll, _ = (
+                                recognizer.match(crop)
+                                if recognizer is not None and crop.size > 0
+                                else (None, 'Unknown', '', float('nan'))
+                            )
                             student = None
                             if sid:
                                 try:
@@ -1079,8 +909,14 @@ def _generate_video_stream(video_path, camera_id=0, camera_location='Classroom',
 
                     x1, y1, x2, y2 = det['bbox']
                     color     = det.get('color', COLOR_MAP.get(dt, (120,120,120)))
-                    label     = det.get('label', LABEL_MAP.get(dt, dt))
-                    
+                    base_label = det.get('label', LABEL_MAP.get(dt, dt))
+                    tid_val   = det.get('track_id')
+                    # Track ID included so a debug log line like
+                    # "[PHONE] Person 44: ..." can be matched directly to
+                    # the exact box on screen instead of guessing which
+                    # visible person a log entry refers to.
+                    label = f"#{tid_val} {base_label}" if tid_val is not None else base_label
+
                     cv2.rectangle(annotated, (x1,y1), (x2,y2), color, 2)
                     cv2.putText(annotated, label, (x1+4, max(y1-8,18)), cv2.FONT_HERSHEY_SIMPLEX, 0.52, color, 2)
 
@@ -1125,7 +961,6 @@ def _generate_video_stream(video_path, camera_id=0, camera_location='Classroom',
         det_thread.join(timeout=1)
         pose_thread.join(timeout=1)
         save_thread.join(timeout=1)
-        _release_yolo_detector(stream_key)
 
 def _get_port():
     """Return the Django dev-server port (default 8000). Override via DJANGO_PORT env var."""
@@ -1152,6 +987,7 @@ def incidents_dashboard(request):
     # Stats
     phone_count = IncidentReport.objects.filter(incident_type='using_phone').count()
     eating_count = IncidentReport.objects.filter(incident_type='eating_food').count()
+    fighting_count = IncidentReport.objects.filter(incident_type='fighting').count()
     distracted_count = IncidentReport.objects.filter(incident_type='distracted').count()
     
     # Pagination
@@ -1165,6 +1001,7 @@ def incidents_dashboard(request):
         'is_paginated': page_obj.has_other_pages(),
         'phone_count': phone_count,
         'eating_count': eating_count,
+        'fighting_count': fighting_count,
         'distracted_count': distracted_count,
     }
     return render(request, 'classroom_monitor/incidents_dashboard.html', context)
@@ -1586,16 +1423,7 @@ def _analyze_video_task(video_pk):
         # Sample one frame every 5 seconds
         sample_interval = max(1, int(src_fps * 5))
 
-        # Own detector key per video job — this must NOT be the same
-        # detector instance used by any live camera stream (or another video
-        # job), since track_id-keyed state (keypoint/behavior history,
-        # confidence smoothing) would otherwise get cross-contaminated
-        # between unrelated people. 5-second frame sampling also means
-        # ByteTrack continuity across samples is weak regardless — that's
-        # expected for batch analysis, but it's still important this job's
-        # track IDs never collide with a live stream's.
-        video_detector_key = f'video:{video_pk}'
-        detector = _get_yolo_detector(video_detector_key)
+        detector = _get_yolo_detector()
 
         frame_number = 0
         analyzed_count = 0
@@ -1643,11 +1471,14 @@ def _analyze_video_task(video_pk):
                     if isinstance(det, dict):
                         x1, y1, x2, y2 = det.get('bbox', (0, 0, 0, 0))
                         color = det.get('color', (0, 200, 60))
-                        label = det.get('label', det.get('type', ''))
+                        base_label = det.get('label', det.get('type', ''))
+                        tid_val = det.get('track_id')
                     else:
                         x1, y1, x2, y2 = getattr(det, 'bbox', (0, 0, 0, 0))
                         color = getattr(det, 'color', (0, 200, 60))
-                        label = getattr(det, 'label', '')
+                        base_label = getattr(det, 'label', '')
+                        tid_val = getattr(det, 'track_id', None)
+                    label = f"#{tid_val} {base_label}" if tid_val is not None else base_label
                     cv2.rectangle(annotated, (x1, y1), (x2, y2), color, 2)
                     cv2.putText(annotated, label, (x1 + 2, max(y1 - 6, 14)),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
@@ -1707,10 +1538,5 @@ def _analyze_video_task(video_pk):
             from django.db import close_old_connections as _cc2
             _cc2()
             ClassroomVideo.objects.filter(pk=video_pk).update(status='failed')
-        except Exception:
-            pass
-    finally:
-        try:
-            _release_yolo_detector(f'video:{video_pk}')
         except Exception:
             pass

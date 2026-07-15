@@ -1,4 +1,4 @@
-{% extends 'base.html' %}
+{% extends 'entrance_cam/base.html' %}
 {% load static %}
 
 {% block title %}Behavior Incidents Dashboard{% endblock %}
@@ -29,7 +29,7 @@
             <div class="card bg-info text-white">
                 <div class="card-body">
                     <h5 class="card-title">🥊 Fighting</h5>
-                    <p class="card-text display-4">{{ fighting_count }}</p>
+                    <p class="card-text display-4">{{ fighting_count|default:"0" }}</p>
                 </div>
             </div>
         </div>

@@ -22,6 +22,7 @@ inference-sdk>=0.23.0
 # HTTP
 requests==2.32.3
 urllib3==2.3.0
+gevent>=23.9.0
 
 # 3D CNN fight detection (mc3_18 / r3d_18)
 torch>=2.0.0
