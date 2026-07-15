@@ -58,17 +58,6 @@ class _SharedYOLOModels:
     _lock = threading.Lock()
     _pose_model = None
     _object_model = None
-    # Local, classroom-specific phone detector (no API, no network calls at
-    # inference time). Trained separately from a Roboflow-downloaded dataset
-    # ("classroom-cell-phone-detection") and exported to a local .pt file —
-    # see CLASSROOM_PHONE_MODEL_PATH below. This is intentionally separate
-    # from the cloud Roboflow branch in _parse_object_detections, which stays
-    # as an optional extra source if ROBOFLOW_API_KEY is set, but should not
-    # be relied on for production (network dependency, per-call cost/latency,
-    # and an external service being a single point of failure for a
-    # safety-relevant detector).
-    _phone_model = None
-    _phone_model_load_attempted = False
 
     @classmethod
     def get(cls):
@@ -83,53 +72,12 @@ class _SharedYOLOModels:
                     print(f'[WARN] Shared YOLO model load failed: {e}')
             return cls._pose_model, cls._object_model
 
-    @classmethod
-    def get_phone_model(cls):
-        """Load the local classroom-specific phone-detection model once per
-        process. Path is configurable via CLASSROOM_PHONE_MODEL_PATH so this
-        is a no-op (returns None, logs a warning once) until you've actually
-        trained and placed a weights file — nothing else in the pipeline
-        depends on this being present."""
-        with cls._lock:
-            if cls._phone_model is None and not cls._phone_model_load_attempted:
-                cls._phone_model_load_attempted = True
-                try:
-                    from ultralytics import YOLO
-                    path = os.environ.get(
-                        'CLASSROOM_PHONE_MODEL_PATH',
-                        os.path.join(os.path.dirname(__file__), 'model_weights', 'classroom_phone_yolo.pt'),
-                    )
-                    if os.path.exists(path):
-                        cls._phone_model = YOLO(path)
-                        print(f'[OK] Local classroom phone model loaded from {path}')
-                    else:
-                        print(f'[WARN] Local classroom phone model not found at {path} — '
-                              f'set CLASSROOM_PHONE_MODEL_PATH or train one (see docs). '
-                              f'Falling back to COCO cell-phone class only.')
-                except Exception as e:
-                    print(f'[WARN] Local classroom phone model load failed: {e}')
-            return cls._phone_model
-
 
 # ── Production Stream Processor ──────────────────────────────────────────────
 class ProductionStreamProcessor:
     _PHONE_CLS = {67}
     _FOOD_CLS  = {46, 47, 48, 49, 50, 51, 52, 53, 54, 55}
     _BOOK_CLS  = {73}
-
-    # Fight-detection tuning. FIGHT_CONFIRM_FRAMES is the number of
-    # consecutive positive frames from the 3D-CNN classifier required
-    # before a fight becomes a confirmed, incident-reportable behavior.
-    # At process_fps=10, 3 frames ~= 0.3s of sustained signal — tune
-    # against the actual pipeline frame rate.
-    FIGHT_CONFIRM_FRAMES    = 3
-    # Fallback localization (used only if the classifier gives no
-    # spatial info): two people are fight candidates only if their bbox
-    # centers are within this multiple of their average bbox diagonal...
-    FIGHT_PROXIMITY_RATIO   = 1.5
-    # ...AND both show normalized keypoint motion (frame-over-frame
-    # displacement / bbox diagonal) at or above this threshold.
-    FIGHT_MOTION_THRESHOLD  = 0.12
 
     def __init__(self, process_fps: int = 10, buffer_size: int = 5):
         self.process_fps      = process_fps
@@ -139,7 +87,6 @@ class ProductionStreamProcessor:
         self.yolo_model       = None
         self.object_model     = None
         self.roboflow_model   = None
-        self.classroom_phone_model = None
         self.running          = False
         self.lock             = threading.Lock()
         self.stop_event       = threading.Event()
@@ -148,8 +95,6 @@ class ProductionStreamProcessor:
         self.person_tracks: List[Tuple] = []
         self.behavior_engine  = TemporalBehaviorEngine()
         self.fight_detector   = None
-        self._fight_streak    = 0          # consecutive positive fight_detected frames
-        self._prev_kp_by_tid: Dict[int, np.ndarray] = {}  # last-frame keypoints, for motion heuristic
 
         # Initialize modular detectors
         self.head_pose_detector = HeadPoseDetector()
@@ -162,7 +107,6 @@ class ProductionStreamProcessor:
 
     def _ensure_models(self):
         self.yolo_model, self.object_model = _SharedYOLOModels.get()
-        self.classroom_phone_model = _SharedYOLOModels.get_phone_model()
 
     def _init_fight_detector(self):
         try:
@@ -177,8 +121,6 @@ class ProductionStreamProcessor:
         self._ensure_models()
 
     def _capture_frames(self, camera_url: str):
-        """DEPRECATED / UNUSED IN THE LIVE PATH — only reachable via start(),
-        which nothing in views.py calls. See start()'s docstring."""
         cap, reconnect_delay = None, 1.0
         while not self.stop_event.is_set():
             try:
@@ -210,8 +152,6 @@ class ProductionStreamProcessor:
             cap.release()
 
     def _process_frames(self):
-        """DEPRECATED / UNUSED IN THE LIVE PATH — only reachable via start(),
-        which nothing in views.py calls. See start()'s docstring."""
         last_ts = 0.0
         while not self.stop_event.is_set():
             now = time.time()
@@ -225,40 +165,6 @@ class ProductionStreamProcessor:
                     self._process_single_frame(frame, ts)
                     last_ts = now
             time.sleep(0.01)
-
-    @staticmethod
-    def _iou(box_a: Tuple, box_b: Tuple) -> float:
-        ax1, ay1, ax2, ay2 = box_a[:4]
-        bx1, by1, bx2, by2 = box_b[:4]
-        ix1, iy1 = max(ax1, bx1), max(ay1, by1)
-        ix2, iy2 = min(ax2, bx2), min(ay2, by2)
-        iw, ih = max(0, ix2 - ix1), max(0, iy2 - iy1)
-        inter = iw * ih
-        if inter <= 0:
-            return 0.0
-        area_a = max(0, ax2 - ax1) * max(0, ay2 - ay1)
-        area_b = max(0, bx2 - bx1) * max(0, by2 - by1)
-        union = area_a + area_b - inter
-        return inter / union if union > 0 else 0.0
-
-    def _merge_phone_detections(self, coco_dets: List[Tuple], roboflow_dets: List[Tuple],
-                                 iou_thresh: float = 0.4) -> List[Tuple]:
-        """Merge COCO generic-object and Roboflow classroom-specific phone
-        detections, deduping overlapping boxes by IoU rather than treating
-        either source as authoritative. On overlap, keep whichever box has
-        the higher confidence."""
-        merged = list(coco_dets)
-        for rdet in roboflow_dets:
-            dup_idx = None
-            for i, cdet in enumerate(merged):
-                if self._iou(rdet, cdet) >= iou_thresh:
-                    dup_idx = i
-                    break
-            if dup_idx is None:
-                merged.append(rdet)
-            elif rdet[4] > merged[dup_idx][4]:
-                merged[dup_idx] = rdet
-        return merged
 
     def _parse_object_detections(self, frame: np.ndarray):
         phone_dets, food_dets, book_dets = [], [], []
@@ -280,75 +186,31 @@ class ProductionStreamProcessor:
                             book_dets.append(det)
             except Exception as e:
                 print(f'[WARN] YOLO object detection failed: {e}')
-
-        # Roboflow's classroom-specific phone model always runs (when
-        # available) rather than only as a fallback when COCO found
-        # nothing — it's purpose-trained for this exact scenario and
-        # shouldn't be gated behind a single low-confidence COCO miss.
-        # Results are merged/deduped with the COCO phone detections by
-        # IoU instead of either source overriding the other outright.
-        # Local, classroom-specific phone model (no API, no network call).
-        # This is the primary/preferred source for phone detections — it was
-        # fine-tuned specifically on classroom camera angles, unlike the
-        # generic COCO "cell phone" class above, and unlike the optional
-        # Roboflow cloud branch below it has no runtime network dependency.
-        local_phone_dets = []
-        if self.classroom_phone_model is not None:
+        if not phone_dets:
             try:
-                for result in self.classroom_phone_model(frame, verbose=False, conf=0.35, iou=0.45):
-                    if result.boxes is None:
-                        continue
-                    names = getattr(result, 'names', {}) or {}
-                    for i in range(len(result.boxes)):
-                        cls_id   = int(result.boxes.cls[i])
-                        cls_name = str(names.get(cls_id, cls_id)).lower()
-                        # Most classroom-phone datasets export a single
-                        # relevant class (e.g. "cell-phone" / "phone" /
-                        # "using-phone"). Keep only boxes whose class name
-                        # actually refers to a phone, in case the dataset
-                        # also ships a "person" class alongside it (some do,
-                        # per the dataset notes) — we don't want those
-                        # showing up as phone detections.
-                        if 'phone' not in cls_name:
-                            continue
-                        conf = float(result.boxes.conf[i])
-                        x1, y1, x2, y2 = map(int, result.boxes.xyxy[i])
-                        local_phone_dets.append((x1, y1, x2, y2, conf))
+                api_key = os.environ.get('ROBOFLOW_API_KEY', '')
+                if api_key:
+                    if self.roboflow_model is None:
+                        from roboflow import Roboflow
+                        rf = Roboflow(api_key=api_key)
+                        project = rf.workspace().project("classroom-cell-phone-detection")
+                        self.roboflow_model = project.version(18).model
+                        print('[OK] Roboflow model loaded')
+                    result = self.roboflow_model.predict(frame, confidence=30, overlap=30).json()
+                    for prediction in result.get('predictions', []):
+                        x1 = int(prediction['x'] - prediction['width'] / 2)
+                        y1 = int(prediction['y'] - prediction['height'] / 2)
+                        x2 = int(prediction['x'] + prediction['width'] / 2)
+                        y2 = int(prediction['y'] + prediction['height'] / 2)
+                        conf = prediction['confidence']
+                        phone_dets.append((x1, y1, x2, y2, conf))
+                    if phone_dets:
+                        print(f'[ROBOFLOW] Found {len(phone_dets)} phone(s)')
+            except ImportError:
+                print('[WARN] roboflow not installed')
             except Exception as e:
-                print(f'[WARN] Local classroom phone model inference failed: {e}')
-
-        # Optional cloud fallback/supplement — only runs if you've explicitly
-        # set ROBOFLOW_API_KEY. Not required once the local model above is in
-        # place; kept as an extra signal source, merged the same way.
-        roboflow_dets = []
-        try:
-            api_key = os.environ.get('ROBOFLOW_API_KEY', '')
-            if api_key:
-                if self.roboflow_model is None:
-                    from roboflow import Roboflow
-                    rf = Roboflow(api_key=api_key)
-                    project = rf.workspace().project("classroom-cell-phone-detection")
-                    self.roboflow_model = project.version(18).model
-                    print('[OK] Roboflow model loaded')
-                result = self.roboflow_model.predict(frame, confidence=30, overlap=30).json()
-                for prediction in result.get('predictions', []):
-                    x1 = int(prediction['x'] - prediction['width'] / 2)
-                    y1 = int(prediction['y'] - prediction['height'] / 2)
-                    x2 = int(prediction['x'] + prediction['width'] / 2)
-                    y2 = int(prediction['y'] + prediction['height'] / 2)
-                    conf = prediction['confidence']
-                    roboflow_dets.append((x1, y1, x2, y2, conf))
-                if roboflow_dets:
-                    print(f'[ROBOFLOW] Found {len(roboflow_dets)} phone(s)')
-        except ImportError:
-            print('[WARN] roboflow not installed')
-        except Exception as e:
-            print(f'[WARN] Roboflow failed: {e}')
-
-        phone_dets = self._merge_phone_detections(phone_dets, local_phone_dets)
-        phone_dets = self._merge_phone_detections(phone_dets, roboflow_dets)
+                print(f'[WARN] Roboflow failed: {e}')
         return phone_dets, food_dets, book_dets
-
 
     def _parse_pose_detections(self, frame: np.ndarray):
         tracks = []
@@ -376,129 +238,19 @@ class ProductionStreamProcessor:
             print(f'[ERROR] Pose detection: {e}')
         return tracks
 
-    @staticmethod
-    def _bbox_center(bbox):
-        x1, y1, x2, y2 = bbox
-        return (x1 + x2) / 2.0, (y1 + y2) / 2.0
-
-    @staticmethod
-    def _bbox_diag(bbox):
-        x1, y1, x2, y2 = bbox
-        return float(np.hypot(x2 - x1, y2 - y1))
-
-    def _keypoint_motion_score(self, tid, kp):
-        """Average frame-over-frame displacement of confident keypoints for a track.
-        Returns 0.0 if there's no usable previous-frame keypoints to compare against."""
-        if kp is None:
-            return 0.0
-        prev_kp = self._prev_kp_by_tid.get(tid)
-        if prev_kp is None or prev_kp.shape != kp.shape:
-            return 0.0
-        diffs = []
-        for i in range(len(kp)):
-            conf_cur  = kp[i][2] if kp.shape[-1] > 2 else 1.0
-            conf_prev = prev_kp[i][2] if prev_kp.shape[-1] > 2 else 1.0
-            if conf_cur < 0.3 or conf_prev < 0.3:
-                continue
-            dx = kp[i][0] - prev_kp[i][0]
-            dy = kp[i][1] - prev_kp[i][1]
-            diffs.append((dx * dx + dy * dy) ** 0.5)
-        if not diffs:
-            return 0.0
-        return float(np.mean(diffs))
-
-    def _localize_fight_participants(self, person_tracks, fight_region):
-        """
-        Determine which track_ids are actually involved in a confirmed fight,
-        instead of tagging every tracked person.
-
-        Priority:
-          1. fight_region gives explicit track_ids  -> use them directly.
-          2. fight_region gives a spatial bbox/region -> flag tracks whose
-             center falls inside it.
-          3. No spatial info at all -> fallback heuristic: flag pairs of
-             people who are both physically close AND both show high
-             frame-over-frame keypoint motion (proxy for a scuffle rather
-             than two people just standing near each other).
-        """
-        track_ids = {t[0] for t in person_tracks}
-
-        if fight_region:
-            if isinstance(fight_region, dict) and 'track_ids' in fight_region:
-                return set(fight_region['track_ids']) & track_ids
-            if isinstance(fight_region, (list, tuple, set)) and fight_region and \
-                    all(isinstance(v, (int, np.integer)) for v in fight_region):
-                return set(fight_region) & track_ids
-            if isinstance(fight_region, (list, tuple)) and len(fight_region) == 4:
-                rx1, ry1, rx2, ry2 = fight_region
-                involved = set()
-                for tid, x1, y1, x2, y2, conf, kp in person_tracks:
-                    cx, cy = self._bbox_center((x1, y1, x2, y2))
-                    if rx1 <= cx <= rx2 and ry1 <= cy <= ry2:
-                        involved.add(tid)
-                if involved:
-                    return involved
-
-        # Fallback: proximity + high relative motion, evaluated pairwise.
-        involved = set()
-        tracks = list(person_tracks)
-        for i in range(len(tracks)):
-            tid_a, ax1, ay1, ax2, ay2, aconf, akp = tracks[i]
-            diag_a = self._bbox_diag((ax1, ay1, ax2, ay2))
-            if diag_a <= 0:
-                continue
-            for j in range(i + 1, len(tracks)):
-                tid_b, bx1, by1, bx2, by2, bconf, bkp = tracks[j]
-                diag_b = self._bbox_diag((bx1, by1, bx2, by2))
-                if diag_b <= 0:
-                    continue
-                cax, cay = self._bbox_center((ax1, ay1, ax2, ay2))
-                cbx, cby = self._bbox_center((bx1, by1, bx2, by2))
-                dist = float(np.hypot(cax - cbx, cay - cby))
-                avg_diag = (diag_a + diag_b) / 2.0
-                if dist > avg_diag * self.FIGHT_PROXIMITY_RATIO:
-                    continue  # not near each other -> not a candidate pair
-                norm_motion_a = self._keypoint_motion_score(tid_a, akp) / diag_a
-                norm_motion_b = self._keypoint_motion_score(tid_b, bkp) / diag_b
-                if norm_motion_a >= self.FIGHT_MOTION_THRESHOLD and \
-                        norm_motion_b >= self.FIGHT_MOTION_THRESHOLD:
-                    involved.add(tid_a)
-                    involved.add(tid_b)
-        return involved
-
-    def _run_behavior_evaluation(self, frame, person_tracks, phone_dets, food_dets, book_dets, timestamp,
-                                  fight_detected=False, fight_region=None):
+    def _run_behavior_evaluation(self, frame, person_tracks, phone_dets, food_dets, book_dets, timestamp, fight_detected=False):
         active_tids = set()
         for tid, x1, y1, x2, y2, conf, kp in person_tracks:
             active_tids.add(tid)
             self.behavior_engine.update_person(tid, (x1, y1, x2, y2), kp, timestamp)
         self.behavior_engine.cleanup_stale(timestamp)
-
-        # --- Fight signal: multi-frame confirmation + spatial localization ---
-        # Mirrors the hysteresis every other behavior type gets via
-        # evaluate_final_behavior; a single noisy frame can no longer
-        # promote straight to a reportable, emailed alert.
-        self._fight_streak = self._fight_streak + 1 if fight_detected else 0
-        fight_confirmed = self._fight_streak >= self.FIGHT_CONFIRM_FRAMES
-
-        fighting_tids = set()
-        if fight_confirmed:
-            fighting_tids = self._localize_fight_participants(person_tracks, fight_region)
-
-        # Cache this frame's keypoints for next frame's motion comparison.
-        for tid, x1, y1, x2, y2, conf, kp in person_tracks:
-            if kp is not None:
-                self._prev_kp_by_tid[tid] = kp
-        for stale_tid in set(self._prev_kp_by_tid) - active_tids:
-            self._prev_kp_by_tid.pop(stale_tid, None)
-
         results = []
         for tid in active_tids:
             with self.behavior_engine.lock:
                 if tid not in self.behavior_engine.tracked_people:
                     continue
                 person = self.behavior_engine.tracked_people[tid]
-            if tid in fighting_tids:
+            if fight_detected:
                 result = DetectionResult(
                     type='fighting', bbox=person.bbox, confidence=0.9,
                     color=(0,0,255), label='Fighting!', is_alert=True, is_distracted=False,
@@ -528,8 +280,12 @@ class ProductionStreamProcessor:
                                 raw_behavior   = "focused"
                                 raw_confidence = 0.75
                             elif head_pose in ("head_down", "looking_away"):
-                                raw_behavior   = "distracted"
-                                raw_confidence = 0.70
+                                if SharedHelpers.hands_near_book(person, book_dets):
+                                    raw_behavior   = "focused"
+                                    raw_confidence = 0.70
+                                else:
+                                    raw_behavior   = "distracted"
+                                    raw_confidence = 0.70
                             elif head_pose == "not_visible":
                                 raw_behavior   = "not_visible"
                                 raw_confidence = 0.60
@@ -552,23 +308,13 @@ class ProductionStreamProcessor:
             person_tracks = self._parse_pose_detections(frame)
             phone_dets, food_dets, book_dets = self._parse_object_detections(frame)
             fight_detected = False
-            fight_region = None  # optional spatial localization from the detector, if it provides any
             if self.fight_detector is not None:
                 self.fight_detector.add_frame(frame)   # buffer frames for 3D CNN
                 fight_result = self.fight_detector.predict()
-                if isinstance(fight_result, tuple):
-                    fight_detected = bool(fight_result[0])
-                    # Some detector variants may return (detected, confidence, region_or_track_ids)
-                    if len(fight_result) > 2:
-                        fight_region = fight_result[2]
-                else:
-                    fight_detected = bool(fight_result)
+                fight_detected = fight_result[0] if isinstance(fight_result, tuple) else bool(fight_result)
                 if fight_detected:
-                    print('[ALERT] Fight signal this frame (pending multi-frame confirmation)')
-            final_results = self._run_behavior_evaluation(
-                frame, person_tracks, phone_dets, food_dets, book_dets, timestamp,
-                fight_detected, fight_region
-            )
+                    print('[ALERT] Fight detected!')
+            final_results = self._run_behavior_evaluation(frame, person_tracks, phone_dets, food_dets, book_dets, timestamp, fight_detected)
             with self.lock:
                 self.phone_detections = phone_dets
                 self.food_detections  = food_dets
@@ -578,24 +324,6 @@ class ProductionStreamProcessor:
             print(f'[ERROR] Frame processing: {e}')
 
     def start(self, camera_url: str):
-        """
-        DEPRECATED / UNUSED IN THE LIVE PATH.
-
-        Nothing in views.py calls this. The actual live stream
-        (_generate_video_stream in views.py) drives its own manual
-        cv2.VideoCapture loop + its own worker threads and calls
-        detector.detect(frame) -> ProductionStreamProcessor's parsing/
-        evaluation methods directly, frame by frame, on the shared
-        detector singleton (_get_yolo_detector()).
-
-        Do NOT re-enable this (or wire it up in a new call site) against
-        that same shared detector/processor instance: it spins up its
-        own _capture_frames + _process_frames threads, which would open
-        a second capture on the camera and contend with the manual
-        pipeline for the same YOLO model. If you need this pipeline,
-        give it its own ProductionStreamProcessor instance, not the
-        shared one used by _generate_video_stream.
-        """
         if self.running:
             return
         self.running = True
@@ -605,7 +333,6 @@ class ProductionStreamProcessor:
         print('[OK] Stream processor started')
 
     def stop(self):
-        """DEPRECATED / UNUSED IN THE LIVE PATH — see start() docstring above."""
         self.running = False
         self.stop_event.set()
         print('[OK] Stream processor stopped')
@@ -702,14 +429,8 @@ class ClassroomBehaviorDetector:
         for det in detections:
             x1, y1, x2, y2 = det['bbox']
             color, label, conf = det['color'], det['label'], det['confidence']
-            tid = det.get('track_id')
             cv2.rectangle(out, (x1, y1), (x2, y2), color, 2)
-            # Track ID included so a debug log line like "[PHONE] Person 44:
-            # ..." can be matched directly to the exact box on screen,
-            # instead of guessing which visible person a log entry refers
-            # to — this came up repeatedly while diagnosing phone-detection
-            # false positives/negatives.
-            text = f"#{tid} {label} ({conf:.2f})" if tid is not None else f"{label} ({conf:.2f})"
+            text = f"{label} ({conf:.2f})"
             tw, th = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)[0]
             bg_y1 = max(0, y1 - th - 4)
             cv2.rectangle(out, (x1, bg_y1), (x1 + tw + 4, y1), color, -1)
@@ -780,15 +501,6 @@ class ClassroomBehaviorDetector:
             return None, 'Unknown', ''
 
     def _detection_loop(self):
-        """
-        DEPRECATED / UNUSED IN THE LIVE PATH.
-
-        Only reachable via start() below, which nothing in views.py calls.
-        The live stream (_generate_video_stream in views.py) calls
-        self.detect(frame) directly per-frame from its own worker thread
-        instead of running this loop. See ProductionStreamProcessor.start()
-        for why this shouldn't be re-enabled against a shared detector.
-        """
         self.processor.start(self.camera_url)
         frame_count, last_ts = 0, 0.0
         while self.running:
@@ -822,9 +534,6 @@ class ClassroomBehaviorDetector:
         self.processor.stop()
 
     def start(self):
-        """DEPRECATED / UNUSED IN THE LIVE PATH — see _detection_loop's docstring.
-        Nothing in views.py calls this; the shared detector singleton
-        (_get_yolo_detector) is driven entirely via .detect(frame) instead."""
         if self.running:
             return
         self._init_face_recognition()
@@ -834,7 +543,6 @@ class ClassroomBehaviorDetector:
         print('[OK] Behavior detection started')
 
     def stop(self):
-        """DEPRECATED / UNUSED IN THE LIVE PATH — see _detection_loop's docstring."""
         self.running = False
         if self.thread:
             self.thread.join(timeout=5)

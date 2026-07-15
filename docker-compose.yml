@@ -21,6 +21,7 @@ services:
     build: .
     container_name: classroom_iot_web
     volumes:
+      - .:/app  # Mount local code to /app so changes are reflected immediately!
       - ./media:/app/media
       - ./staticfiles:/app/staticfiles
     ports:

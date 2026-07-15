@@ -11,19 +11,105 @@ import json
 import base64
 import os
 import time
+import cv2
+import numpy as np
 import requests
-
-try:
-    import cv2
-    import numpy as np
-except ImportError:
-    cv2 = None
-    np = None
+import urllib3
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 from .models import ClassroomCamera, ClassSession, EngagementSnapshot, StudentZoneLog, ClassroomVideo, VideoAnalysisFrame, VideoStudentZone, IncidentReport
 from .forms import ClassroomCameraForm, ClassroomVideoForm
 from django.core.paginator import Paginator
 from django.db.models import Q, Count
+
+
+class MJPEGCapture:
+    """Custom MJPEG capture class to properly handle HTTP streams"""
+    def __init__(self, url):
+        self.url = url
+        self.stream = None
+        self._ok = False
+        # Buffer and chunk-iterator both persist across read() calls now —
+        # see the note in read() for why recreating either per-call broke
+        # the stream after ~1 frame.
+        self._buffer = bytes()
+        self._chunk_iter = None
+        try:
+            self.stream = requests.get(url, stream=True, timeout=10, verify=False)
+            self.stream.raise_for_status()
+            self._chunk_iter = self.stream.iter_content(chunk_size=1024)
+            self._ok = True
+            print(f"[MJPEGCapture] Opened stream from {url}")
+        except Exception as e:
+            print(f"[MJPEGCapture] Failed to open stream: {e}")
+            self._ok = False
+
+    def isOpened(self):
+        return self._ok
+
+    def read(self):
+        if not self._ok or not self.stream or self._chunk_iter is None:
+            return False, None
+        try:
+            while True:
+                a = self._buffer.find(b'\xff\xd8')
+                # Search for the end marker AFTER the start marker — searching
+                # from the very start of the buffer (the original bug) could
+                # match a stray \xff\xd9-like byte sequence sitting before the
+                # real start marker, producing a corrupt/empty slice.
+                b = self._buffer.find(b'\xff\xd9', a + 2) if a != -1 else -1
+                if a != -1 and b != -1:
+                    jpg = self._buffer[a:b + 2]
+                    self._buffer = self._buffer[b + 2:]
+                    img = cv2.imdecode(np.frombuffer(jpg, dtype=np.uint8), cv2.IMREAD_COLOR)
+                    if img is not None:
+                        return True, img
+                    # Malformed frame despite matching markers — drop it and
+                    # keep scanning the rest of the buffer instead of
+                    # returning (True, None), which would crash the caller.
+                    continue
+
+                # requests.Response.iter_content() is meant to be consumed as
+                # ONE generator for the life of the response. The previous
+                # version called self.stream.iter_content() fresh on every
+                # read(), abandoning the prior generator mid-stream each
+                # time — once abandoned/garbage-collected, requests marks
+                # the response content as consumed, so the SECOND read()
+                # call would raise StreamConsumedError and every call after
+                # that failed instantly. Reusing one generator (created once
+                # in __init__) and only advancing it here fixes that.
+                chunk = next(self._chunk_iter, None)
+                if chunk is None:
+                    self._ok = False   # underlying stream ended
+                    return False, None
+                if chunk:
+                    self._buffer += chunk
+                # Guard against unbounded growth if valid JPEG markers never
+                # show up (e.g. non-MJPEG content on that URL) — keep only
+                # the tail so this can't leak memory or hang forever.
+                if len(self._buffer) > 2_000_000:
+                    self._buffer = self._buffer[-500_000:]
+        except Exception as e:
+            print(f"[MJPEGCapture] Read error: {e}")
+            self._ok = False
+            return False, None
+
+    def get(self, prop):
+        if prop == cv2.CAP_PROP_FPS:
+            return 25.0
+        return 0.0
+
+    def set(self, prop, value):
+        return True
+
+    def release(self):
+        if self.stream:
+            try:
+                self.stream.close()
+                print("[MJPEGCapture] Closed stream")
+            except Exception:
+                pass
+        self._ok = False
 
 
 @login_required
@@ -326,18 +412,6 @@ def generate_frames(camera_url):
 
 
 @login_required
-def live_stream(request, camera_id):
-    """Live camera stream with behaviour detection overlays."""
-    camera = get_object_or_404(ClassroomCamera, pk=camera_id)
-    return StreamingHttpResponse(
-        _generate_video_stream(camera.url, camera_id=camera.pk,
-                               camera_location=camera.location,
-                               request_obj=request),
-        content_type='multipart/x-mixed-replace; boundary=frame'
-    )
-
-
-@login_required
 def live_monitor(request):
     try:
         from entrance_cam.models import Student
@@ -395,23 +469,41 @@ def live_camera_detail(request, camera_id):
     return render(request, 'classroom_monitor/live_camera_detail.html', context)
 
 
-# ── Behavior Incident Views ───────────────────────────────────────────────────
+# ΓöÇΓöÇ Behavior Incident Views ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 
-# Module-level shared detector (loaded once, reused by all streams)
-_SHARED_DETECTOR = None
+# Per-stream detector registry (keyed by camera / video job ΓÇö NOT a single
+# global instance). Each ClassroomBehaviorDetector owns its own
+# TemporalBehaviorEngine + HeadPoseDetector + PhoneDetector + FoodDetector +
+# HandRaiseDetector, all of which key their internal state by ByteTrack
+# track_id. Track IDs are assigned independently per tracking session, so two
+# different cameras (or a live camera running at the same time as an
+# uploaded-video analysis job) WILL eventually produce the same numeric
+# track_id for two completely different people. Sharing one detector across
+# streams meant one student's keypoint/behavior history, confidence
+# smoothing, and incident cooldown could silently get overwritten by an
+# unrelated student on a different camera or video. Each key below gets its
+# own isolated detector instance instead.
+#
+# The underlying YOLO model *weights* are still shared process-wide via
+# _SharedYOLOModels inside behavior_detection.py, so creating a new
+# ClassroomBehaviorDetector per key does NOT reload the model from disk ΓÇö
+# it's cheap after the very first load.
+_DETECTOR_REGISTRY: dict = {}
+_DETECTOR_REGISTRY_LOCK = None  # set below once threading is imported
 
 
 def _prewarm_detector():
-    """Load YOLO in a background thread at Django startup so the first stream
-    request doesn't block for 3-5 seconds."""
+    """Load YOLO model weights in a background thread at Django startup so
+    the first stream request doesn't block for 3-5 seconds. This constructs
+    one throwaway detector purely to trigger the shared model load in
+    _SharedYOLOModels ΓÇö it is not kept or reused itself, since real streams
+    get their own per-key detector via _get_yolo_detector(key)."""
     import threading
     def _load():
-        global _SHARED_DETECTOR
         try:
             from classroom_monitor.behavior_detection import ClassroomBehaviorDetector
-            _SHARED_DETECTOR = ClassroomBehaviorDetector(
-                camera_url='', camera_id=0, server_url='')
-            print('[OK] Shared detector pre-warmed')
+            ClassroomBehaviorDetector(camera_url='', camera_id=0, server_url='')
+            print('[OK] YOLO models pre-warmed')
         except Exception as e:
             print(f'[WARN] Pre-warm failed: {e}')
     t = threading.Thread(target=_load, daemon=True)
@@ -420,29 +512,211 @@ def _prewarm_detector():
 
 # Kick off pre-warm immediately when views.py is imported by Django
 try:
+    import threading as _threading_bootstrap
+    _DETECTOR_REGISTRY_LOCK = _threading_bootstrap.Lock()
     _prewarm_detector()
 except Exception:
     pass
 
 
-def _get_yolo_detector():
+def _get_yolo_detector(key: str = '_default'):
     """
-    Module-level singleton for the YOLO+Haar detector.
-    Loaded once when the module is first imported, shared across all streams.
-    This prevents the 3-5s YOLO load blocking the HTTP response.
+    Per-stream detector registry. `key` should be something stable and
+    unique per live camera (e.g. f"camera:{camera_id}") or per uploaded-video
+    analysis job (e.g. f"video:{video_pk}") ΓÇö never shared between two
+    different streams/jobs. Lazily creates and caches one
+    ClassroomBehaviorDetector per key so tracked-person state never leaks
+    across cameras or videos.
     """
-    global _SHARED_DETECTOR
-    try:
-        if _SHARED_DETECTOR is None:
-            from classroom_monitor.behavior_detection import ClassroomBehaviorDetector
-            _SHARED_DETECTOR = ClassroomBehaviorDetector(
-                camera_url='',
-                camera_id=0,
-                server_url='',       # no HTTP self-calls inside detector
-            )
-    except Exception as e:
-        print(f'[WARN] Could not init shared detector: {e}')
-    return _SHARED_DETECTOR
+    global _DETECTOR_REGISTRY, _DETECTOR_REGISTRY_LOCK
+    if _DETECTOR_REGISTRY_LOCK is None:
+        import threading as _threading_lazy
+        _DETECTOR_REGISTRY_LOCK = _threading_lazy.Lock()
+    with _DETECTOR_REGISTRY_LOCK:
+        det = _DETECTOR_REGISTRY.get(key)
+        if det is None:
+            try:
+                from classroom_monitor.behavior_detection import ClassroomBehaviorDetector
+                det = ClassroomBehaviorDetector(
+                    camera_url='',
+                    camera_id=0,
+                    server_url='',       # no HTTP self-calls inside detector
+                )
+                _DETECTOR_REGISTRY[key] = det
+            except Exception as e:
+                print(f'[WARN] Could not init detector for key={key}: {e}')
+                det = None
+    return det
+
+
+def _release_yolo_detector(key: str):
+    """Remove a per-camera/per-video detector from the registry once its
+    stream or job ends, so tracked-person state and memory don't accumulate
+    across repeated open/close cycles of the same camera page."""
+    global _DETECTOR_REGISTRY, _DETECTOR_REGISTRY_LOCK
+    if _DETECTOR_REGISTRY_LOCK is None:
+        return
+    with _DETECTOR_REGISTRY_LOCK:
+        _DETECTOR_REGISTRY.pop(key, None)
+
+
+@login_required
+def live_stream(request, camera_id):
+    """
+    Simple MJPEG proxy ΓÇö reads directly from the camera via OpenCV and
+    streams annotated frames to the browser.  The heavy behavior-detection
+    pipeline runs in a background thread; if it fails for any reason the
+    stream still keeps delivering raw frames so the modal always shows video.
+    """
+    import logging
+    import threading
+    import queue as _q
+    import time as _time
+
+    _log = logging.getLogger(__name__)
+
+    # Manual auth check ΓÇö avoids redirect (302) that makes <img> fire onerror
+    if not request.user.is_authenticated:
+        from django.http import HttpResponse
+        return HttpResponse(status=401)
+
+    camera = get_object_or_404(ClassroomCamera, pk=camera_id)
+
+    def _stream():
+        url = camera.url.strip()
+        try:
+            src = int(url) if url.isdigit() else url
+        except Exception:
+            src = url
+
+        if isinstance(src, str) and src.lower().startswith('http'):
+            cap = MJPEGCapture(src)
+        else:
+            cap = cv2.VideoCapture(src)
+            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+
+        if not cap.isOpened():
+            err = np.zeros((240, 480, 3), dtype=np.uint8)
+            cv2.putText(err, 'Camera unavailable', (60, 110),
+                        cv2.FONT_HERSHEY_SIMPLEX, 1.0, (80, 80, 255), 2)
+            cv2.putText(err, url[:60], (20, 160),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (180, 180, 180), 1)
+            _, buf = cv2.imencode('.jpg', err)
+            yield (b'--frame\r\nContent-Type: image/jpeg\r\n\r\n'
+                   + buf.tobytes() + b'\r\n')
+            return
+
+        detector = None
+        try:
+            detector = _get_yolo_detector(f'camera:{camera_id}')
+        except Exception as e:
+            _log.warning(f'[STREAM] detector unavailable: {e}')
+
+        result_lock = threading.Lock()
+        latest_dets: list = []
+        detect_q = _q.Queue(maxsize=1)
+        stop_ev = threading.Event()
+
+        def _det_worker():
+            while not stop_ev.is_set():
+                try:
+                    frm = detect_q.get(timeout=0.5)
+                except _q.Empty:
+                    continue
+                try:
+                    dets = detector.detect(frm) if detector else []
+                    with result_lock:
+                        latest_dets.clear()
+                        latest_dets.extend(dets)
+                except Exception as exc:
+                    _log.debug(f'[DET] {exc}')
+
+        det_thread = threading.Thread(target=_det_worker, daemon=True)
+        det_thread.start()
+
+        src_fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
+        frame_delay = 1.0 / min(src_fps, 25.0)
+        heavy_every = max(1, int(src_fps // 2))
+        fc = 0
+        last_yield = _time.monotonic()
+        consecutive_errors = 0
+
+        try:
+            while True:
+                ret, frame = cap.read()
+                if not ret or frame is None:
+                    consecutive_errors += 1
+                    if consecutive_errors > 10:
+                        break
+                    _time.sleep(0.05)
+                    continue
+                consecutive_errors = 0
+                fc += 1
+
+                if fc % heavy_every == 0:
+                    try:
+                        detect_q.put_nowait(frame.copy())
+                    except _q.Full:
+                        pass
+
+                try:
+                    with result_lock:
+                        dets = list(latest_dets)
+                    annotated = frame.copy()
+                    focused = distracted = phone = eating = 0
+                    for det in dets[:20]:
+                        dt = det.get('type', '')
+                        x1, y1, x2, y2 = det.get('bbox', (0, 0, 0, 0))
+                        color = det.get('color', (120, 120, 120))
+                        tid = det.get('track_id')
+                        base_label = det.get('label', dt)
+                        # Track ID included so a debug log line like
+                        # "[PHONE] Person 44: ..." can be matched directly
+                        # to the exact box on screen.
+                        label = f"#{tid} {base_label}" if tid is not None else base_label
+                        cv2.rectangle(annotated, (x1, y1), (x2, y2), color, 2)
+                        cv2.putText(annotated, label, (x1 + 4, max(y1 - 8, 18)),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.52, color, 2)
+                        if dt == 'focused':
+                            focused += 1
+                        elif dt in ('distracted', 'looking_away', 'head_down'):
+                            distracted += 1
+                        elif dt == 'using_phone':
+                            phone += 1
+                        elif dt == 'eating_food':
+                            eating += 1
+                    total = focused + distracted + phone + eating
+                    score = (focused / total * 100) if total > 0 else 0.0
+                    bar = f'F:{focused} D:{distracted} Ph:{phone} Eat:{eating}  {score:.0f}%'
+                    cv2.rectangle(annotated, (0, 0), (len(bar) * 9 + 14, 26), (20, 20, 20), -1)
+                    cv2.putText(annotated, bar, (6, 18),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.48, (255, 255, 255), 1)
+                except Exception:
+                    annotated = frame
+
+                _, buf = cv2.imencode('.jpg', annotated, [cv2.IMWRITE_JPEG_QUALITY, 72])
+                if buf is not None:
+                    try:
+                        yield (b'--frame\r\nContent-Type: image/jpeg\r\n\r\n'
+                               + buf.tobytes() + b'\r\n')
+                    except (BrokenPipeError, ConnectionResetError, OSError):
+                        break
+
+                elapsed = _time.monotonic() - last_yield
+                wait = frame_delay - elapsed
+                if wait > 0:
+                    _time.sleep(wait)
+                last_yield = _time.monotonic()
+        finally:
+            stop_ev.set()
+            cap.release()
+            det_thread.join(timeout=1)
+            _release_yolo_detector(f'camera:{camera_id}')
+
+    return StreamingHttpResponse(
+        _stream(),
+        content_type='multipart/x-mixed-replace; boundary=frame',
+    )
 
 
 def _incident_severity(det_type: str) -> str:
@@ -459,7 +733,7 @@ def _save_incident_direct(det_type, confidence, snapshot_bgr, student,
     """
     Save IncidentReport to DB and send one alert email per student per incident
     type with a 5-minute cooldown (per student, not global).
-    Called directly — no HTTP self-POST, no Twilio. Uses SMTP email.
+    Called directly ΓÇö no HTTP self-POST, no Twilio. Uses SMTP email.
     Returns the IncidentReport on success, None on failure.
     """
     try:
@@ -473,7 +747,7 @@ def _save_incident_direct(det_type, confidence, snapshot_bgr, student,
         tag   = f'{student_name} ({roll_no})' if student else 'Unknown person'
         label = LABEL_MAP.get(det_type, det_type)
 
-        desc = description_extra or f'{label} — {tag}'
+        desc = description_extra or f'{label} ΓÇö {tag}'
 
         incident = IncidentReport.objects.create(
             student=student,
@@ -504,41 +778,27 @@ def _save_incident_direct(det_type, confidence, snapshot_bgr, student,
 def _generate_video_stream(video_path, camera_id=0, camera_location='Classroom',
                             request_obj=None):
     """
-    MJPEG stream — crash-free on Windows, no HTTP self-calls.
+    MJPEG stream ΓÇö crash-free on Windows, no HTTP self-calls.
     Fully isolated against dictionary/dataclass structural type mismatches.
     """
     import time
     import threading
     import queue as _queue
 
-    if cv2 is None or np is None:
-        # OpenCV not installed — yield a plain text error frame and stop
-        import numpy as _np_fallback
-        import cv2 as _cv2_fallback
-        err = _np_fallback.zeros((240, 640, 3), dtype=_np_fallback.uint8)
-        _cv2_fallback.putText(err, 'OpenCV not available — pip install opencv-python-headless',
-                    (10, 120), _cv2_fallback.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 200), 2)
-        _, buf = _cv2_fallback.imencode('.jpg', err)
-        yield (b'--frame\r\nContent-Type: image/jpeg\r\n\r\n' + buf.tobytes() + b'\r\n')
-        return
-
     from classroom_monitor.behavior_detection import (
         ClassroomBehaviorDetector, COLOR_MAP, LABEL_MAP,
         ALERT_POSES, DISTRACTED_POSES,
     )
     from classroom_monitor.constants import EMAIL_ALERT_TYPES
-    try:
-        from classroom_monitor.face_recognition_helper import StudentFaceRecognizer, DLIB_LOCK
-    except Exception as _frimport_err:
-        print(f'[WARN] face_recognition_helper import failed: {_frimport_err}')
-        StudentFaceRecognizer = None
-        DLIB_LOCK = None
+    from classroom_monitor.face_recognition_helper import (
+        StudentFaceRecognizer, DLIB_LOCK,
+    )
 
     FACEREC_INTERVAL = 5.0   # seconds between face-recognition attempts
     COOLDOWN_S       = 90    # seconds between same incident type alerts
     SNAPSHOT_INTERVAL = 10.0 # seconds between saving engagement snapshots
 
-    # ── Camera object ─────────────────────────────────────────────────────────
+    # ΓöÇΓöÇ Camera object ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
     camera_obj = None
     if camera_id:
         try:
@@ -546,33 +806,40 @@ def _generate_video_stream(video_path, camera_id=0, camera_location='Classroom',
         except Exception:
             pass
 
-    # ── Shared detector singleton ─────────────────────────────────────────────
-    detector = _get_yolo_detector()
+    # ΓöÇΓöÇ Per-camera detector (own tracker/behavior-engine state) ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
+    # camera_id defaults to 0 for ad-hoc/URL-only streams; make that a unique
+    # key too (keyed by video_path) so two zero-id ad-hoc streams don't share
+    # state either.
+    stream_key = f'camera:{camera_id}' if camera_id else f'adhoc:{video_path}'
+    detector = _get_yolo_detector(stream_key)
     if detector is None:
         from classroom_monitor.behavior_detection import ClassroomBehaviorDetector
         detector = ClassroomBehaviorDetector(camera_url='', camera_id=0, server_url='')
 
-    # ── Face recognizer — loads DB once, used ONLY on main thread ─────────────
-    recognizer = None
-    if StudentFaceRecognizer is not None:
-        try:
-            recognizer = StudentFaceRecognizer()
-            recognizer.load_from_db()
-        except Exception as _fr_err:
-            print(f'[WARN] Face recognizer load failed (stream will run without face ID): {_fr_err}')
-            recognizer = None
+    # ΓöÇΓöÇ Face recognizer ΓÇö loads DB once, used ONLY on main thread ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
+    recognizer = StudentFaceRecognizer()
+    recognizer.load_from_db()
 
-    # ── Thread primitives ─────────────────────────────────────────────────────
+    # ΓöÇΓöÇ Thread primitives ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
     result_lock = threading.Lock()
-    latest_dets = []                        # list[dict] — latest detections
-    detect_q    = _queue.Queue(maxsize=1)   # frames  → full detect worker (heavy)
-    pose_q      = _queue.Queue(maxsize=2)   # frames  → pose-only worker (cheap)
-    save_q      = _queue.Queue(maxsize=50)  # incident dicts → DB/WA saver
+    latest_dets = []                        # list[dict] ΓÇö latest detections
+    detect_q    = _queue.Queue(maxsize=1)   # frames  ΓåÆ full detect worker (heavy)
+    pose_q      = _queue.Queue(maxsize=2)   # frames  ΓåÆ pose-only worker (cheap)
+    save_q      = _queue.Queue(maxsize=50)  # incident dicts ΓåÆ DB/WA saver
     stop_event  = threading.Event()
-    cooldown    = {}                        # (type, track_id) → last saved timestamp
+    cooldown    = {}                        # (type, track_id) ΓåÆ last saved timestamp
     pending_keys = set()
 
-    # ── Detect worker — YOLO + Haar only, NO dlib ────────────────────────────
+    # `detector.processor.yolo_model.track(..., persist=True)` keeps mutable
+    # internal ByteTrack state on the model object. _detection_worker and
+    # _pose_worker run as separate threads and both call into that same
+    # model ΓÇö without a lock, two threads can enter .track() at the same
+    # time and corrupt tracker state (ID churn, garbage/misaligned
+    # keypoints, occasional exceptions). This lock makes every call into the
+    # tracker mutually exclusive, regardless of which worker makes it.
+    yolo_track_lock = threading.Lock()
+
+    # ΓöÇΓöÇ Detect worker ΓÇö YOLO + Haar only, NO dlib ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
     def _detection_worker():
         while not stop_event.is_set():
             try:
@@ -580,17 +847,25 @@ def _generate_video_stream(video_path, camera_id=0, camera_location='Classroom',
             except _queue.Empty:
                 continue
             try:
-                dets = detector.detect(work_frame)
+                with yolo_track_lock:
+                    dets = detector.detect(work_frame)
                 with result_lock:
                     latest_dets.clear()
                     latest_dets.extend(dets)
             except Exception as exc:
                 print(f'[DETECT] {exc}')
 
-    # ── Pose-only worker — keeps ByteTrack IDs alive between heavy detections ─
+    # ΓöÇΓöÇ Pose-only worker ΓÇö keeps ByteTrack IDs alive between heavy detections ΓöÇ
     # Calls _parse_pose_detections on every pose_q frame so the tracker sees
     # consistent motion and doesn't churn IDs. Does NOT run object detection
-    # or fight detection (cheap path only).
+    # or fight detection (cheap path only). It DOES feed each track into
+    # behavior_engine.update_person() so keypoint_history actually gets
+    # samples at this worker's higher cadence (~8fps) instead of only at the
+    # heavy-detection cadence (~2fps) ΓÇö the wrist-motion-variance ("is this
+    # writing or phone-scrolling") heuristic in behavior_detection_core.py
+    # needs that higher sample rate to be a meaningful signal. Previously this
+    # worker discarded its results entirely, so it had zero effect on
+    # tracked-person state.
     def _pose_worker():
         while not stop_event.is_set():
             try:
@@ -599,11 +874,16 @@ def _generate_video_stream(video_path, camera_id=0, camera_location='Classroom',
                 continue
             try:
                 if detector is not None and detector.processor.yolo_model is not None:
-                    detector.processor._parse_pose_detections(work_frame)
+                    with yolo_track_lock:
+                        tracks = detector.processor._parse_pose_detections(work_frame)
+                    ts = time.time()
+                    for tid, x1, y1, x2, y2, conf, kp in tracks:
+                        detector.processor.behavior_engine.update_person(
+                            tid, (x1, y1, x2, y2), kp, ts)
             except Exception as exc:
                 print(f'[POSE] {exc}')
 
-    # ── Save worker — DB write + email alert, NO dlib ──────────────────────────────
+    # ΓöÇΓöÇ Save worker ΓÇö DB write + email alert, NO dlib ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
     def _save_worker():
         from django.db import close_old_connections
         while not stop_event.is_set():
@@ -641,7 +921,7 @@ def _generate_video_stream(video_path, camera_id=0, camera_location='Classroom',
     pose_thread.start()
     save_thread.start()
 
-    # ── Video / camera capture ────────────────────────────────────────────────
+    # ΓöÇΓöÇ Video / camera capture ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
     cap = None
     reconnect_attempts = 0
     max_reconnect_attempts = 5
@@ -649,11 +929,17 @@ def _generate_video_stream(video_path, camera_id=0, camera_location='Classroom',
     
     def _open_camera():
         try:
-            path = int(video_path) if str(video_path).isdigit() else video_path
-            cv2_cap = cv2.VideoCapture(path)
-            if cv2_cap.isOpened():
-                cv2_cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-                return cv2_cap
+            path_str = str(video_path)
+            if path_str.lower().startswith('http'):
+                mjpeg_cap = MJPEGCapture(video_path)
+                if mjpeg_cap.isOpened():
+                    return mjpeg_cap
+            else:
+                path = int(video_path) if path_str.isdigit() else video_path
+                cv2_cap = cv2.VideoCapture(path)
+                if cv2_cap.isOpened():
+                    cv2_cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+                    return cv2_cap
         except Exception as e:
             print(f'[STREAM] Error opening camera: {e}')
         return None
@@ -662,13 +948,6 @@ def _generate_video_stream(video_path, camera_id=0, camera_location='Classroom',
     if cap is None:
         print(f'[STREAM] Failed to open camera: {video_path}')
         stop_event.set()
-        # Yield a single error frame so StreamingHttpResponse doesn't produce a 500
-        if cv2 is not None and np is not None:
-            err_img = np.zeros((240, 640, 3), dtype=np.uint8)
-            cv2.putText(err_img, f'Camera unavailable: {video_path}',
-                        (20, 120), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 200), 2)
-            _, buf = cv2.imencode('.jpg', err_img)
-            yield (b'--frame\r\nContent-Type: image/jpeg\r\n\r\n' + buf.tobytes() + b'\r\n')
         return
 
     src_fps      = cap.get(cv2.CAP_PROP_FPS) or 25.0
@@ -730,13 +1009,13 @@ def _generate_video_stream(video_path, camera_id=0, camera_location='Classroom',
                     time.sleep(0.1)
                 continue
                 
-            # ── PROTECTED INNER LOOP PROCESSING (Prevents all 500 stream crashes) ──
+            # ΓöÇΓöÇ PROTECTED INNER LOOP PROCESSING (Prevents all 500 stream crashes) ΓöÇΓöÇ
             try:
                 frame_count += 1
 
                 # Two-tier dispatch:
-                # pose_q  — every pose_every frames (~8fps): keeps ByteTrack IDs stable
-                # detect_q — every heavy_every frames (~2fps): full object+fight pipeline
+                # pose_q  ΓÇö every pose_every frames (~8fps): keeps ByteTrack IDs stable
+                # detect_q ΓÇö every heavy_every frames (~2fps): full object+fight pipeline
                 if frame_count % pose_every == 0:
                     try:
                         pose_q.put_nowait(frame.copy())
@@ -772,7 +1051,7 @@ def _generate_video_stream(video_path, camera_id=0, camera_location='Classroom',
                         except Exception:
                             pass
 
-                # ── Save engagement snapshot periodically ─────────────────────
+                # ΓöÇΓöÇ Save engagement snapshot periodically ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
                 now = time.time()
                 if (now - last_snapshot_save) >= SNAPSHOT_INTERVAL:
                     last_snapshot_save = now
@@ -830,7 +1109,7 @@ def _generate_video_stream(video_path, camera_id=0, camera_location='Classroom',
                     )
                     snapshot_thread.start()
 
-                # ── Face recognition + incident queueing ──────────────────────
+                # ΓöÇΓöÇ Face recognition + incident queueing ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
                 now = time.time()
                 if (now - last_facerec) >= FACEREC_INTERVAL:
                     last_facerec = now
@@ -856,11 +1135,7 @@ def _generate_video_stream(video_path, camera_id=0, camera_location='Classroom',
                             crop = frame[y1:y2, x1:x2]
 
                         try:
-                            sid, name, roll, _ = (
-                                recognizer.match(crop)
-                                if recognizer is not None and crop.size > 0
-                                else (None, 'Unknown', '', float('nan'))
-                            )
+                            sid, name, roll, _ = (recognizer.match(crop) if crop.size > 0 else (None, 'Unknown', '', float('nan')))
                             student = None
                             if sid:
                                 try:
@@ -890,11 +1165,11 @@ def _generate_video_stream(video_path, camera_id=0, camera_location='Classroom',
                                 save_q.put(item, timeout=2.0)
                             except _queue.Full:
                                 pending_keys.discard(key)
-                                print('[STREAM] Incident save queue full — dropping alert')
+                                print('[STREAM] Incident save queue full ΓÇö dropping alert')
                         except Exception as e:
                             print(f'[STREAM] Error in face recognition: {e}')
 
-                # ── Draw annotations ──────────────────────────────────────────
+                # ΓöÇΓöÇ Draw annotations ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
                 annotated  = frame.copy()
                 focused = distracted = phone = eating = hand_raised = 0
 
@@ -909,14 +1184,8 @@ def _generate_video_stream(video_path, camera_id=0, camera_location='Classroom',
 
                     x1, y1, x2, y2 = det['bbox']
                     color     = det.get('color', COLOR_MAP.get(dt, (120,120,120)))
-                    base_label = det.get('label', LABEL_MAP.get(dt, dt))
-                    tid_val   = det.get('track_id')
-                    # Track ID included so a debug log line like
-                    # "[PHONE] Person 44: ..." can be matched directly to
-                    # the exact box on screen instead of guessing which
-                    # visible person a log entry refers to.
-                    label = f"#{tid_val} {base_label}" if tid_val is not None else base_label
-
+                    label     = det.get('label', LABEL_MAP.get(dt, dt))
+                    
                     cv2.rectangle(annotated, (x1,y1), (x2,y2), color, 2)
                     cv2.putText(annotated, label, (x1+4, max(y1-8,18)), cv2.FONT_HERSHEY_SIMPLEX, 0.52, color, 2)
 
@@ -940,7 +1209,7 @@ def _generate_video_stream(video_path, camera_id=0, camera_location='Classroom',
                 print(f'[STREAM LOOP EXCEPTION HANDLED]: {loop_processing_err}')
                 annotated = frame
 
-            # ── Encode and Yield Frame ────────────────────────────────────────
+            # ΓöÇΓöÇ Encode and Yield Frame ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
             _, buf = cv2.imencode('.jpg', annotated, [cv2.IMWRITE_JPEG_QUALITY, 72])
             if buf is not None and len(buf) > 0:
                 try:
@@ -961,13 +1230,14 @@ def _generate_video_stream(video_path, camera_id=0, camera_location='Classroom',
         det_thread.join(timeout=1)
         pose_thread.join(timeout=1)
         save_thread.join(timeout=1)
+        _release_yolo_detector(stream_key)
 
 def _get_port():
     """Return the Django dev-server port (default 8000). Override via DJANGO_PORT env var."""
     return int(os.environ.get('DJANGO_PORT', 8000))
 
 
-# ── Behavior Incident Views ───────────────────────────────────────────────────
+# ΓöÇΓöÇ Behavior Incident Views ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 
 @login_required
 def incidents_dashboard(request):
@@ -987,7 +1257,6 @@ def incidents_dashboard(request):
     # Stats
     phone_count = IncidentReport.objects.filter(incident_type='using_phone').count()
     eating_count = IncidentReport.objects.filter(incident_type='eating_food').count()
-    fighting_count = IncidentReport.objects.filter(incident_type='fighting').count()
     distracted_count = IncidentReport.objects.filter(incident_type='distracted').count()
     
     # Pagination
@@ -1001,7 +1270,6 @@ def incidents_dashboard(request):
         'is_paginated': page_obj.has_other_pages(),
         'phone_count': phone_count,
         'eating_count': eating_count,
-        'fighting_count': fighting_count,
         'distracted_count': distracted_count,
     }
     return render(request, 'classroom_monitor/incidents_dashboard.html', context)
@@ -1072,7 +1340,7 @@ def api_incidents_report(request):
     try:
         data = json.loads(request.body)
 
-        # ── 1. Resolve student ────────────────────────────────────────────────
+        # ΓöÇΓöÇ 1. Resolve student ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
         student = None
         if data.get('student_id'):
             try:
@@ -1081,7 +1349,7 @@ def api_incidents_report(request):
             except Exception:
                 pass
 
-        # ── 2. Resolve camera (camera_id 0 means "no camera row") ────────────
+        # ΓöÇΓöÇ 2. Resolve camera (camera_id 0 means "no camera row") ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
         camera = None
         cam_id = data.get('camera_id')
         if cam_id:
@@ -1095,7 +1363,7 @@ def api_incidents_report(request):
                 except Exception:
                     pass
 
-        # ── 3. Decode snapshot ────────────────────────────────────────────────
+        # ΓöÇΓöÇ 3. Decode snapshot ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
         snapshot_file = None
         snapshot_bytes = None
         if data.get('snapshot'):
@@ -1109,12 +1377,12 @@ def api_incidents_report(request):
             except Exception:
                 pass
 
-        # ── 4. Determine severity ─────────────────────────────────────────────
+        # ΓöÇΓöÇ 4. Determine severity ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
         from classroom_monitor.constants import EMAIL_ALERT_TYPES
         inc_type    = data.get('incident_type', 'other')
         severity = _incident_severity(inc_type)
 
-        # ── 5. Save to DB ─────────────────────────────────────────────────────
+        # ΓöÇΓöÇ 5. Save to DB ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
         incident = IncidentReport.objects.create(
             student=student,
             camera=camera,
@@ -1126,7 +1394,7 @@ def api_incidents_report(request):
             whatsapp_sent=False,
         )
 
-        # ── 6. Email alert for RED incidents (including fighting) ─────────────
+        # ΓöÇΓöÇ 6. Email alert for RED incidents (including fighting) ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
         if inc_type in EMAIL_ALERT_TYPES and snapshot_bytes:
             _send_incident_email(
                 incident=incident,
@@ -1169,7 +1437,7 @@ def _load_env_vars():
             return
 
 
-# ── Per-student email cooldown: (student_id_or_"unknown", det_type) → timestamp
+# ΓöÇΓöÇ Per-student email cooldown: (student_id_or_"unknown", det_type) ΓåÆ timestamp
 # Keeps 5-minute silence per student per incident type.
 _EMAIL_COOLDOWN: dict = {}
 _EMAIL_COOLDOWN_SECS  = 300   # 5 minutes
@@ -1181,12 +1449,12 @@ def _send_incident_email(incident, student, student_name, roll_no,
     Send ONE alert email per student per incident-type with a 5-minute cooldown.
 
     .env / environment variables required:
-      SMTP_HOST       — e.g. smtp.gmail.com
-      SMTP_PORT       — e.g. 587
-      SMTP_USER       — sender address, e.g. school@gmail.com
-      SMTP_PASSWORD   — app password or SMTP password
-      SMTP_USE_TLS    — True / False  (default True)
-      ALERT_EMAIL_TO  — recipient address (teacher / admin)
+      SMTP_HOST       ΓÇö e.g. smtp.gmail.com
+      SMTP_PORT       ΓÇö e.g. 587
+      SMTP_USER       ΓÇö sender address, e.g. school@gmail.com
+      SMTP_PASSWORD   ΓÇö app password or SMTP password
+      SMTP_USE_TLS    ΓÇö True / False  (default True)
+      ALERT_EMAIL_TO  ΓÇö recipient address (teacher / admin)
 
     Optional (for known-student parent emails):
       The Student model should have a  parent_email  field.
@@ -1200,16 +1468,16 @@ def _send_incident_email(incident, student, student_name, roll_no,
 
     _load_env_vars()
 
-    # ── Cooldown check: one email per (student_key, incident_type) per 5 min ──
+    # ΓöÇΓöÇ Cooldown check: one email per (student_key, incident_type) per 5 min ΓöÇΓöÇ
     student_key = str(student.id) if student else 'unknown'
     cooldown_key = (student_key, det_type)
     now = time.time()
     if (now - _EMAIL_COOLDOWN.get(cooldown_key, 0)) < _EMAIL_COOLDOWN_SECS:
-        print(f'[EMAIL] Cooldown active for {student_name} / {det_type} — skipping')
+        print(f'[EMAIL] Cooldown active for {student_name} / {det_type} ΓÇö skipping')
         return False
     _EMAIL_COOLDOWN[cooldown_key] = now
 
-    # ── SMTP credentials from env ─────────────────────────────────────────────
+    # ΓöÇΓöÇ SMTP credentials from env ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
     smtp_host = (os.environ.get('SMTP_HOST') or
                  os.environ.get('EMAIL_HOST', '')).strip()
     smtp_port = int(os.environ.get('SMTP_PORT') or
@@ -1224,7 +1492,7 @@ def _send_incident_email(incident, student, student_name, roll_no,
                  os.environ.get('ADMIN_EMAIL', '')).strip()
 
     if not smtp_host or not smtp_user or not smtp_pass:
-        print('[EMAIL] SMTP credentials missing in .env — '
+        print('[EMAIL] SMTP credentials missing in .env ΓÇö '
               'set SMTP_HOST, SMTP_USER, SMTP_PASSWORD')
         return False
 
@@ -1232,7 +1500,7 @@ def _send_incident_email(incident, student, student_name, roll_no,
         print('[EMAIL] ALERT_EMAIL_TO not set in .env')
         return False
 
-    # ── Build recipient list ──────────────────────────────────────────────────
+    # ΓöÇΓöÇ Build recipient list ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
     from classroom_monitor.constants import LABEL_MAP
     label = LABEL_MAP.get(det_type, det_type.replace('_', ' ').title())
 
@@ -1244,16 +1512,16 @@ def _send_incident_email(incident, student, student_name, roll_no,
         if parent_email and parent_email not in recipients:
             recipients.append(parent_email)
 
-    # ── Build email ───────────────────────────────────────────────────────────
+    # ΓöÇΓöÇ Build email ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
     cam_name  = incident.camera.name if incident.camera else 'Unknown'
     timestamp = timezone.now().strftime('%d %b %Y %H:%M:%S')
 
     if student:
-        subject = f'⚠️ Classroom Alert: {label} — {student_name} ({roll_no})'
+        subject = f'ΓÜá∩╕Å Classroom Alert: {label} ΓÇö {student_name} ({roll_no})'
         body_html = f"""
 <html><body style="font-family:Arial,sans-serif;max-width:600px;margin:auto">
   <div style="background:#d32f2f;color:white;padding:16px;border-radius:6px 6px 0 0">
-    <h2 style="margin:0">⚠️ Classroom Behaviour Alert</h2>
+    <h2 style="margin:0">ΓÜá∩╕Å Classroom Behaviour Alert</h2>
   </div>
   <div style="border:1px solid #ddd;border-top:none;padding:20px;border-radius:0 0 6px 6px">
     <table style="width:100%;border-collapse:collapse">
@@ -1274,11 +1542,11 @@ def _send_incident_email(incident, student, student_name, roll_no,
   </div>
 </body></html>"""
     else:
-        subject = f'⚠️ Classroom Alert: {label} — Unknown Person'
+        subject = f'ΓÜá∩╕Å Classroom Alert: {label} ΓÇö Unknown Person'
         body_html = f"""
 <html><body style="font-family:Arial,sans-serif;max-width:600px;margin:auto">
   <div style="background:#e65100;color:white;padding:16px;border-radius:6px 6px 0 0">
-    <h2 style="margin:0">⚠️ Classroom Behaviour Alert — Unknown Person</h2>
+    <h2 style="margin:0">ΓÜá∩╕Å Classroom Behaviour Alert ΓÇö Unknown Person</h2>
   </div>
   <div style="border:1px solid #ddd;border-top:none;padding:20px;border-radius:0 0 6px 6px">
     <table style="width:100%;border-collapse:collapse">
@@ -1294,7 +1562,7 @@ def _send_incident_email(incident, student, student_name, roll_no,
   </div>
 </body></html>"""
 
-    # ── Assemble MIME ─────────────────────────────────────────────────────────
+    # ΓöÇΓöÇ Assemble MIME ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
     msg             = MIMEMultipart('related')
     msg['Subject']  = subject
     msg['From']     = smtp_user
@@ -1308,7 +1576,7 @@ def _send_incident_email(incident, student, student_name, roll_no,
                             filename=f'incident_{timezone.now().strftime("%Y%m%d_%H%M%S")}.jpg')
         msg.attach(img_part)
 
-    # ── Send ──────────────────────────────────────────────────────────────────
+    # ΓöÇΓöÇ Send ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
     try:
         context = ssl.create_default_context()
         if use_tls:
@@ -1323,7 +1591,7 @@ def _send_incident_email(incident, student, student_name, roll_no,
                 srv.login(smtp_user, smtp_pass)
                 srv.sendmail(smtp_user, recipients, msg.as_string())
 
-        print(f'[EMAIL] Sent "{subject}" → {recipients}')
+        print(f'[EMAIL] Sent "{subject}" ΓåÆ {recipients}')
         return True
 
     except Exception as e:
@@ -1331,7 +1599,7 @@ def _send_incident_email(incident, student, student_name, roll_no,
         return False
 
 
-# ── Video Upload & Analysis Views ─────────────────────────────────────────────
+# ΓöÇΓöÇ Video Upload & Analysis Views ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 
 @login_required
 def video_list(request):
@@ -1399,7 +1667,7 @@ def video_analysis_status(request, pk):
 
 
 def _analyze_video_task(video_pk):
-    """Run in a background thread — reads the video, samples frames, runs YOLO."""
+    """Run in a background thread ΓÇö reads the video, samples frames, runs YOLO."""
     import django
     from django.db import close_old_connections
     close_old_connections()
@@ -1423,7 +1691,16 @@ def _analyze_video_task(video_pk):
         # Sample one frame every 5 seconds
         sample_interval = max(1, int(src_fps * 5))
 
-        detector = _get_yolo_detector()
+        # Own detector key per video job ΓÇö this must NOT be the same
+        # detector instance used by any live camera stream (or another video
+        # job), since track_id-keyed state (keypoint/behavior history,
+        # confidence smoothing) would otherwise get cross-contaminated
+        # between unrelated people. 5-second frame sampling also means
+        # ByteTrack continuity across samples is weak regardless ΓÇö that's
+        # expected for batch analysis, but it's still important this job's
+        # track IDs never collide with a live stream's.
+        video_detector_key = f'video:{video_pk}'
+        detector = _get_yolo_detector(video_detector_key)
 
         frame_number = 0
         analyzed_count = 0
@@ -1471,14 +1748,11 @@ def _analyze_video_task(video_pk):
                     if isinstance(det, dict):
                         x1, y1, x2, y2 = det.get('bbox', (0, 0, 0, 0))
                         color = det.get('color', (0, 200, 60))
-                        base_label = det.get('label', det.get('type', ''))
-                        tid_val = det.get('track_id')
+                        label = det.get('label', det.get('type', ''))
                     else:
                         x1, y1, x2, y2 = getattr(det, 'bbox', (0, 0, 0, 0))
                         color = getattr(det, 'color', (0, 200, 60))
-                        base_label = getattr(det, 'label', '')
-                        tid_val = getattr(det, 'track_id', None)
-                    label = f"#{tid_val} {base_label}" if tid_val is not None else base_label
+                        label = getattr(det, 'label', '')
                     cv2.rectangle(annotated, (x1, y1), (x2, y2), color, 2)
                     cv2.putText(annotated, label, (x1 + 2, max(y1 - 6, 14)),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
@@ -1538,5 +1812,10 @@ def _analyze_video_task(video_pk):
             from django.db import close_old_connections as _cc2
             _cc2()
             ClassroomVideo.objects.filter(pk=video_pk).update(status='failed')
+        except Exception:
+            pass
+    finally:
+        try:
+            _release_yolo_detector(f'video:{video_pk}')
         except Exception:
             pass
