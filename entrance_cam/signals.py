@@ -8,42 +8,22 @@ from django.dispatch import receiver
 from django.contrib.auth.models import User
 import os
 import json
+import threading
 
 from .models import Student
 
 
-# ── Signal 1: Face encoding ───────────────────────────────────────────────────
+def process_face_encoding(student_pk):
+    """Process face encoding in a background thread to avoid blocking requests."""
+    try:
+        instance = Student.objects.get(pk=student_pk)
+    except Student.DoesNotExist:
+        return
 
-@receiver(post_save, sender=Student)
-def generate_face_encoding_on_photo_upload(sender, instance, created, **kwargs):
-    """
-    Regenerate the face encoding whenever a student record is saved with a photo.
-
-    Rules:
-    - On CREATE  : always generate if photo is present.
-    - On UPDATE  : regenerate only if the photo field has actually changed
-                   (avoids unnecessary re-encoding on every admin save).
-    - Uses Student.objects.filter().update() so post_save is NOT re-fired.
-    - Marks student as is_enrolled=True only if encoding generated successfully
-    """
     if not instance.photo:
         # No photo — mark as not enrolled
         Student.objects.filter(pk=instance.pk).update(is_enrolled=False)
         return
-
-    # ── Decide whether to (re)generate ───────────────────────────────────────
-    if not created:
-        try:
-            db_photo = (Student.objects
-                        .filter(pk=instance.pk)
-                        .values_list('photo', flat=True)
-                        .first())
-            photo_unchanged  = (db_photo == instance.photo.name)
-            encoding_exists  = bool(instance.face_encoding and instance.face_encoding.strip())
-            if photo_unchanged and encoding_exists:
-                return  # Photo and encoding both current — nothing to do
-        except Exception:
-            pass  # On any error fall through and regenerate to be safe
 
     # ── Load face_recognition ONLY WHEN NEEDED ─────────────────────────────────
     try:
@@ -98,14 +78,49 @@ def generate_face_encoding_on_photo_upload(sender, instance, created, **kwargs):
             is_enrolled=True  # ← Mark as successfully enrolled
         )
 
-        action = 'generated' if created else 'updated'
-        success_msg = f"[OK] Face encoding {action} for {instance.name} (pk={instance.pk}) — ENROLLED ✓"
+        success_msg = f"[OK] Face encoding generated for {instance.name} (pk={instance.pk}) — ENROLLED ✓"
         print(success_msg)
 
     except Exception as e:
         error_msg = f"[ERROR] Failed to encode face for {instance.name}: {e}"
         print(error_msg)
         Student.objects.filter(pk=instance.pk).update(is_enrolled=False)
+
+
+# ── Signal 1: Face encoding ───────────────────────────────────────────────────
+
+@receiver(post_save, sender=Student)
+def generate_face_encoding_on_photo_upload(sender, instance, created, **kwargs):
+    """
+    Regenerate the face encoding whenever a student record is saved with a photo.
+    Runs in a background thread to avoid blocking the HTTP request.
+    """
+    if not instance.photo:
+        # No photo — mark as not enrolled immediately
+        Student.objects.filter(pk=instance.pk).update(is_enrolled=False)
+        return
+
+    # Check if we need to regenerate
+    if not created:
+        try:
+            db_photo = (Student.objects
+                        .filter(pk=instance.pk)
+                        .values_list('photo', flat=True)
+                        .first())
+            photo_unchanged = (db_photo == instance.photo.name)
+            encoding_exists = bool(instance.face_encoding and instance.face_encoding.strip())
+            if photo_unchanged and encoding_exists:
+                return  # Nothing to do
+        except Exception:
+            pass
+
+    # Launch face encoding in a background thread
+    thread = threading.Thread(
+        target=process_face_encoding,
+        args=(instance.pk,),
+        daemon=True
+    )
+    thread.start()
 
 
 # ── Signal 2: Auto-create User account ───────────────────────────────────────

@@ -189,7 +189,15 @@ def student_add(request):
         form = StudentForm(request.POST, request.FILES)
         if form.is_valid():
             student = form.save()
-            messages.success(request, f'Student "{student.name}" added. Face encoding will be generated automatically.')
+            # Calculate the generated username and password
+            username = student.email
+            password = student.branch.lower() + student.roll_no
+            # Show success message with login credentials
+            messages.success(
+                request,
+                f'Student "{student.name}" added successfully! '
+                f'Login credentials — Username: {username}, Password: {password}'
+            )
             return redirect('student_list')
     else:
         form = StudentForm()

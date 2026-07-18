@@ -39,7 +39,7 @@ class SharedHelpers:
     def point_near_book(pt, bbox_h: float, book_detections: List[Tuple]) -> bool:
         for (bx1, by1, bx2, by2, _) in book_detections:
             bc = np.array([(bx1 + bx2) / 2.0, (by1 + by2) / 2.0])
-            if np.linalg.norm(np.array(pt) - bc) / bbox_h < 0.3:
+            if np.linalg.norm(np.array(pt) - bc) / bbox_h < 0.22:
                 return True
         return False
 
@@ -104,6 +104,38 @@ class SharedHelpers:
         confidence = min(total_variance / 800, 0.95)
         return is_writing, confidence
 
+    @staticmethod
+    def wrist_motion_variance_raw(person: TrackedPerson) -> Tuple[bool, float]:
+        """Like calculate_wrist_motion_variance, but returns the actual
+        variance value (and whether enough history exists to trust it)
+        instead of an is-this-obviously-writing verdict. Lets a caller
+        require genuine STILLNESS — a much lower bar than "not obviously
+        writing" — for heuristics where any real hand motion (even modest,
+        controlled handwriting strokes well under the 300 'obviously
+        writing' threshold) should rule the match out. calculate_wrist_
+        motion_variance's threshold is deliberately high so it doesn't
+        suppress real phone-object evidence on minor movement; this is
+        for the opposite case, where a POSITIVE stillness requirement is
+        what's needed instead of a suppression threshold."""
+        if len(person.keypoint_history) < 6:
+            return False, 0.0
+
+        wrist_positions = []
+        for _, kp in person.keypoint_history:
+            if kp is not None and len(kp) > 10:
+                for idx in (9, 10):
+                    if idx < len(kp):
+                        w = kp[idx]
+                        if len(w) >= 3 and w[2] >= 0.4 and w[0] != 0.0:
+                            wrist_positions.append(w[:2])
+
+        if len(wrist_positions) < 5:
+            return False, 0.0
+
+        wrist_array = np.array(wrist_positions)
+        total_variance = np.var(wrist_array[:, 0]) + np.var(wrist_array[:, 1])
+        return True, float(total_variance)
+
 
 # ── Temporal Behavior Engine ─────────────────────────────────────────────────
 class TemporalBehaviorEngine:
@@ -146,28 +178,52 @@ class TemporalBehaviorEngine:
         final_behavior = person.last_final_behavior
         history = list(person.behavior_history)
 
-        if len(history) >= 1:
+        if history:
             last = history[-1]
-            if last in ALERT_POSES or last == 'hand_raised':
-                # For alert behaviours: confirm over last N frames (majority vote)
+
+            if last == 'hand_raised':
                 n = min(self.ALERT_CONFIRM_FRAMES, len(history))
                 recent = history[-n:]
-                alert_count = sum(1 for h in recent if h == last)
-                # Confirm if ≥ 2/3 of recent frames agree (was 100% for all N)
-                if alert_count / n >= 0.67:
+                count = sum(1 for h in recent if h == last)
+                if count / n >= 0.67:
                     final_behavior = last
             else:
-                if len(history) >= self.NORMAL_CONFIRM_FRAMES:
-                    recent = history[-self.NORMAL_CONFIRM_FRAMES:]
-                    if len(set(recent)) == 1:
-                        final_behavior = recent[0]
-                    else:
-                        window = history[-8:]
-                        top_label, top_count = Counter(window).most_common(1)[0]
-                        if top_count / len(window) > 0.5:   # was 0.6
-                            final_behavior = top_label
-                else:
-                    final_behavior = last
+                # Always check every ALERT_POSES label against its own
+                # strict confirm window, regardless of what the single
+                # newest frame happened to read. Previously this only ran
+                # when `last` itself was already an alert label — so a
+                # phone-use signal that was genuinely confirmed by
+                # PhoneDetector repeatedly could still fail to ever surface
+                # here if the newest single sample happened to read
+                # "focused"/"distracted" instead, since that shunted
+                # evaluation into the looser "normal" path below, which was
+                # never meant to confirm alert labels.
+                promoted = False
+                n = min(self.ALERT_CONFIRM_FRAMES, len(history))
+                recent_alert_window = history[-n:]
+                for candidate in ALERT_POSES:
+                    count = sum(1 for h in recent_alert_window if h == candidate)
+                    if count / n >= 0.67:
+                        final_behavior = candidate
+                        promoted = True
+                        break  # at most one alert label dominates a window
+
+                # Only reachable if no alert label was just confirmed above.
+                # Handles focused/distracted/not_visible — and can never
+                # itself promote an ALERT_POSES label, that's Step 1's job
+                # at Step 1's stricter bar.
+                if not promoted:
+                    if len(history) >= self.NORMAL_CONFIRM_FRAMES:
+                        recent = history[-self.NORMAL_CONFIRM_FRAMES:]
+                        if len(set(recent)) == 1 and recent[0] not in ALERT_POSES:
+                            final_behavior = recent[0]
+                        else:
+                            window = history[-8:]
+                            top_label, top_count = Counter(window).most_common(1)[0]
+                            if top_label not in ALERT_POSES and top_count / len(window) > 0.5:
+                                final_behavior = top_label
+                    elif last not in ALERT_POSES:
+                        final_behavior = last
 
         person.last_final_behavior = final_behavior
 

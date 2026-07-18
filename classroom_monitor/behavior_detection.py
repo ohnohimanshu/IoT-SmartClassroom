@@ -279,13 +279,38 @@ class ProductionStreamProcessor:
                             if head_pose == "focused":
                                 raw_behavior   = "focused"
                                 raw_confidence = 0.75
-                            elif head_pose in ("head_down", "looking_away"):
-                                if SharedHelpers.hands_near_book(person, book_dets):
+                            elif head_pose == "head_down":
+                                # "Head down" is ambiguous on pose alone —
+                                # it looks identical whether someone is
+                                # writing in a notebook or genuinely
+                                # checked out. hands_near_book() alone
+                                # isn't reliable here: COCO's "book" class
+                                # is trained on closed, standing books and
+                                # routinely misses a flat, open notebook
+                                # partly covered by a hand and pen — so it
+                                # was tagging most writing students
+                                # "Distracted" despite the override existing.
+                                # Reuse the same wrist-motion-variance
+                                # signal already proven to separate writing
+                                # from phone use in PhoneDetector — a
+                                # writing hand moves in small sustained
+                                # strokes; someone genuinely idle/checked
+                                # out with their head down does not.
+                                is_writing, _ = SharedHelpers.calculate_wrist_motion_variance(person)
+                                if is_writing or SharedHelpers.hands_near_book(person, book_dets):
                                     raw_behavior   = "focused"
                                     raw_confidence = 0.70
                                 else:
                                     raw_behavior   = "distracted"
                                     raw_confidence = 0.70
+                            elif head_pose == "looking_away":
+                                # Head turned sideways, away from one's own
+                                # desk — unlike head_down, there's rarely a
+                                # legitimate "actually focused" explanation
+                                # for this, so no writing-motion exception
+                                # here.
+                                raw_behavior   = "distracted"
+                                raw_confidence = 0.70
                             elif head_pose == "not_visible":
                                 raw_behavior   = "not_visible"
                                 raw_confidence = 0.60

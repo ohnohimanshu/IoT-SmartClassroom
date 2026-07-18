@@ -9,41 +9,52 @@ class HeadPoseDetector:
     from YOLO-pose keypoints (nose, left_eye, right_eye).
 
     Design principle: a single frame of "nose dropped" or "nose offset" is
-    NORMAL classroom behavior (writing in a notebook, glancing at the board,
-    a blink, a brief head tilt). Only a SUSTAINED deviation over roughly a
-    second or more should be treated as a real signal. Every path below
-    that can classify someone as distracted requires N consecutive frames,
-    not just one.
+    NORMAL classroom behavior (writing, glancing at the board, a blink).
+    Only a SUSTAINED deviation should be treated as a real signal — but
+    real-time pose estimation is noisy frame to frame (motion blur, brief
+    confidence dips, a keypoint jittering a few pixels), so persistence is
+    tracked with LEAKY counters: a match increments, a miss only decays by
+    one instead of resetting to zero. This tolerates the occasional bad
+    frame in the middle of genuinely sustained behavior, unlike a strict
+    consecutive-frame counter which one noisy frame can wipe out entirely.
     """
 
     # Keypoint confidence required to trust a landmark.
     LOW_CONFIDENCE_THRESHOLD = 0.5
 
-    # Frame counts (not seconds) a pose must persist before it's reported.
-    # At process_fps frames/sec, N frames ~= N / process_fps seconds.
-    # ProductionStreamProcessor runs at process_fps=10, so 15 frames ~= 1.5s.
-    # If you change process_fps, scale these proportionally.
-    HEAD_DOWN_CONSECUTIVE_FRAMES = 15
-    LOOKING_AWAY_CONSECUTIVE_FRAMES = 15
+    # Leaky-counter thresholds (not raw frame counts — see class docstring).
+    # At process_fps=10, ~10 net frames of "credit" roughly corresponds to
+    # ~1s of real sustained behavior, tolerant of the odd noisy frame.
+    HEAD_DOWN_THRESHOLD = 10
+    LOOKING_AWAY_THRESHOLD = 10
+    COUNTER_CAP = 20  # prevents unbounded buildup while someone stays down/away
 
     # Yaw: nose horizontal offset from eye-center, relative to inter-eye
     # distance. Looking at a side-mounted board, or just a normal seated
     # angle relative to the camera, commonly produces yaw in the 0.35-0.55
-    # range — that is NOT looking away. Keep this high enough to only catch
-    # a genuine turn of the head away from the front of the room.
+    # range — that is NOT looking away.
     YAW_LOOKING_AWAY_RATIO = 0.65
 
     # Pitch: nose vertical drop below the eye-line, relative to inter-eye
-    # distance. Writing in a notebook produces a real, sustained pitch drop
-    # that looks identical to "distracted head down" from pose alone — the
-    # consecutive-frame requirement above is what keeps a normal 1-2s glance
-    # down from being flagged, while a student who stays down (phone, doze,
-    # prolonged disengagement) still gets caught.
+    # distance. Writing produces a real, sustained pitch drop that looks
+    # identical to "distracted head down" from pose alone.
     PITCH_HEAD_DOWN_RATIO = 0.6
 
     def __init__(self):
         self.head_down_counters = {}
         self.looking_away_counters = {}
+
+    @classmethod
+    def _leaky_update(cls, counters: dict, tid, matched: bool, threshold: int) -> bool:
+        """Increment on match, decay by 1 on miss (floor 0). Returns True
+        once the counter has crossed `threshold`."""
+        val = counters.get(tid, 0)
+        val = min(val + 1, cls.COUNTER_CAP) if matched else max(val - 1, 0)
+        if val == 0:
+            counters.pop(tid, None)
+        else:
+            counters[tid] = val
+        return val >= threshold
 
     def calculate_head_pose(self, person: TrackedPerson) -> str:
         kp = person.keypoints
@@ -60,11 +71,11 @@ class HeadPoseDetector:
             right_eye_ok = right_eye[2] >= self.LOW_CONFIDENCE_THRESHOLD and right_eye[0] != 0.0
 
             # Head hidden / face down far enough that eyes aren't visible.
-            # This is a strong signal, but still require sustained duration.
             head_down_suspected = (not nose_ok) or (not left_eye_ok and not right_eye_ok)
             if head_down_suspected:
-                self.looking_away_counters.pop(tid, None)
-                return self._bump(self.head_down_counters, tid, self.HEAD_DOWN_CONSECUTIVE_FRAMES, 'head_down')
+                self._leaky_update(self.looking_away_counters, tid, False, self.LOOKING_AWAY_THRESHOLD)
+                is_down = self._leaky_update(self.head_down_counters, tid, True, self.HEAD_DOWN_THRESHOLD)
+                return 'head_down' if is_down else 'focused'
 
             if left_eye_ok and right_eye_ok:
                 inter_eye = np.linalg.norm(left_eye[:2] - right_eye[:2])
@@ -76,40 +87,29 @@ class HeadPoseDetector:
 
                     bbox_h = person.bbox[3] - person.bbox[1]
                     is_profile = bbox_h > 10 and inter_eye < bbox_h * 0.07
+                    is_yaw_away = yaw_ratio > self.YAW_LOOKING_AWAY_RATIO or is_profile
+                    is_pitch_down = drop_ratio > self.PITCH_HEAD_DOWN_RATIO
 
-                    if yaw_ratio > self.YAW_LOOKING_AWAY_RATIO or is_profile:
-                        self.head_down_counters.pop(tid, None)
-                        return self._bump(self.looking_away_counters, tid,
-                                           self.LOOKING_AWAY_CONSECUTIVE_FRAMES, 'looking_away')
-                    self.looking_away_counters.pop(tid, None)
+                    is_away = self._leaky_update(self.looking_away_counters, tid, is_yaw_away, self.LOOKING_AWAY_THRESHOLD)
+                    is_down = self._leaky_update(self.head_down_counters, tid, is_pitch_down, self.HEAD_DOWN_THRESHOLD)
 
-                    if drop_ratio > self.PITCH_HEAD_DOWN_RATIO:
-                        return self._bump(self.head_down_counters, tid,
-                                           self.HEAD_DOWN_CONSECUTIVE_FRAMES, 'head_down')
-                    self.head_down_counters.pop(tid, None)
+                    if is_yaw_away and is_away:
+                        return 'looking_away'
+                    if is_pitch_down and is_down:
+                        return 'head_down'
                     return 'focused'
             else:
                 # Only one eye visible — likely a turned/profile head.
-                self.head_down_counters.pop(tid, None)
-                if nose_ok:
-                    return self._bump(self.looking_away_counters, tid,
-                                       self.LOOKING_AWAY_CONSECUTIVE_FRAMES, 'looking_away')
-                self.looking_away_counters.pop(tid, None)
-                return 'focused'
+                self._leaky_update(self.head_down_counters, tid, False, self.HEAD_DOWN_THRESHOLD)
+                is_away = self._leaky_update(self.looking_away_counters, tid, nose_ok, self.LOOKING_AWAY_THRESHOLD)
+                return 'looking_away' if (nose_ok and is_away) else 'focused'
 
-            self.head_down_counters.pop(tid, None)
-            self.looking_away_counters.pop(tid, None)
+            self._leaky_update(self.head_down_counters, tid, False, self.HEAD_DOWN_THRESHOLD)
+            self._leaky_update(self.looking_away_counters, tid, False, self.LOOKING_AWAY_THRESHOLD)
             return 'focused'
         except Exception as exc:
             print(f'[HEAD] pose error track {person.track_id}: {exc}')
             return 'focused'
-
-    @staticmethod
-    def _bump(counters: dict, tid, threshold: int, label: str) -> str:
-        """Increment a track's consecutive-frame counter and only report
-        `label` once it crosses `threshold`; otherwise treat as focused."""
-        counters[tid] = counters.get(tid, 0) + 1
-        return label if counters[tid] >= threshold else 'focused'
 
     def is_head_down_like(self, person: TrackedPerson, head_pose: str) -> bool:
         if head_pose == 'head_down':

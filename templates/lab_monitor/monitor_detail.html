@@ -4,34 +4,6 @@
 {% block page_title %}Session Detail: {{ session.student.name }}{% endblock %}
 
 {% block content %}
-<style>
-  #screen-placeholder, #camera-placeholder {
-    display: flex;
-    flex-direction: column;
-    align-items: center;
-    justify-content: center;
-    padding: 3rem 2rem;
-    background: #f8fafc;
-    border: 2px dashed #cbd5e1;
-    border-radius: 8px;
-  }
-  #screen-placeholder i, #camera-placeholder i {
-    font-size: 3.5rem;
-    color: #cbd5e1;
-    margin-bottom: 1rem;
-  }
-  #screen-placeholder p, #camera-placeholder p {
-    font-size: 0.95rem;
-    color: #64748b;
-    font-weight: 500;
-    margin: 0;
-  }
-  #screen-placeholder small, #camera-placeholder small {
-    font-size: 0.8rem;
-    color: #94a3b8;
-    margin-top: 0.25rem;
-  }
-</style>
 <div class="row g-4 mb-4">
   <div class="col-12">
     <div class="stat-card">
@@ -50,13 +22,72 @@
   </div>
 </div>
 
+{% if summary %}
+<div class="row g-4 mb-4">
+  <div class="col-12">
+    <div class="stat-card">
+      <div class="section-hdr d-flex align-items-center justify-content-between">
+        <h5 class="mb-0"><i class="bi bi-clipboard-data me-2" style="color:#4f46e5"></i> Session Summary</h5>
+        {% if session.is_active %}
+        <span class="badge bg-success">Live</span>
+        {% else %}
+        <span class="badge bg-secondary">Completed</span>
+        {% endif %}
+      </div>
+
+      <div class="row g-3 my-1 mb-4">
+        <div class="col-6 col-md-3">
+          <div class="p-3 rounded-3 h-100" style="background:#eef2ff">
+            <div class="text-muted small">Duration</div>
+            <div class="fs-4 fw-bold" style="color:#4f46e5">{{ summary.duration_display }}</div>
+          </div>
+        </div>
+        <div class="col-6 col-md-3">
+          <div class="p-3 rounded-3 h-100" style="background:#ecfdf5">
+            <div class="text-muted small">Focus Rate</div>
+            <div class="fs-4 fw-bold" style="color:#059669">{{ summary.focus_percent }}%</div>
+          </div>
+        </div>
+        <div class="col-6 col-md-3">
+          <div class="p-3 rounded-3 h-100" style="background:#fef3c7">
+            <div class="text-muted small">Dominant Emotion</div>
+            <div class="fs-4 fw-bold text-capitalize" style="color:#b45309">{{ summary.dominant_emotion }}</div>
+          </div>
+        </div>
+        <div class="col-6 col-md-3">
+          <div class="p-3 rounded-3 h-100" style="background:#fee2e2">
+            <div class="text-muted small">Distraction Alerts</div>
+            <div class="fs-4 fw-bold" style="color:#dc2626">{{ summary.alert_count }}</div>
+          </div>
+        </div>
+      </div>
+
+      <div class="row g-4">
+        <div class="col-md-6">
+          <div class="text-muted small mb-2 text-center">Emotion Distribution</div>
+          <canvas id="emotion-dist-chart" style="max-height:220px"></canvas>
+        </div>
+        <div class="col-md-6">
+          <div class="text-muted small mb-2 text-center">Pose Distribution</div>
+          <canvas id="pose-dist-chart" style="max-height:220px"></canvas>
+        </div>
+      </div>
+      {{ summary.emotion_counts|json_script:"emotion-counts-data" }}
+      {{ summary.pose_counts|json_script:"pose-counts-data" }}
+    </div>
+  </div>
+</div>
+{% endif %}
+
 <div class="row g-4">
   <div class="col-lg-8">
+    {% if session.is_active %}
     <div class="stat-card mb-4">
       <div class="section-hdr">
         <h5><i class="bi bi-images me-2" style="color:#4f46e5"></i> Live Screen</h5>
       </div>
       <div style="position:relative;background:#111;border-radius:8px;overflow:hidden;min-height:300px;">
+        <video id="live-screen" autoplay playsinline muted class="w-100 d-none" style="max-height:500px;object-fit:contain;"></video>
         <img id="fallback-screen" class="w-100 d-block" style="max-height:500px;object-fit:contain;">
         <div id="screen-placeholder" style="position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;color:#aaa;font-size:0.9rem;">
           <i class="bi bi-projector" style="font-size:3rem;margin-bottom:1rem;opacity:0.4"></i>
@@ -65,6 +96,7 @@
         </div>
       </div>
     </div>
+    {% endif %}
     
     <div class="stat-card mb-4">
       <div class="section-hdr">
@@ -73,11 +105,20 @@
       <canvas id="emotion-chart" style="height:300px"></canvas>
     </div>
     
-    <div class="stat-card">
+    <div class="stat-card mb-4">
+      <div class="section-hdr">
+        <h5><i class="bi bi-person me-2" style="color:#8b5cf6"></i> Pose Over Time</h5>
+      </div>
+      <canvas id="pose-chart" style="height:300px"></canvas>
+    </div>
+    
+    {% if session.is_active %}
+    <div class="stat-card mb-4">
       <div class="section-hdr">
         <h5><i class="bi bi-camera-video me-2" style="color:#10b981"></i> Live Camera</h5>
       </div>
       <div style="position:relative;background:#111;border-radius:8px;overflow:hidden;margin-bottom:1rem;min-height:240px;">
+        <video id="live-camera" autoplay playsinline muted class="w-100 d-none" style="max-height:400px;object-fit:contain;"></video>
         <img id="fallback-camera" class="w-100 d-block" style="max-height:400px;object-fit:contain;">
         <div id="camera-placeholder" style="position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;color:#aaa;font-size:0.9rem;">
           <i class="bi bi-camera" style="font-size:3rem;margin-bottom:1rem;opacity:0.4"></i>
@@ -89,6 +130,58 @@
         <span id="pose-display" class="emotion-badge badge-neutral">Pose: Unknown</span>
       </div>
     </div>
+    {% endif %}
+
+    <div class="stat-card mb-4">
+      <div class="section-hdr">
+        <h5><i class="bi bi-camera me-2" style="color:#10b981"></i> Camera Snapshots</h5>
+      </div>
+      {% if camera_snapshots %}
+      <div class="row g-3">
+        {% for snap in camera_snapshots %}
+        <div class="col-md-4">
+          <div class="card">
+            <img src="{{ snap.image.url }}" class="card-img-top" alt="Camera Snapshot">
+            <div class="card-body">
+              <div class="small text-muted">{{ snap.timestamp|date:"Y-m-d H:i:s" }}</div>
+              <div class="d-flex gap-2 mt-1">
+                <span class="emotion-badge badge-{{ snap.emotion }}">{{ snap.emotion|capfirst }}</span>
+                <span class="emotion-badge badge-neutral">{{ snap.pose|capfirst }}</span>
+              </div>
+            </div>
+          </div>
+        </div>
+        {% endfor %}
+      </div>
+      {% else %}
+      <p class="text-muted text-center py-4">No camera snapshots</p>
+      {% endif %}
+    </div>
+
+    <div class="stat-card">
+      <div class="section-hdr">
+        <h5><i class="bi bi-images me-2" style="color:#4f46e5"></i> Screen Snapshots</h5>
+      </div>
+      {% if screenshots %}
+      <div class="row g-3">
+        {% for snap in screenshots %}
+        <div class="col-md-6">
+          <div class="card">
+            <img src="{{ snap.image.url }}" class="card-img-top" alt="Screen Snapshot">
+            <div class="card-body">
+              <div class="small text-muted">{{ snap.timestamp|date:"Y-m-d H:i:s" }}</div>
+              {% if snap.tab_title %}
+              <div class="small">{{ snap.tab_title|truncatechars:50 }}</div>
+              {% endif %}
+            </div>
+          </div>
+        </div>
+        {% endfor %}
+      </div>
+      {% else %}
+      <p class="text-muted text-center py-4">No screen snapshots</p>
+      {% endif %}
+    </div>
   </div>
   
   <div class="col-lg-4">
@@ -96,7 +189,7 @@
       <div class="section-hdr">
         <h5><i class="bi bi-list-ul me-2" style="color:#f59e0b"></i> Activity Log</h5>
       </div>
-      {% if session.activity_logs.all %}
+      {% if activity_logs %}
       <div class="data-table" style="max-height:600px;overflow-y:auto">
         <table class="table table-sm">
           <thead class="sticky-top bg-white">
@@ -106,7 +199,7 @@
             </tr>
           </thead>
           <tbody>
-            {% for log in session.activity_logs.all %}
+            {% for log in activity_logs %}
             <tr>
               <td class="text-nowrap">{{ log.timestamp|time:"H:i:s" }}</td>
               <td>
@@ -150,14 +243,16 @@ document.addEventListener('DOMContentLoaded', function() {
     console.log('Session ID:', {{ session.id }});
     console.log('Session Active:', {{ session.is_active|lower }});
     
-    const ctx = document.getElementById('emotion-chart').getContext('2d');
+    const ctxEmotion = document.getElementById('emotion-chart').getContext('2d');
+    const ctxPose = document.getElementById('pose-chart').getContext('2d');
     
     const initialSnapshots = [
-        {% for snapshot in session.camera_snapshots.all %}
+        {% for snapshot in camera_snapshots %}
         {
             timestamp: "{{ snapshot.timestamp|time:'H:i:s' }}",
             emotion: "{{ snapshot.emotion }}",
-            score: {{ snapshot.emotion_score|default:0 }}
+            score: {{ snapshot.emotion_score|default:0 }},
+            pose: "{{ snapshot.pose }}"
         }{% if not forloop.last %},{% endif %}
         {% endfor %}
     ];
@@ -168,26 +263,148 @@ document.addEventListener('DOMContentLoaded', function() {
         disgust: '#8b5cf6', unknown: '#94a3b8'
     };
     
-    let emotionChart = new Chart(ctx, {
+    const poseToValue = {
+        focused: 3,
+        looking_away: 2,
+        head_down: 1,
+        unknown: 0
+    };
+    
+    const poseToColor = {
+        focused: '#22c55e',
+        looking_away: '#f59e0b',
+        head_down: '#ef4444',
+        unknown: '#94a3b8'
+    };
+    
+    function getPoseColor(pose) {
+        return poseToColor[pose] || '#94a3b8';
+    }
+    
+    let emotionChart = new Chart(ctxEmotion, {
         type: 'line',
         data: {
-            labels: initialSnapshots.length > 0 ? initialSnapshots.map(s => s.timestamp) : [],
+            labels: initialSnapshots.map(s => s.timestamp),
             datasets: [{
-                label: 'Emotion Score',
-                data: initialSnapshots.length > 0 ? initialSnapshots.map(s => s.score * 100) : [],
+                label: 'Emotion Confidence',
+                data: initialSnapshots.map(s => s.score * 100),
                 borderColor: '#4f46e5',
                 backgroundColor: 'rgba(79, 70, 229, 0.1)',
                 fill: true,
-                tension: 0.4
+                tension: 0.35,
+                borderWidth: 2,
+                pointRadius: 2,
+                pointHoverRadius: 5,
+                pointBackgroundColor: '#4f46e5'
             }]
         },
         options: {
             responsive: true,
-            plugins: { legend: { display: false } },
-            scales: { y: { beginAtZero: true, max: 100 } }
+            interaction: { mode: 'index', intersect: false },
+            plugins: {
+                legend: { display: false },
+                tooltip: { callbacks: { label: ctx => `Confidence: ${ctx.parsed.y.toFixed(0)}%` } }
+            },
+            scales: {
+                y: { beginAtZero: true, max: 100, grid: { color: 'rgba(0,0,0,0.05)' }, title: { display: true, text: 'Confidence (%)' } },
+                x: { grid: { display: false } }
+            }
         }
     });
     
+    let poseChart = new Chart(ctxPose, {
+        type: 'line',
+        data: {
+            labels: initialSnapshots.map(s => s.timestamp),
+            datasets: [{
+                label: 'Pose',
+                data: initialSnapshots.map(s => poseToValue[s.pose] || 0),
+                borderColor: '#8b5cf6',
+                backgroundColor: 'rgba(139, 92, 246, 0.1)',
+                fill: true,
+                tension: 0.35,
+                stepped: 'before',
+                borderWidth: 2,
+                pointRadius: 3,
+                pointHoverRadius: 6,
+                pointBackgroundColor: initialSnapshots.map(s => getPoseColor(s.pose))
+            }]
+        },
+        options: {
+            responsive: true,
+            interaction: { mode: 'index', intersect: false },
+            plugins: {
+                legend: { display: false },
+                tooltip: {
+                    callbacks: {
+                        label: ctx => {
+                            const labels = ['Unknown', 'Head Down', 'Looking Away', 'Focused'];
+                            return `Pose: ${labels[ctx.parsed.y] || 'Unknown'}`;
+                        }
+                    }
+                }
+            },
+            scales: { 
+                y: { 
+                    beginAtZero: true, 
+                    max: 3,
+                    grid: { color: 'rgba(0,0,0,0.05)' },
+                    ticks: {
+                        stepSize: 1,
+                        callback: function(value) {
+                            if (value === 0) return 'Unknown';
+                            if (value === 1) return 'Head Down';
+                            if (value === 2) return 'Looking Away';
+                            if (value === 3) return 'Focused';
+                            return '';
+                        }
+                    }
+                },
+                x: { grid: { display: false } }
+            }
+        }
+    });
+    
+    // ── Professional summary distribution charts ───────────────────────────
+    const emotionCountsEl = document.getElementById('emotion-counts-data');
+    const poseCountsEl = document.getElementById('pose-counts-data');
+    if (emotionCountsEl && poseCountsEl) {
+        const emotionCounts = JSON.parse(emotionCountsEl.textContent);
+        const poseCounts = JSON.parse(poseCountsEl.textContent);
+
+        new Chart(document.getElementById('emotion-dist-chart').getContext('2d'), {
+            type: 'doughnut',
+            data: {
+                labels: Object.keys(emotionCounts).map(e => e.charAt(0).toUpperCase() + e.slice(1)),
+                datasets: [{
+                    data: Object.values(emotionCounts),
+                    backgroundColor: Object.keys(emotionCounts).map(e => emotionColors[e] || '#94a3b8'),
+                    borderWidth: 2,
+                    borderColor: '#fff'
+                }]
+            },
+            options: {
+                plugins: { legend: { position: 'bottom', labels: { boxWidth: 12, padding: 12 } } }
+            }
+        });
+
+        new Chart(document.getElementById('pose-dist-chart').getContext('2d'), {
+            type: 'doughnut',
+            data: {
+                labels: Object.keys(poseCounts).map(p => p.replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase())),
+                datasets: [{
+                    data: Object.values(poseCounts),
+                    backgroundColor: Object.keys(poseCounts).map(p => getPoseColor(p)),
+                    borderWidth: 2,
+                    borderColor: '#fff'
+                }]
+            },
+            options: {
+                plugins: { legend: { position: 'bottom', labels: { boxWidth: 12, padding: 12 } } }
+            }
+        });
+    }
+
     const sessionId = {{ session.id }};
     let peerConnection = null;
     let pollingInterval = null;
@@ -197,10 +414,39 @@ document.addEventListener('DOMContentLoaded', function() {
     const fallbackCamera = document.getElementById('fallback-camera');
     const emotionDisplay = document.getElementById('emotion-display');
     const poseDisplay = document.getElementById('pose-display');
-    
     let screenStreamId = null;
     let cameraStreamId = null;
-
+    
+    function initializeFromInitialData() {
+        if (initialSnapshots.length > 0) {
+            const latest = initialSnapshots[initialSnapshots.length - 1];
+            emotionDisplay.className = `emotion-badge badge-${latest.emotion}`;
+            emotionDisplay.textContent = `Emotion: ${latest.emotion.charAt(0).toUpperCase() + latest.emotion.slice(1)}`;
+        }
+        
+        {% with latest_screenshot=screenshots.last latest_camera=camera_snapshots.last %}
+            {% if latest_screenshot %}
+                fallbackScreen.src = "{{ latest_screenshot.image.url }}";
+                fallbackScreen.style.display = 'block';
+                document.getElementById('screen-placeholder').style.display = 'none';
+            {% endif %}
+            {% if latest_camera %}
+                fallbackCamera.src = "{{ latest_camera.image.url }}";
+                fallbackCamera.style.display = 'block';
+                document.getElementById('camera-placeholder').style.display = 'none';
+                
+                const latestPose = "{{ latest_camera.pose }}";
+                const poseLabel = latestPose.replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase());
+                const poseColor = latestPose === 'focused' ? '#22c55e'
+                    : latestPose === 'looking_away' ? '#f59e0b'
+                    : latestPose === 'head_down' ? '#ef4444' : '#94a3b8';
+                poseDisplay.style.background = poseColor + '22';
+                poseDisplay.style.color = poseColor;
+                poseDisplay.textContent = `Pose: ${poseLabel}`;
+            {% endif %}
+        {% endwith %}
+    }
+    
     async function startWebRTC() {
         try {
             console.log('Starting WebRTC connection...');
@@ -227,7 +473,6 @@ document.addEventListener('DOMContentLoaded', function() {
                     document.getElementById('camera-placeholder').style.display = 'none';
                     console.log('Camera stream attached');
                 } else {
-                    // Stream IDs not yet known — attach by arrival order
                     if (!liveScreen.srcObject) {
                         liveScreen.srcObject = stream;
                         liveScreen.style.display = 'block';
@@ -261,7 +506,7 @@ document.addEventListener('DOMContentLoaded', function() {
             peerConnection.onconnectionstatechange = () =>
                 console.log('Connection State:', peerConnection.connectionState);
             peerConnection.oniceconnectionstatechange = () =>
-                console.log('ICE State:', peerConnection.iceConnectionState);
+                console.log('ICE State:', peerConnection.iceconnectionstatechange);
 
             pollingInterval = setInterval(pollForOffer, 2000);
         } catch (e) {
@@ -350,13 +595,27 @@ document.addEventListener('DOMContentLoaded', function() {
                 if (lastLabel !== timeStr) {
                     emotionChart.data.labels.push(timeStr);
                     emotionChart.data.datasets[0].data.push(
-                        data.latest_emotion_score != null ? data.latest_emotion_score : 0
+                        data.latest_emotion_score != null ? data.latest_emotion_score * 100 : 0
                     );
-                    if (emotionChart.data.labels.length > 20) {
+                    if (emotionChart.data.labels.length > 50) {
                         emotionChart.data.labels.shift();
                         emotionChart.data.datasets[0].data.shift();
                     }
                     emotionChart.update();
+                    
+                    poseChart.data.labels.push(timeStr);
+                    poseChart.data.datasets[0].data.push(
+                        poseToValue[data.latest_pose] || 0
+                    );
+                    poseChart.data.datasets[0].pointBackgroundColor.push(
+                        getPoseColor(data.latest_pose)
+                    );
+                    if (poseChart.data.labels.length > 50) {
+                        poseChart.data.labels.shift();
+                        poseChart.data.datasets[0].data.shift();
+                        poseChart.data.datasets[0].pointBackgroundColor.shift();
+                    }
+                    poseChart.update();
                 }
             }
         } catch (e) {
@@ -364,11 +623,13 @@ document.addEventListener('DOMContentLoaded', function() {
         }
     }
     
+    initializeFromInitialData();
+    
     if ({{ session.is_active|lower }}) {
         console.log('✅ Session is active - Starting WebRTC');
         startWebRTC();
     } else {
-        console.log('⏸️  Session is not active');
+        console.log('⏸️  Session is not active - Showing historical data');
     }
     
     console.log('=== Page initialization complete ===');
