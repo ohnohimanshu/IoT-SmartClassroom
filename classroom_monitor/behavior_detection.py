@@ -58,6 +58,7 @@ class _SharedYOLOModels:
     _lock = threading.Lock()
     _pose_model = None
     _object_model = None
+    _phone_model = None
 
     @classmethod
     def get(cls):
@@ -70,7 +71,14 @@ class _SharedYOLOModels:
                     print('[OK] Shared YOLO pose + object models loaded')
                 except Exception as e:
                     print(f'[WARN] Shared YOLO model load failed: {e}')
-            return cls._pose_model, cls._object_model
+            if cls._phone_model is None:
+                try:
+                    from ultralytics import YOLO
+                    cls._phone_model = YOLO('classroom_phone_yolo.pt')
+                    print('[OK] Custom classroom phone model loaded')
+                except Exception as e:
+                    print(f'[WARN] Custom phone model load failed: {e}')
+            return cls._pose_model, cls._object_model, cls._phone_model
 
 
 # ── Production Stream Processor ──────────────────────────────────────────────
@@ -86,7 +94,7 @@ class ProductionStreamProcessor:
         self.result_buffer: deque = deque(maxlen=2)
         self.yolo_model       = None
         self.object_model     = None
-        self.roboflow_model   = None
+        self.phone_model      = None
         self.running          = False
         self.lock             = threading.Lock()
         self.stop_event       = threading.Event()
@@ -106,7 +114,7 @@ class ProductionStreamProcessor:
         self._init_fight_detector()
 
     def _ensure_models(self):
-        self.yolo_model, self.object_model = _SharedYOLOModels.get()
+        self.yolo_model, self.object_model, self.phone_model = _SharedYOLOModels.get()
 
     def _init_fight_detector(self):
         try:
@@ -170,7 +178,7 @@ class ProductionStreamProcessor:
         phone_dets, food_dets, book_dets = [], [], []
         if self.object_model is not None:
             try:
-                for result in self.object_model(frame, verbose=False, conf=0.3, iou=0.45):
+                for result in self.object_model(frame, verbose=False, conf=0.25, iou=0.45):
                     if result.boxes is None:
                         continue
                     for i in range(len(result.boxes)):
@@ -186,30 +194,30 @@ class ProductionStreamProcessor:
                             book_dets.append(det)
             except Exception as e:
                 print(f'[WARN] YOLO object detection failed: {e}')
-        if not phone_dets:
+
+        # Custom classroom-trained phone model. More reliable than the
+        # generic model's COCO 'cell phone' class for this footage (small,
+        # hand-occluded, off-angle phones). Always runs and merges with
+        # the generic model's results, skipping near-duplicate boxes,
+        # rather than only running when the generic model found nothing.
+        if self.phone_model is not None:
             try:
-                api_key = os.environ.get('ROBOFLOW_API_KEY', '')
-                if api_key:
-                    if self.roboflow_model is None:
-                        from roboflow import Roboflow
-                        rf = Roboflow(api_key=api_key)
-                        project = rf.workspace().project("classroom-cell-phone-detection")
-                        self.roboflow_model = project.version(18).model
-                        print('[OK] Roboflow model loaded')
-                    result = self.roboflow_model.predict(frame, confidence=30, overlap=30).json()
-                    for prediction in result.get('predictions', []):
-                        x1 = int(prediction['x'] - prediction['width'] / 2)
-                        y1 = int(prediction['y'] - prediction['height'] / 2)
-                        x2 = int(prediction['x'] + prediction['width'] / 2)
-                        y2 = int(prediction['y'] + prediction['height'] / 2)
-                        conf = prediction['confidence']
-                        phone_dets.append((x1, y1, x2, y2, conf))
-                    if phone_dets:
-                        print(f'[ROBOFLOW] Found {len(phone_dets)} phone(s)')
-            except ImportError:
-                print('[WARN] roboflow not installed')
+                for result in self.phone_model(frame, verbose=False, conf=0.25, iou=0.45):
+                    if result.boxes is None:
+                        continue
+                    new_count = 0
+                    for i in range(len(result.boxes)):
+                        conf = float(result.boxes.conf[i])
+                        x1, y1, x2, y2 = map(int, result.boxes.xyxy[i])
+                        is_dup = any(abs(x1 - ex1) < 25 and abs(y1 - ey1) < 25
+                                     for (ex1, ey1, ex2, ey2, _) in phone_dets)
+                        if not is_dup:
+                            phone_dets.append((x1, y1, x2, y2, conf))
+                            new_count += 1
+                    if new_count:
+                        print(f'[PHONE-MODEL] Found {new_count} additional phone(s)')
             except Exception as e:
-                print(f'[WARN] Roboflow failed: {e}')
+                print(f'[WARN] Custom phone model failed: {e}')
         return phone_dets, food_dets, book_dets
 
     def _parse_pose_detections(self, frame: np.ndarray):
@@ -279,38 +287,13 @@ class ProductionStreamProcessor:
                             if head_pose == "focused":
                                 raw_behavior   = "focused"
                                 raw_confidence = 0.75
-                            elif head_pose == "head_down":
-                                # "Head down" is ambiguous on pose alone —
-                                # it looks identical whether someone is
-                                # writing in a notebook or genuinely
-                                # checked out. hands_near_book() alone
-                                # isn't reliable here: COCO's "book" class
-                                # is trained on closed, standing books and
-                                # routinely misses a flat, open notebook
-                                # partly covered by a hand and pen — so it
-                                # was tagging most writing students
-                                # "Distracted" despite the override existing.
-                                # Reuse the same wrist-motion-variance
-                                # signal already proven to separate writing
-                                # from phone use in PhoneDetector — a
-                                # writing hand moves in small sustained
-                                # strokes; someone genuinely idle/checked
-                                # out with their head down does not.
-                                is_writing, _ = SharedHelpers.calculate_wrist_motion_variance(person)
-                                if is_writing or SharedHelpers.hands_near_book(person, book_dets):
+                            elif head_pose in ("head_down", "looking_away"):
+                                if SharedHelpers.hands_near_book(person, book_dets):
                                     raw_behavior   = "focused"
                                     raw_confidence = 0.70
                                 else:
                                     raw_behavior   = "distracted"
                                     raw_confidence = 0.70
-                            elif head_pose == "looking_away":
-                                # Head turned sideways, away from one's own
-                                # desk — unlike head_down, there's rarely a
-                                # legitimate "actually focused" explanation
-                                # for this, so no writing-motion exception
-                                # here.
-                                raw_behavior   = "distracted"
-                                raw_confidence = 0.70
                             elif head_pose == "not_visible":
                                 raw_behavior   = "not_visible"
                                 raw_confidence = 0.60
