@@ -288,7 +288,17 @@ class ProductionStreamProcessor:
                                 raw_behavior   = "focused"
                                 raw_confidence = 0.75
                             elif head_pose in ("head_down", "looking_away"):
-                                if SharedHelpers.hands_near_book(person, book_dets):
+                                # hands_near_book relies on COCO's generic "book" class,
+                                # which essentially never fires on an open notebook/notepad
+                                # at a normal writing angle -- so this veto almost never
+                                # actually confirms real writing, and writers with head
+                                # down get mislabeled "distracted" by default. Wrist-motion
+                                # variance (already computed for phone-vs-writing
+                                # disambiguation elsewhere) is a much more reliable signal
+                                # here: real handwriting produces small, repetitive wrist
+                                # motion that phone-holding or idle hands don't.
+                                is_writing_motion, _ = SharedHelpers.calculate_wrist_motion_variance(person)
+                                if SharedHelpers.hands_near_book(person, book_dets) or is_writing_motion:
                                     raw_behavior   = "focused"
                                     raw_confidence = 0.70
                                 else:

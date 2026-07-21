@@ -6,38 +6,45 @@ from classroom_monitor.head_pose_detection import HeadPoseDetector
 
 class PhoneDetector:
     """
-    Two independent detection paths:
+    Single detection path: real object evidence only.
 
-    Path 1 - YOLO actually detected a phone-shaped object near a hand.
-             Real visual evidence, needs only light smoothing.
+    A phone-shaped object (from your trained classroom_phone_yolo model,
+    or any other detector feeding phone_detections) was seen near a hand.
+    Confirmed over a short leaky-counter window for light smoothing
+    against one-off misdetections, but the underlying signal is always
+    real visual evidence — never a pose-only guess.
 
-    Path 2 - No phone object seen; guess from hand position + head pose
-             alone. Inherently ambiguous — a hand holding a notebook in
-             the lap (no desk in frame) looks geometrically identical to a
-             hand holding a phone in the lap. Persistence is required
-             before this is trusted, and the book/notebook veto matters.
+    Path 2 (guessing phone-vs-writing from wrist position + head pose
+    alone, with no object seen) was removed. It was firing on ordinary
+    writing far more often than on real phone use: it relied on a
+    book/notebook proximity veto to tell the two apart, but that veto
+    depends on COCO's generic "book" class, which essentially never
+    detects an open spiral notebook or notepad at a normal writing angle.
+    With that veto not actually vetoing anything, "wrist in torso/lap
+    zone, head down" matched writing students just as easily as phone
+    users, producing false "Using Phone" labels. Since a real trained
+    phone detector exists (Path 1) and is reliable, it isn't worth
+    keeping an ambiguous fallback that produced more false positives
+    than confirmed true positives.
 
-    Persistence on both paths uses LEAKY counters (decay by 1 on a miss,
-    not reset to 0) rather than strict consecutive-frame counters. Pose
-    estimation is noisy frame to frame, and a hard reset means one bad
-    frame in the middle of five seconds of real phone use can wipe out
-    the whole streak and the behavior never confirms.
+    Persistence uses a LEAKY counter (decay by 1 on a miss, not reset to
+    0) rather than a strict consecutive-frame counter. Pose/detector
+    output is noisy frame to frame, and a hard reset means one bad frame
+    in the middle of sustained real phone use can wipe out the whole
+    streak and the behavior never confirms.
     """
 
-    PHONE_LAP_HEIGHT_FRACTION  = 0.65   # wrist must be genuinely low (lap), not mid-torso
-    PHONE_CUPPED_SPREAD_MAX    = 0.20   # tight-ish cupped grip — open notebook has notably wider spread
-    PHONE_SINGLE_HAND_Y_MIN    = 0.45   # wrist-relative-y above this = torso zone
-    PHONE_SINGLE_HAND_Y_MAX    = 0.85
-
-    # Leaky-counter thresholds. At process_fps=10, ~6 net frames of
-    # "credit" is roughly ~0.6s of real sustained heuristic match.
-    HEURISTIC_THRESHOLD = 6
+    # Leaky-counter threshold. At process_fps=10, ~2 net frames of
+    # "credit" is roughly ~0.2s of real sustained match — short since
+    # Path 1 evidence is already real object detections, not a guess.
     YOLO_HIT_THRESHOLD = 2
     COUNTER_CAP = 20
 
     def __init__(self):
+        # Retained for API compatibility (head-pose based callers/signature
+        # elsewhere); no longer used for phone-vs-writing disambiguation
+        # since Path 2 was removed.
         self.head_pose_detector = HeadPoseDetector()
-        self._heuristic_counters = {}
         self._yolo_counters = {}
 
     @classmethod
@@ -52,7 +59,10 @@ class PhoneDetector:
 
     def detect_phone_usage(self, person: TrackedPerson, phone_detections: List[Tuple],
                            head_pose: str, book_detections: Optional[List[Tuple]] = None) -> Tuple[bool, float]:
-        book_detections = book_detections or []
+        # book_detections / head_pose kept in the signature for backward
+        # compatibility with the caller in behavior_detection.py, but are
+        # no longer used now that Path 2 (the only place that consumed
+        # them) has been removed.
         x1, y1, x2, y2 = person.bbox
         bbox_h = y2 - y1
         bbox_w = x2 - x1
@@ -60,23 +70,10 @@ class PhoneDetector:
         if bbox_h <= 0 or bbox_w <= 0:
             return False, 0.0
 
-        # Suppress phone detection when there is clear, high-variance writing motion
-        is_writing, _ = SharedHelpers.calculate_wrist_motion_variance(person)
-        if is_writing:
-            self._leaky_update(self._heuristic_counters, tid, False, self.HEURISTIC_THRESHOLD)
-            self._leaky_update(self._yolo_counters, tid, False, self.YOLO_HIT_THRESHOLD)
-            return False, 0.0
-
-        head_is_down = (head_pose in ('head_down', 'looking_away')) or \
-                       self.head_pose_detector.is_head_down_like(person, head_pose)
-
-        def _book_near(pt) -> bool:
-            return SharedHelpers.point_near_book(pt, bbox_h, book_detections)
-
         def _wrist_ok(w, min_conf=0.4) -> bool:
             return w is not None and len(w) >= 3 and w[2] >= min_conf and w[0] != 0.0
 
-        # ── Path 1: YOLO detected a phone object ─────────────────────────────
+        # ── Path 1: real object evidence (only remaining path) ───────────────
         yolo_hit_conf = None
         if phone_detections:
             for (px1, py1, px2, py2, conf) in phone_detections:
@@ -116,67 +113,8 @@ class PhoneDetector:
                     break
 
         yolo_confirmed = self._leaky_update(self._yolo_counters, tid, yolo_hit_conf is not None, self.YOLO_HIT_THRESHOLD)
-        if yolo_hit_conf is not None:
-            self._leaky_update(self._heuristic_counters, tid, False, self.HEURISTIC_THRESHOLD)
-            if yolo_confirmed:
-                print(f'[PHONE] Person {tid}: YOLO phone confirmed, conf={yolo_hit_conf:.2f}')
-                return True, yolo_hit_conf
-            return False, 0.0
-
-        # ── Path 2: Heuristic (no YOLO phone, use pose only) ─────────────────
-        if person.keypoints is None or person.keypoints.size == 0 or len(person.keypoints) <= 10:
-            self._leaky_update(self._heuristic_counters, tid, False, self.HEURISTIC_THRESHOLD)
-            return False, 0.0
-
-        try:
-            left_wrist  = person.keypoints[9]
-            right_wrist = person.keypoints[10]
-            lap_thresh  = y1 + bbox_h * self.PHONE_LAP_HEIGHT_FRACTION
-
-            wrist_pts = [w[:2] for w in (left_wrist, right_wrist) if _wrist_ok(w, 0.5)]
-            both_wrists_for_veto = [w[:2] for w in (left_wrist, right_wrist) if _wrist_ok(w, 0.4)]
-
-            if not wrist_pts:
-                self._leaky_update(self._heuristic_counters, tid, False, self.HEURISTIC_THRESHOLD)
-                return False, 0.0
-
-            heuristic_matched = False
-            match_conf = 0.0
-
-            if head_is_down and len(wrist_pts) >= 1:
-                for w in wrist_pts:
-                    rel_y = (w[1] - y1) / bbox_h
-                    rel_x_offset = abs(w[0] - (x1 + x2) / 2.0) / bbox_w
-
-                    # Wrist in torso-to-lap zone, centred (not off to the
-                    # side reaching for something), and not near a book.
-                    # No separate "desk level" cutoff here: in rooms
-                    # without desks, a genuine phone-in-lap grip sits in
-                    # exactly the same low zone that cutoff was meant to
-                    # exclude as "writing at a desk" — the book-proximity
-                    # check below is the more reliable signal for that.
-                    if (self.PHONE_SINGLE_HAND_Y_MIN <= rel_y <= self.PHONE_SINGLE_HAND_Y_MAX
-                            and rel_x_offset < 0.35
-                            and not any(_book_near(p) for p in both_wrists_for_veto)):
-                        heuristic_matched = True
-                        match_conf = 0.60
-                        break
-
-            if not heuristic_matched and head_is_down and len(wrist_pts) == 2:
-                both_low = all(w[1] > lap_thresh for w in wrist_pts)
-                spread   = np.linalg.norm(wrist_pts[0] - wrist_pts[1]) / bbox_h
-                if both_low and spread < self.PHONE_CUPPED_SPREAD_MAX:
-                    if not any(_book_near(p) for p in both_wrists_for_veto):
-                        heuristic_matched = True
-                        match_conf = 0.55
-
-            confirmed = self._leaky_update(self._heuristic_counters, tid, heuristic_matched, self.HEURISTIC_THRESHOLD)
-            if heuristic_matched and confirmed:
-                print(f'[PHONE] Person {tid}: sustained pose heuristic match, conf={match_conf:.2f}')
-                return True, match_conf
-            return False, 0.0
-
-        except Exception as exc:
-            print(f'[PHONE] Heuristic error: {exc}')
+        if yolo_hit_conf is not None and yolo_confirmed:
+            print(f'[PHONE] Person {tid}: YOLO phone confirmed, conf={yolo_hit_conf:.2f}')
+            return True, yolo_hit_conf
 
         return False, 0.0
