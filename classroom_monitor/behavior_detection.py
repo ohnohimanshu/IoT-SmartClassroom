@@ -59,6 +59,7 @@ class _SharedYOLOModels:
     _pose_model = None
     _object_model = None
     _phone_model = None
+    _phone_model_attempted = False
 
     @classmethod
     def get(cls):
@@ -71,11 +72,29 @@ class _SharedYOLOModels:
                     print('[OK] Shared YOLO pose + object models loaded')
                 except Exception as e:
                     print(f'[WARN] Shared YOLO model load failed: {e}')
-            if cls._phone_model is None:
+            if cls._phone_model is None and not cls._phone_model_attempted:
+                # Only attempt this once per process — previously this
+                # retried (and re-printed a warning) on every single
+                # detector construction, which is why the log was full of
+                # repeated "Custom phone model load failed" lines.
+                cls._phone_model_attempted = True
                 try:
                     from ultralytics import YOLO
-                    cls._phone_model = YOLO('classroom_phone_yolo.pt')
-                    print('[OK] Custom classroom phone model loaded')
+                    # CLASSROOM_PHONE_MODEL_PATH must actually be read here
+                    # — a bare 'classroom_phone_yolo.pt' filename (no env
+                    # var lookup) was silently ignoring any path set in
+                    # .env/docker-compose, which is why that setting had no
+                    # effect no matter what it was set to.
+                    path = os.environ.get(
+                        'CLASSROOM_PHONE_MODEL_PATH',
+                        os.path.join(os.path.dirname(__file__), 'model_weights', 'classroom_phone_yolo.pt'),
+                    )
+                    if os.path.exists(path):
+                        cls._phone_model = YOLO(path)
+                        print(f'[OK] Custom classroom phone model loaded from {path}')
+                    else:
+                        print(f'[WARN] Custom phone model not found at {path} — '
+                              f'set CLASSROOM_PHONE_MODEL_PATH or place the file there')
                 except Exception as e:
                     print(f'[WARN] Custom phone model load failed: {e}')
             return cls._pose_model, cls._object_model, cls._phone_model
