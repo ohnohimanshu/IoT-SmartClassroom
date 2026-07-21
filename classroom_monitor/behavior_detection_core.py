@@ -97,11 +97,10 @@ class SharedHelpers:
         wrist_array = np.array(wrist_positions)
         variance_x = np.var(wrist_array[:, 0])
         variance_y = np.var(wrist_array[:, 1])
-        total_variance = variance_x + variance_y
-
-        # Higher threshold so we don't suppress phone detection due to slight movement
-        is_writing = total_variance > 300   # was 150 — too aggressive
-        confidence = min(total_variance / 800, 0.95)
+        bbox_h = person.bbox[3] - person.bbox[1]
+        normalized_variance = (variance_x + variance_y) / max(bbox_h ** 2, 1)
+        is_writing = normalized_variance > 0.0015   # start here, tune against your footage
+        confidence = min(normalized_variance / 0.004, 0.95)
         return is_writing, confidence
 
 
@@ -114,13 +113,14 @@ class TemporalBehaviorEngine:
 
     def __init__(self):
         self.tracked_people: Dict[int, TrackedPerson] = {}
-        self.cleanup_threshold = 2.0
+        self.cleanup_threshold = 8.0
         self.low_confidence_counters: Dict[int, int] = {}
         self.lock = threading.Lock()
 
     def update_person(self, track_id: int, bbox: Tuple, keypoints: Optional[np.ndarray], timestamp: float):
         with self.lock:
             if track_id not in self.tracked_people:
+                print(f'[TRACK] New track_id {track_id} created')
                 p = TrackedPerson(
                     track_id=track_id, bbox=bbox, keypoints=keypoints, last_seen=timestamp)
                 self.tracked_people[track_id] = p

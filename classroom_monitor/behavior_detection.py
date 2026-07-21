@@ -122,6 +122,8 @@ class ProductionStreamProcessor:
         self.person_tracks: List[Tuple] = []
         self.behavior_engine  = TemporalBehaviorEngine()
         self.fight_detector   = None
+        track_buffer_frames = 60          # must match bytetrack_classroom.yaml's track_buffer
+        self.behavior_engine.cleanup_threshold = (track_buffer_frames / process_fps) + 1.0
 
         # Initialize modular detectors
         self.head_pose_detector = HeadPoseDetector()
@@ -244,7 +246,7 @@ class ProductionStreamProcessor:
         if self.yolo_model is None:
             return tracks
         try:
-            for result in self.yolo_model.track(frame, persist=True, verbose=False, conf=0.3, iou=0.5, tracker='bytetrack.yaml'):
+            for result in self.yolo_model.track(frame, persist=True, verbose=False, conf=0.1, iou=0.5, tracker='bytetrack_classroom.yaml'):
                 if result.boxes is None:
                     continue
                 kp_list = result.keypoints if hasattr(result, 'keypoints') else None
@@ -359,6 +361,10 @@ class ProductionStreamProcessor:
                 self.result_buffer.append((timestamp, frame.copy(), final_results))
         except Exception as e:
             print(f'[ERROR] Frame processing: {e}')
+        finally:
+            elapsed = time.time() - t0
+            if elapsed > self.frame_interval * 1.5:
+                print(f'[PERF] Frame processing took {elapsed:.2f}s (target {self.frame_interval:.2f}s) — falling behind')
 
     def start(self, camera_url: str):
         if self.running:
