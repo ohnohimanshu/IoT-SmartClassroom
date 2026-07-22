@@ -443,12 +443,25 @@ class ClassroomBehaviorDetector:
             print(f'[WARN] Could not load students: {e}')
             self.known_students = []
 
-    def detect(self, frame) -> List[Dict]:
+    def detect(self, frame, person_tracks=None) -> List[Dict]:
+        """
+        `person_tracks` lets a caller pass in tracks already computed by a
+        higher-frequency pose worker instead of having this method call
+        `.track()` again itself. Two independent callers each calling
+        `.track(persist=True)` on the same shared ByteTrack tracker — one
+        from a pose loop, one from here — can feed it frames out of
+        chronological order (this path is much slower per-call, since it
+        also runs the phone/food/book models), which corrupts ByteTrack's
+        motion prediction and causes constant track ID reassignment. Pass
+        `person_tracks=None` only for callers that don't also run a
+        separate pose-tracking loop against the same detector.
+        """
         if self.processor.yolo_model is None:
             return []
         try:
             timestamp     = time.time()
-            person_tracks = self.processor._parse_pose_detections(frame)
+            if person_tracks is None:
+                person_tracks = self.processor._parse_pose_detections(frame)
             phone_dets, food_dets, book_dets = self.processor._parse_object_detections(frame)
             det_objs = self.processor._run_behavior_evaluation(frame, person_tracks, phone_dets, food_dets, book_dets, timestamp)
             detections = []

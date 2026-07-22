@@ -563,158 +563,45 @@ def _release_yolo_detector(key: str):
 @login_required
 def live_stream(request, camera_id):
     """
-    Simple MJPEG proxy ΓÇö reads directly from the camera via OpenCV and
-    streams annotated frames to the browser.  The heavy behavior-detection
-    pipeline runs in a background thread; if it fails for any reason the
-    stream still keeps delivering raw frames so the modal always shows video.
+    MJPEG proxy for a live classroom camera.
+
+    This used to contain its own minimal single-worker pipeline that only
+    called into the ByteTrack tracker (via detector.detect()) once every
+    ~12 frames (~2fps at 25fps source) and with no lock protecting the
+    shared tracker object. That gap is far too sparse for ByteTrack's
+    IoU-based frame-to-frame matching to hold onto an ID â€” a person only
+    has to move a normal amount between two tracker calls half a second
+    apart to fall outside match_thresh, so track IDs were being
+    reassigned constantly. Since every persistence check in this codebase
+    (phone, distraction, hand-raise, alerts) is keyed by track_id and
+    requires several consecutive/majority frames on the *same* ID, none of
+    it could ever confirm.
+
+    _generate_video_stream() below already implements the correct fix (an
+    ~8fps pose worker that feeds the tracker frequently enough to keep IDs
+    stable, with a lock around all tracker access) but was never actually
+    wired up to a URL. Delegate to it here instead of keeping two
+    divergent implementations.
     """
-    import logging
-    import threading
-    import queue as _q
-    import time as _time
-
-    _log = logging.getLogger(__name__)
-
-    # Manual auth check ΓÇö avoids redirect (302) that makes <img> fire onerror
     if not request.user.is_authenticated:
         from django.http import HttpResponse
         return HttpResponse(status=401)
 
     camera = get_object_or_404(ClassroomCamera, pk=camera_id)
-
-    def _stream():
-        url = camera.url.strip()
-        try:
-            src = int(url) if url.isdigit() else url
-        except Exception:
-            src = url
-
-        if isinstance(src, str) and src.lower().startswith('http'):
-            cap = MJPEGCapture(src)
-        else:
-            cap = cv2.VideoCapture(src)
-            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-
-        if not cap.isOpened():
-            err = np.zeros((240, 480, 3), dtype=np.uint8)
-            cv2.putText(err, 'Camera unavailable', (60, 110),
-                        cv2.FONT_HERSHEY_SIMPLEX, 1.0, (80, 80, 255), 2)
-            cv2.putText(err, url[:60], (20, 160),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (180, 180, 180), 1)
-            _, buf = cv2.imencode('.jpg', err)
-            yield (b'--frame\r\nContent-Type: image/jpeg\r\n\r\n'
-                   + buf.tobytes() + b'\r\n')
-            return
-
-        detector = None
-        try:
-            detector = _get_yolo_detector(f'camera:{camera_id}')
-        except Exception as e:
-            _log.warning(f'[STREAM] detector unavailable: {e}')
-
-        result_lock = threading.Lock()
-        latest_dets: list = []
-        detect_q = _q.Queue(maxsize=1)
-        stop_ev = threading.Event()
-
-        def _det_worker():
-            while not stop_ev.is_set():
-                try:
-                    frm = detect_q.get(timeout=0.5)
-                except _q.Empty:
-                    continue
-                try:
-                    dets = detector.detect(frm) if detector else []
-                    with result_lock:
-                        latest_dets.clear()
-                        latest_dets.extend(dets)
-                except Exception as exc:
-                    _log.debug(f'[DET] {exc}')
-
-        det_thread = threading.Thread(target=_det_worker, daemon=True)
-        det_thread.start()
-
-        src_fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
-        frame_delay = 1.0 / min(src_fps, 25.0)
-        heavy_every = max(1, int(src_fps // 2))
-        fc = 0
-        last_yield = _time.monotonic()
-        consecutive_errors = 0
-
-        try:
-            while True:
-                ret, frame = cap.read()
-                if not ret or frame is None:
-                    consecutive_errors += 1
-                    if consecutive_errors > 10:
-                        break
-                    _time.sleep(0.05)
-                    continue
-                consecutive_errors = 0
-                fc += 1
-
-                if fc % heavy_every == 0:
-                    try:
-                        detect_q.put_nowait(frame.copy())
-                    except _q.Full:
-                        pass
-
-                try:
-                    with result_lock:
-                        dets = list(latest_dets)
-                    annotated = frame.copy()
-                    focused = distracted = phone = eating = 0
-                    for det in dets[:20]:
-                        dt = det.get('type', '')
-                        x1, y1, x2, y2 = det.get('bbox', (0, 0, 0, 0))
-                        color = det.get('color', (120, 120, 120))
-                        tid = det.get('track_id')
-                        base_label = det.get('label', dt)
-                        # Track ID included so a debug log line like
-                        # "[PHONE] Person 44: ..." can be matched directly
-                        # to the exact box on screen.
-                        label = f"#{tid} {base_label}" if tid is not None else base_label
-                        cv2.rectangle(annotated, (x1, y1), (x2, y2), color, 2)
-                        cv2.putText(annotated, label, (x1 + 4, max(y1 - 8, 18)),
-                                    cv2.FONT_HERSHEY_SIMPLEX, 0.52, color, 2)
-                        if dt == 'focused':
-                            focused += 1
-                        elif dt in ('distracted', 'looking_away', 'head_down'):
-                            distracted += 1
-                        elif dt == 'using_phone':
-                            phone += 1
-                        elif dt == 'eating_food':
-                            eating += 1
-                    total = focused + distracted + phone + eating
-                    score = (focused / total * 100) if total > 0 else 0.0
-                    bar = f'F:{focused} D:{distracted} Ph:{phone} Eat:{eating}  {score:.0f}%'
-                    cv2.rectangle(annotated, (0, 0), (len(bar) * 9 + 14, 26), (20, 20, 20), -1)
-                    cv2.putText(annotated, bar, (6, 18),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.48, (255, 255, 255), 1)
-                except Exception:
-                    annotated = frame
-
-                _, buf = cv2.imencode('.jpg', annotated, [cv2.IMWRITE_JPEG_QUALITY, 72])
-                if buf is not None:
-                    try:
-                        yield (b'--frame\r\nContent-Type: image/jpeg\r\n\r\n'
-                               + buf.tobytes() + b'\r\n')
-                    except (BrokenPipeError, ConnectionResetError, OSError):
-                        break
-
-                elapsed = _time.monotonic() - last_yield
-                wait = frame_delay - elapsed
-                if wait > 0:
-                    _time.sleep(wait)
-                last_yield = _time.monotonic()
-        finally:
-            stop_ev.set()
-            cap.release()
-            det_thread.join(timeout=1)
-            _release_yolo_detector(f'camera:{camera_id}')
+    video_path = camera.url.strip()
+    camera_location = (
+        getattr(camera, 'name', None)
+        or getattr(camera, 'location', None)
+        or f'Camera {camera_id}'
+    )
 
     return StreamingHttpResponse(
-        _stream(),
+        _generate_video_stream(
+            video_path=video_path,
+            camera_id=camera_id,
+            camera_location=camera_location,
+            request_obj=request,
+        ),
         content_type='multipart/x-mixed-replace; boundary=frame',
     )
 
@@ -821,8 +708,12 @@ def _generate_video_stream(video_path, camera_id=0, camera_location='Classroom',
     recognizer.load_from_db()
 
     # ΓöÇΓöÇ Thread primitives ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
-    result_lock = threading.Lock()
-    latest_dets = []                        # list[dict] ΓÇö latest detections
+    result_lock  = threading.Lock()
+    latest_dets  = []                        # list[dict] ΓÇö latest detections
+    latest_tracks = []                       # list[tuple] ΓÇö latest (tid,x1,y1,x2,y2,conf,kp)
+                                              # from the pose worker; the detect
+                                              # worker reuses this instead of
+                                              # re-tracking (see note below)
     detect_q    = _queue.Queue(maxsize=1)   # frames  ΓåÆ full detect worker (heavy)
     pose_q      = _queue.Queue(maxsize=2)   # frames  ΓåÆ pose-only worker (cheap)
     save_q      = _queue.Queue(maxsize=50)  # incident dicts ΓåÆ DB/WA saver
@@ -847,8 +738,20 @@ def _generate_video_stream(video_path, camera_id=0, camera_location='Classroom',
             except _queue.Empty:
                 continue
             try:
+                # Reuse the pose worker's most recent tracks rather than
+                # calling detector.detect() with person_tracks=None, which
+                # would trigger a *second* independent call into
+                # .track(persist=True) on the same shared tracker. Two
+                # producers calling .track() on their own frame timelines
+                # can deliver frames out of chronological order to
+                # ByteTrack (this worker is much slower per-call than the
+                # pose worker, since it also runs phone/food/book models),
+                # which was the actual cause of the constant track ID
+                # churn — not tracker mis-tuning.
+                with result_lock:
+                    tracks_snapshot = list(latest_tracks)
                 with yolo_track_lock:
-                    dets = detector.detect(work_frame)
+                    dets = detector.detect(work_frame, person_tracks=tracks_snapshot)
                 with result_lock:
                     latest_dets.clear()
                     latest_dets.extend(dets)
@@ -876,6 +779,9 @@ def _generate_video_stream(video_path, camera_id=0, camera_location='Classroom',
                 if detector is not None and detector.processor.yolo_model is not None:
                     with yolo_track_lock:
                         tracks = detector.processor._parse_pose_detections(work_frame)
+                    with result_lock:
+                        latest_tracks.clear()
+                        latest_tracks.extend(tracks)
                     ts = time.time()
                     for tid, x1, y1, x2, y2, conf, kp in tracks:
                         detector.processor.behavior_engine.update_person(
