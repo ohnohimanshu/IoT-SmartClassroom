@@ -58,7 +58,7 @@ RUN mkdir -p /etc/supervisor/conf.d
 COPY docker/ /docker_configs/
 
 RUN pip install --no-cache-dir git+https://github.com/ageitgey/face_recognition_models
-
+RUN pip install --no-cache-dir face_recognition_models face_recognition
 # Apply dos2unix to avoid any Windows CRLF issues, then move files to correct locations
 RUN dos2unix /docker_configs/start.sh /docker_configs/gunicorn.conf /docker_configs/supervisord.conf && \
     mv /docker_configs/gunicorn.conf /etc/supervisor/conf.d/gunicorn.conf && \

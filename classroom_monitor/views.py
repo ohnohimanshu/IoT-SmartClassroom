@@ -588,20 +588,77 @@ def live_stream(request, camera_id):
         return HttpResponse(status=401)
 
     camera = get_object_or_404(ClassroomCamera, pk=camera_id)
-    video_path = camera.url.strip()
+
+    # camera.url can be None/blank if the camera was added without a stream
+    # URL (or the field was cleared). `.strip()` on None used to raise an
+    # unhandled AttributeError here, which happens BEFORE the
+    # StreamingHttpResponse is ever created — Django has no choice but to
+    # return a bare 500 for that, since none of the crash-proofing inside
+    # _safe_stream()/_generate_video_stream() runs until after this point.
+    # Validate here instead and, on any problem, stream a clear error frame
+    # just like the rest of this pipeline does, so the client always gets a
+    # normal 200 MJPEG response with a legible message rather than a 500.
+    raw_url = getattr(camera, 'url', None)
+    video_path = raw_url.strip() if raw_url else ''
+
     camera_location = (
         getattr(camera, 'name', None)
         or getattr(camera, 'location', None)
         or f'Camera {camera_id}'
     )
 
+    if not video_path:
+        def _no_url_stream():
+            err = np.zeros((240, 426, 3), dtype=np.uint8)
+            cv2.putText(err, 'No stream URL set', (30, 100),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (60, 60, 220), 2)
+            cv2.putText(err, f'for {camera_location}', (30, 135),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, (180, 180, 180), 1)
+            _, buf = cv2.imencode('.jpg', err)
+            frame = (b'--frame\r\nContent-Type: image/jpeg\r\n\r\n'
+                      + buf.tobytes() + b'\r\n')
+            while True:
+                yield frame
+                time.sleep(2.0)
+
+        return StreamingHttpResponse(
+            _no_url_stream(),
+            content_type='multipart/x-mixed-replace; boundary=frame',
+        )
+
+    def _safe_stream():
+        """Outer wrapper so ANY exception in _generate_video_stream yields an
+        error frame rather than crashing the worker (which causes nginx 502)."""
+        import time
+        import traceback
+        try:
+            yield from _generate_video_stream(
+                video_path=video_path,
+                camera_id=camera_id,
+                camera_location=camera_location,
+                request_obj=request,
+            )
+        except Exception as _e:
+            print(f'[STREAM] Fatal crash camera {camera_id}: {_e}')
+            print(traceback.format_exc())
+            try:
+                msg = str(_e)[:70]
+                err = np.zeros((240, 426, 3), dtype=np.uint8)
+                cv2.putText(err, 'Stream error', (50, 100),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.8, (60, 60, 220), 2)
+                cv2.putText(err, msg, (8, 140),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.38, (180, 180, 180), 1)
+                _, buf = cv2.imencode('.jpg', err)
+                frame = (b'--frame\r\nContent-Type: image/jpeg\r\n\r\n'
+                         + buf.tobytes() + b'\r\n')
+                while True:
+                    yield frame
+                    time.sleep(2.0)
+            except (GeneratorExit, BrokenPipeError, ConnectionResetError, OSError):
+                return
+
     return StreamingHttpResponse(
-        _generate_video_stream(
-            video_path=video_path,
-            camera_id=camera_id,
-            camera_location=camera_location,
-            request_obj=request,
-        ),
+        _safe_stream(),
         content_type='multipart/x-mixed-replace; boundary=frame',
     )
 
@@ -672,14 +729,47 @@ def _generate_video_stream(video_path, camera_id=0, camera_location='Classroom',
     import threading
     import queue as _queue
 
-    from classroom_monitor.behavior_detection import (
-        ClassroomBehaviorDetector, COLOR_MAP, LABEL_MAP,
-        ALERT_POSES, DISTRACTED_POSES,
-    )
-    from classroom_monitor.constants import EMAIL_ALERT_TYPES
-    from classroom_monitor.face_recognition_helper import (
-        StudentFaceRecognizer, DLIB_LOCK,
-    )
+    # ── Yield a placeholder error frame so the HTTP response is always valid.
+    # An unhandled exception before the first yield causes gunicorn to close
+    # the connection mid-header, which nginx surfaces as 502 "upstream
+    # prematurely closed connection". Wrapping everything in try/except and
+    # falling back to an error-frame loop prevents that entirely.
+    def _error_frame_loop(msg: str):
+        try:
+            err = np.zeros((240, 426, 3), dtype=np.uint8)
+            cv2.putText(err, 'Stream error', (60, 100),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (60, 60, 220), 2)
+            cv2.putText(err, msg[:60], (10, 135),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.4, (160, 160, 160), 1)
+            _, buf = cv2.imencode('.jpg', err)
+            while True:
+                yield (b'--frame\r\nContent-Type: image/jpeg\r\n\r\n'
+                       + buf.tobytes() + b'\r\n')
+                time.sleep(2.0)
+        except (GeneratorExit, BrokenPipeError, ConnectionResetError, OSError):
+            return
+
+    try:
+        from classroom_monitor.behavior_detection import (
+            ClassroomBehaviorDetector, COLOR_MAP, LABEL_MAP,
+            ALERT_POSES, DISTRACTED_POSES,
+        )
+        from classroom_monitor.constants import EMAIL_ALERT_TYPES
+    except Exception as _import_err:
+        print(f'[STREAM] Import error: {_import_err}')
+        yield from _error_frame_loop(f'Import error: {_import_err}')
+        return
+
+    try:
+        from classroom_monitor.face_recognition_helper import (
+            StudentFaceRecognizer, DLIB_LOCK,
+        )
+        _face_rec_available = True
+    except Exception as _fr_err:
+        print(f'[STREAM] face_recognition not available: {_fr_err}')
+        StudentFaceRecognizer = None
+        DLIB_LOCK = None
+        _face_rec_available = False
 
     FACEREC_INTERVAL = 5.0   # seconds between face-recognition attempts
     COOLDOWN_S       = 90    # seconds between same incident type alerts
@@ -698,14 +788,25 @@ def _generate_video_stream(video_path, camera_id=0, camera_location='Classroom',
     # key too (keyed by video_path) so two zero-id ad-hoc streams don't share
     # state either.
     stream_key = f'camera:{camera_id}' if camera_id else f'adhoc:{video_path}'
-    detector = _get_yolo_detector(stream_key)
-    if detector is None:
-        from classroom_monitor.behavior_detection import ClassroomBehaviorDetector
-        detector = ClassroomBehaviorDetector(camera_url='', camera_id=0, server_url='')
+    
+    try:
+        detector = _get_yolo_detector(stream_key)
+        if detector is None:
+            detector = ClassroomBehaviorDetector(camera_url='', camera_id=0, server_url='')
+    except Exception as _det_err:
+        print(f'[STREAM] Detector init failed: {_det_err}')
+        yield from _error_frame_loop(f'Detector init failed: {_det_err}')
+        return
 
     # ΓöÇΓöÇ Face recognizer ΓÇö loads DB once, used ONLY on main thread ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
-    recognizer = StudentFaceRecognizer()
-    recognizer.load_from_db()
+    recognizer = None
+    if _face_rec_available and StudentFaceRecognizer is not None:
+        try:
+            recognizer = StudentFaceRecognizer()
+            recognizer.load_from_db()
+        except Exception as _rec_err:
+            print(f'[STREAM] Face recognizer load failed (non-fatal): {_rec_err}')
+            recognizer = None
 
     # ΓöÇΓöÇ Thread primitives ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
     result_lock  = threading.Lock()
@@ -854,6 +955,21 @@ def _generate_video_stream(video_path, camera_id=0, camera_location='Classroom',
     if cap is None:
         print(f'[STREAM] Failed to open camera: {video_path}')
         stop_event.set()
+        # Yield a single error frame so the StreamingHttpResponse is valid
+        # (an empty generator causes gunicorn to return 502 to nginx).
+        try:
+            err_frame = np.zeros((240, 426, 3), dtype=np.uint8)
+            cv2.putText(err_frame, 'Camera unavailable', (30, 110),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (60, 60, 220), 2)
+            cv2.putText(err_frame, str(video_path)[:50], (10, 145),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, (160, 160, 160), 1)
+            _, err_buf = cv2.imencode('.jpg', err_frame)
+            while True:
+                yield (b'--frame\r\nContent-Type: image/jpeg\r\n\r\n'
+                       + err_buf.tobytes() + b'\r\n')
+                time.sleep(2.0)
+        except (GeneratorExit, BrokenPipeError, ConnectionResetError, OSError):
+            pass
         return
 
     src_fps      = cap.get(cv2.CAP_PROP_FPS) or 25.0
@@ -1017,7 +1133,7 @@ def _generate_video_stream(video_path, camera_id=0, camera_location='Classroom',
 
                 # ΓöÇΓöÇ Face recognition + incident queueing ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
                 now = time.time()
-                if (now - last_facerec) >= FACEREC_INTERVAL:
+                if recognizer is not None and (now - last_facerec) >= FACEREC_INTERVAL:
                     last_facerec = now
                     facerec_start = time.time()
                     
@@ -1041,7 +1157,7 @@ def _generate_video_stream(video_path, camera_id=0, camera_location='Classroom',
                             crop = frame[y1:y2, x1:x2]
 
                         try:
-                            sid, name, roll, _ = (recognizer.match(crop) if crop.size > 0 else (None, 'Unknown', '', float('nan')))
+                            sid, name, roll, _ = (recognizer.match(crop) if (recognizer is not None and crop.size > 0) else (None, 'Unknown', '', float('nan')))
                             student = None
                             if sid:
                                 try:
