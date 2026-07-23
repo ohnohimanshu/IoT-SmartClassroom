@@ -588,43 +588,12 @@ def live_stream(request, camera_id):
         return HttpResponse(status=401)
 
     camera = get_object_or_404(ClassroomCamera, pk=camera_id)
-
-    # camera.url can be None/blank if the camera was added without a stream
-    # URL (or the field was cleared). `.strip()` on None used to raise an
-    # unhandled AttributeError here, which happens BEFORE the
-    # StreamingHttpResponse is ever created — Django has no choice but to
-    # return a bare 500 for that, since none of the crash-proofing inside
-    # _safe_stream()/_generate_video_stream() runs until after this point.
-    # Validate here instead and, on any problem, stream a clear error frame
-    # just like the rest of this pipeline does, so the client always gets a
-    # normal 200 MJPEG response with a legible message rather than a 500.
-    raw_url = getattr(camera, 'url', None)
-    video_path = raw_url.strip() if raw_url else ''
-
+    video_path = camera.url.strip()
     camera_location = (
         getattr(camera, 'name', None)
         or getattr(camera, 'location', None)
         or f'Camera {camera_id}'
     )
-
-    if not video_path:
-        def _no_url_stream():
-            err = np.zeros((240, 426, 3), dtype=np.uint8)
-            cv2.putText(err, 'No stream URL set', (30, 100),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (60, 60, 220), 2)
-            cv2.putText(err, f'for {camera_location}', (30, 135),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, (180, 180, 180), 1)
-            _, buf = cv2.imencode('.jpg', err)
-            frame = (b'--frame\r\nContent-Type: image/jpeg\r\n\r\n'
-                      + buf.tobytes() + b'\r\n')
-            while True:
-                yield frame
-                time.sleep(2.0)
-
-        return StreamingHttpResponse(
-            _no_url_stream(),
-            content_type='multipart/x-mixed-replace; boundary=frame',
-        )
 
     def _safe_stream():
         """Outer wrapper so ANY exception in _generate_video_stream yields an
@@ -1191,7 +1160,55 @@ def _generate_video_stream(video_path, camera_id=0, camera_location='Classroom',
                         except Exception as e:
                             print(f'[STREAM] Error in face recognition: {e}')
 
-                # ΓöÇΓöÇ Draw annotations ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
+                # ── Dedup overlapping boxes ──────────────────────────────
+                # Safety net for when the pose model/tracker still produces
+                # >1 simultaneous track ID for the same physical person
+                # (partially-overlapping raw detections that survive NMS,
+                # or a brief window where an old ID hasn't been cleaned up
+                # yet while a new one has already been created for the same
+                # body). Rather than trusting tracking to be perfectly
+                # deduplicated upstream, collapse any boxes here whose IoU
+                # is high enough that they're almost certainly the same
+                # person, keeping only the single most informative one:
+                # prefer an alert/distracted state over "focused" (a
+                # violation shouldn't be hidden behind a stale "focused"
+                # duplicate), then the higher-confidence detection.
+                def _iou(b1, b2):
+                    ax1, ay1, ax2, ay2 = b1
+                    bx1, by1, bx2, by2 = b2
+                    ix1, iy1 = max(ax1, bx1), max(ay1, by1)
+                    ix2, iy2 = min(ax2, bx2), min(ay2, by2)
+                    iw, ih = max(0, ix2 - ix1), max(0, iy2 - iy1)
+                    inter = iw * ih
+                    if inter <= 0:
+                        return 0.0
+                    area_a = max(0, ax2 - ax1) * max(0, ay2 - ay1)
+                    area_b = max(0, bx2 - bx1) * max(0, by2 - by1)
+                    union = area_a + area_b - inter
+                    return inter / union if union > 0 else 0.0
+
+                _PRIORITY = {
+                    'using_phone': 5, 'eating_food': 5, 'fighting': 5,
+                    'hand_raised': 4, 'distracted': 3, 'looking_away': 3,
+                    'head_down': 3, 'focused': 1, 'not_visible': 0,
+                }
+                DEDUP_IOU_THRESH = 0.55
+                kept_dets = []
+                for det in current_dets:
+                    merged = False
+                    for i, existing in enumerate(kept_dets):
+                        if _iou(det['bbox'], existing['bbox']) >= DEDUP_IOU_THRESH:
+                            merged = True
+                            det_pri = _PRIORITY.get(det.get('type', ''), 0)
+                            ex_pri  = _PRIORITY.get(existing.get('type', ''), 0)
+                            if (det_pri, det.get('confidence', 0)) > (ex_pri, existing.get('confidence', 0)):
+                                kept_dets[i] = det
+                            break
+                    if not merged:
+                        kept_dets.append(det)
+                current_dets = kept_dets
+
+                # ── Draw annotations ─────────────────────────────────────
                 annotated  = frame.copy()
                 focused = distracted = phone = eating = hand_raised = 0
 
@@ -1210,6 +1227,8 @@ def _generate_video_stream(video_path, camera_id=0, camera_location='Classroom',
                     
                     cv2.rectangle(annotated, (x1,y1), (x2,y2), color, 2)
                     cv2.putText(annotated, label, (x1+4, max(y1-8,18)), cv2.FONT_HERSHEY_SIMPLEX, 0.52, color, 2)
+
+
 
                 # Summary bar
                 total = focused + distracted + phone + eating + hand_raised

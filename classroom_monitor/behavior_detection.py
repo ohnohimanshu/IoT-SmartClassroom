@@ -246,7 +246,19 @@ class ProductionStreamProcessor:
         if self.yolo_model is None:
             return tracks
         try:
-            for result in self.yolo_model.track(frame, persist=True, verbose=False, conf=0.1, iou=0.5, tracker='bytetrack_classroom.yaml'):
+            # iou=0.35 (was 0.5): this is YOLO's own NMS threshold applied to
+            # RAW pose detections BEFORE they ever reach ByteTrack — separate
+            # from bytetrack_classroom.yaml's match_thresh, which only
+            # governs matching already-deduplicated boxes across frames.
+            # 0.5 was letting two partially-overlapping boxes for the SAME
+            # physical person (e.g. a tight head/torso box vs a looser box
+            # including an outstretched arm) both survive NMS. Each then
+            # independently passed new_track_thresh (0.3) in the tracker
+            # yaml and got its own ByteTrack ID — visible on screen as
+            # multiple simultaneous, differently-labeled boxes drawn on one
+            # person. Tightening NMS here stops the duplicates at the
+            # source instead of relying on the tracker to reconcile them.
+            for result in self.yolo_model.track(frame, persist=True, verbose=False, conf=0.1, iou=0.35, tracker='bytetrack_classroom.yaml'):
                 if result.boxes is None:
                     continue
                 kp_list = result.keypoints if hasattr(result, 'keypoints') else None
