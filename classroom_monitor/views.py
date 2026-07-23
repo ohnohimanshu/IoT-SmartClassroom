@@ -779,28 +779,47 @@ def _generate_video_stream(video_path, camera_id=0, camera_location='Classroom',
 
     # ΓöÇΓöÇ Thread primitives ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
     result_lock  = threading.Lock()
-    latest_dets  = []                        # list[dict] ΓÇö latest detections
-    latest_tracks = []                       # list[tuple] ΓÇö latest (tid,x1,y1,x2,y2,conf,kp)
+    latest_dets  = []                        # list[dict] — latest detections
+    latest_tracks = []                       # list[tuple] — latest (tid,x1,y1,x2,y2,conf,kp)
                                               # from the pose worker; the detect
                                               # worker reuses this instead of
                                               # re-tracking (see note below)
-    detect_q    = _queue.Queue(maxsize=1)   # frames  ΓåÆ full detect worker (heavy)
-    pose_q      = _queue.Queue(maxsize=2)   # frames  ΓåÆ pose-only worker (cheap)
-    save_q      = _queue.Queue(maxsize=50)  # incident dicts ΓåÆ DB/WA saver
+    latest_object_dets = {'phone': [], 'food': [], 'book': []}  # from detect
+                                              # worker (heavy, ~2fps), consumed
+                                              # every cycle by the pose worker
+    latest_fight_state = {'detected': False}  # from detect worker (heavy, ~2fps)
+    detect_q    = _queue.Queue(maxsize=1)   # frames  → object-detection worker (heavy)
+    pose_q      = _queue.Queue(maxsize=2)   # frames  → pose + behavior worker (cheap)
+    save_q      = _queue.Queue(maxsize=50)  # incident dicts → DB/WA saver
     stop_event  = threading.Event()
-    cooldown    = {}                        # (type, track_id) ΓåÆ last saved timestamp
+    cooldown    = {}                        # (type, track_id) → last saved timestamp
     pending_keys = set()
 
     # `detector.processor.yolo_model.track(..., persist=True)` keeps mutable
     # internal ByteTrack state on the model object. _detection_worker and
     # _pose_worker run as separate threads and both call into that same
-    # model ΓÇö without a lock, two threads can enter .track() at the same
+    # model — without a lock, two threads can enter .track() at the same
     # time and corrupt tracker state (ID churn, garbage/misaligned
     # keypoints, occasional exceptions). This lock makes every call into the
     # tracker mutually exclusive, regardless of which worker makes it.
     yolo_track_lock = threading.Lock()
 
-    # ΓöÇΓöÇ Detect worker ΓÇö YOLO + Haar only, NO dlib ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
+    # ── Object-detection worker — phone/food/book YOLO models + fight model
+    # ONLY. Behavior evaluation (head pose / hand raise / phone / distracted)
+    # used to happen here too (via detector.detect()), but this worker only
+    # ticks at heavy_every cadence (~2fps) since the object-detection models
+    # are the expensive part. The leaky-counter hysteresis in
+    # head_pose_detection.py / phone_detection.py (thresholds of ~6-10
+    # matched calls) was tuned assuming evaluation runs close to the pose
+    # worker's ~8fps — at 2fps those same thresholds took 3-5 REAL SECONDS
+    # to confirm a state change, and a brief gesture (a quick hand-raise)
+    # could start and end entirely between two heavy-worker ticks and never
+    # get evaluated at all. That mismatch was the actual cause of both
+    # "shows the old label for several seconds after the pose changed" and
+    # "never detects a quick hand-raise/phone glance." Object detection
+    # itself stays at this cadence (it's genuinely expensive); only the
+    # *evaluation* against pose moved to the pose worker below, which now
+    # runs every ~125ms instead of every ~500ms.
     def _detection_worker():
         while not stop_event.is_set():
             try:
@@ -808,37 +827,32 @@ def _generate_video_stream(video_path, camera_id=0, camera_location='Classroom',
             except _queue.Empty:
                 continue
             try:
-                # Reuse the pose worker's most recent tracks rather than
-                # calling detector.detect() with person_tracks=None, which
-                # would trigger a *second* independent call into
-                # .track(persist=True) on the same shared tracker. Two
-                # producers calling .track() on their own frame timelines
-                # can deliver frames out of chronological order to
-                # ByteTrack (this worker is much slower per-call than the
-                # pose worker, since it also runs phone/food/book models),
-                # which was the actual cause of the constant track ID
-                # churn — not tracker mis-tuning.
-                with result_lock:
-                    tracks_snapshot = list(latest_tracks)
                 with yolo_track_lock:
-                    dets = detector.detect(work_frame, person_tracks=tracks_snapshot)
+                    phone_dets, food_dets, book_dets = detector.processor._parse_object_detections(work_frame)
+                fight_detected = False
+                fd = detector.processor.fight_detector
+                if fd is not None:
+                    try:
+                        fd.add_frame(work_frame)
+                        fight_result = fd.predict()
+                        fight_detected = fight_result[0] if isinstance(fight_result, tuple) else bool(fight_result)
+                    except Exception as exc:
+                        print(f'[FIGHT] {exc}')
                 with result_lock:
-                    latest_dets.clear()
-                    latest_dets.extend(dets)
+                    latest_object_dets['phone'] = phone_dets
+                    latest_object_dets['food']  = food_dets
+                    latest_object_dets['book']  = book_dets
+                    latest_fight_state['detected'] = fight_detected
             except Exception as exc:
                 print(f'[DETECT] {exc}')
 
-    # ΓöÇΓöÇ Pose-only worker ΓÇö keeps ByteTrack IDs alive between heavy detections ΓöÇ
-    # Calls _parse_pose_detections on every pose_q frame so the tracker sees
-    # consistent motion and doesn't churn IDs. Does NOT run object detection
-    # or fight detection (cheap path only). It DOES feed each track into
-    # behavior_engine.update_person() so keypoint_history actually gets
-    # samples at this worker's higher cadence (~8fps) instead of only at the
-    # heavy-detection cadence (~2fps) ΓÇö the wrist-motion-variance ("is this
-    # writing or phone-scrolling") heuristic in behavior_detection_core.py
-    # needs that higher sample rate to be a meaningful signal. Previously this
-    # worker discarded its results entirely, so it had zero effect on
-    # tracked-person state.
+    # ── Pose + behavior worker — keeps ByteTrack IDs alive AND now performs
+    # the actual head-pose/hand-raise/phone/distraction evaluation on every
+    # cycle (~8fps), using whatever phone/food/book detections the (slower)
+    # object-detection worker most recently produced. This is what makes
+    # state changes (hand raised, distracted, focused, phone) show up within
+    # roughly one pose cycle (~125ms) instead of lagging ~0.5-5s behind the
+    # actual video the way the old single heavy-worker-only evaluation did.
     def _pose_worker():
         while not stop_event.is_set():
             try:
@@ -852,14 +866,25 @@ def _generate_video_stream(video_path, camera_id=0, camera_location='Classroom',
                     with result_lock:
                         latest_tracks.clear()
                         latest_tracks.extend(tracks)
+                        phone_dets     = list(latest_object_dets['phone'])
+                        food_dets      = list(latest_object_dets['food'])
+                        book_dets      = list(latest_object_dets['book'])
+                        fight_detected = latest_fight_state['detected']
                     ts = time.time()
                     for tid, x1, y1, x2, y2, conf, kp in tracks:
                         detector.processor.behavior_engine.update_person(
                             tid, (x1, y1, x2, y2), kp, ts)
+                    dets = detector.evaluate_tracks(
+                        tracks, phone_dets=phone_dets, food_dets=food_dets,
+                        book_dets=book_dets, fight_detected=fight_detected,
+                    )
+                    with result_lock:
+                        latest_dets.clear()
+                        latest_dets.extend(dets)
             except Exception as exc:
                 print(f'[POSE] {exc}')
 
-    # ΓöÇΓöÇ Save worker ΓÇö DB write + email alert, NO dlib ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
+    # ── Save worker — DB write + email alert, NO dlib ──────────────────────
     def _save_worker():
         from django.db import close_old_connections
         while not stop_event.is_set():
@@ -1160,55 +1185,7 @@ def _generate_video_stream(video_path, camera_id=0, camera_location='Classroom',
                         except Exception as e:
                             print(f'[STREAM] Error in face recognition: {e}')
 
-                # ── Dedup overlapping boxes ──────────────────────────────
-                # Safety net for when the pose model/tracker still produces
-                # >1 simultaneous track ID for the same physical person
-                # (partially-overlapping raw detections that survive NMS,
-                # or a brief window where an old ID hasn't been cleaned up
-                # yet while a new one has already been created for the same
-                # body). Rather than trusting tracking to be perfectly
-                # deduplicated upstream, collapse any boxes here whose IoU
-                # is high enough that they're almost certainly the same
-                # person, keeping only the single most informative one:
-                # prefer an alert/distracted state over "focused" (a
-                # violation shouldn't be hidden behind a stale "focused"
-                # duplicate), then the higher-confidence detection.
-                def _iou(b1, b2):
-                    ax1, ay1, ax2, ay2 = b1
-                    bx1, by1, bx2, by2 = b2
-                    ix1, iy1 = max(ax1, bx1), max(ay1, by1)
-                    ix2, iy2 = min(ax2, bx2), min(ay2, by2)
-                    iw, ih = max(0, ix2 - ix1), max(0, iy2 - iy1)
-                    inter = iw * ih
-                    if inter <= 0:
-                        return 0.0
-                    area_a = max(0, ax2 - ax1) * max(0, ay2 - ay1)
-                    area_b = max(0, bx2 - bx1) * max(0, by2 - by1)
-                    union = area_a + area_b - inter
-                    return inter / union if union > 0 else 0.0
-
-                _PRIORITY = {
-                    'using_phone': 5, 'eating_food': 5, 'fighting': 5,
-                    'hand_raised': 4, 'distracted': 3, 'looking_away': 3,
-                    'head_down': 3, 'focused': 1, 'not_visible': 0,
-                }
-                DEDUP_IOU_THRESH = 0.55
-                kept_dets = []
-                for det in current_dets:
-                    merged = False
-                    for i, existing in enumerate(kept_dets):
-                        if _iou(det['bbox'], existing['bbox']) >= DEDUP_IOU_THRESH:
-                            merged = True
-                            det_pri = _PRIORITY.get(det.get('type', ''), 0)
-                            ex_pri  = _PRIORITY.get(existing.get('type', ''), 0)
-                            if (det_pri, det.get('confidence', 0)) > (ex_pri, existing.get('confidence', 0)):
-                                kept_dets[i] = det
-                            break
-                    if not merged:
-                        kept_dets.append(det)
-                current_dets = kept_dets
-
-                # ── Draw annotations ─────────────────────────────────────
+                # ΓöÇΓöÇ Draw annotations ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
                 annotated  = frame.copy()
                 focused = distracted = phone = eating = hand_raised = 0
 
@@ -1227,8 +1204,6 @@ def _generate_video_stream(video_path, camera_id=0, camera_location='Classroom',
                     
                     cv2.rectangle(annotated, (x1,y1), (x2,y2), color, 2)
                     cv2.putText(annotated, label, (x1+4, max(y1-8,18)), cv2.FONT_HERSHEY_SIMPLEX, 0.52, color, 2)
-
-
 
                 # Summary bar
                 total = focused + distracted + phone + eating + hand_raised

@@ -246,19 +246,7 @@ class ProductionStreamProcessor:
         if self.yolo_model is None:
             return tracks
         try:
-            # iou=0.35 (was 0.5): this is YOLO's own NMS threshold applied to
-            # RAW pose detections BEFORE they ever reach ByteTrack — separate
-            # from bytetrack_classroom.yaml's match_thresh, which only
-            # governs matching already-deduplicated boxes across frames.
-            # 0.5 was letting two partially-overlapping boxes for the SAME
-            # physical person (e.g. a tight head/torso box vs a looser box
-            # including an outstretched arm) both survive NMS. Each then
-            # independently passed new_track_thresh (0.3) in the tracker
-            # yaml and got its own ByteTrack ID — visible on screen as
-            # multiple simultaneous, differently-labeled boxes drawn on one
-            # person. Tightening NMS here stops the duplicates at the
-            # source instead of relying on the tracker to reconcile them.
-            for result in self.yolo_model.track(frame, persist=True, verbose=False, conf=0.1, iou=0.35, tracker='bytetrack_classroom.yaml'):
+            for result in self.yolo_model.track(frame, persist=True, verbose=False, conf=0.1, iou=0.5, tracker='bytetrack_classroom.yaml'):
                 if result.boxes is None:
                     continue
                 kp_list = result.keypoints if hasattr(result, 'keypoints') else None
@@ -320,7 +308,7 @@ class ProductionStreamProcessor:
                             if head_pose == "focused":
                                 raw_behavior   = "focused"
                                 raw_confidence = 0.75
-                            elif head_pose in ("head_down", "looking_away"):
+                            elif head_pose == "head_down":
                                 # hands_near_book relies on COCO's generic "book" class,
                                 # which essentially never fires on an open notebook/notepad
                                 # at a normal writing angle -- so this veto almost never
@@ -330,6 +318,14 @@ class ProductionStreamProcessor:
                                 # disambiguation elsewhere) is a much more reliable signal
                                 # here: real handwriting produces small, repetitive wrist
                                 # motion that phone-holding or idle hands don't.
+                                #
+                                # This veto only applies to head_down (writing posture).
+                                # looking_away means the head is turned aside, not down at
+                                # a desk -- there's no legitimate "writing" interpretation
+                                # for that, so it no longer shares this branch. Previously
+                                # bundling both meant a student looking away with any
+                                # incidental hand movement (adjusting a phone, gesturing)
+                                # got relabeled "focused" instead of "distracted".
                                 is_writing_motion, _ = SharedHelpers.calculate_wrist_motion_variance(person)
                                 if SharedHelpers.hands_near_book(person, book_dets) or is_writing_motion:
                                     raw_behavior   = "focused"
@@ -337,6 +333,9 @@ class ProductionStreamProcessor:
                                 else:
                                     raw_behavior   = "distracted"
                                     raw_confidence = 0.70
+                            elif head_pose == "looking_away":
+                                raw_behavior   = "distracted"
+                                raw_confidence = 0.70
                             elif head_pose == "not_visible":
                                 raw_behavior   = "not_visible"
                                 raw_confidence = 0.60
@@ -355,6 +354,7 @@ class ProductionStreamProcessor:
         return results
 
     def _process_single_frame(self, frame: np.ndarray, timestamp: float):
+        t0 = time.time()
         try:
             person_tracks = self._parse_pose_detections(frame)
             phone_dets, food_dets, book_dets = self._parse_object_detections(frame)
@@ -454,6 +454,51 @@ class ClassroomBehaviorDetector:
         except Exception as e:
             print(f'[WARN] Could not load students: {e}')
             self.known_students = []
+
+    def evaluate_tracks(self, person_tracks, phone_dets=None, food_dets=None,
+                        book_dets=None, fight_detected=False) -> List[Dict]:
+        """
+        Lightweight companion to `detect()` — runs ONLY behavior evaluation
+        (head pose, hand raise, phone, distraction, fight) against tracks a
+        caller already has, using whatever phone/food/book detections were
+        most recently produced by a separate (slower) object-detection
+        worker. No YOLO model is called here.
+
+        Why this exists: head_pose_detection.py / phone_detection.py use
+        LEAKY COUNTERS with thresholds (e.g. ~6-10 matched calls) tuned
+        assuming evaluation happens close to pose-tracking frequency
+        (~8fps). If behavior evaluation only ever runs at the much slower
+        heavy object-detection cadence (~2fps, since that path also calls
+        the phone/food/book YOLO models), those same thresholds take
+        several REAL SECONDS to confirm a state change, and a brief
+        gesture (a quick hand-raise) can start and end entirely between
+        two heavy-worker ticks and never get evaluated at all.
+
+        Call this once per pose-tracking cycle (e.g. from an ~8fps pose
+        worker) with the latest pose tracks and the latest cached
+        phone/food/book detections — this makes hand-raise/phone/
+        distracted/focused state changes show up within roughly one pose
+        cycle instead of lagging behind the heavy-detection cadence.
+        """
+        if self.processor.yolo_model is None:
+            return []
+        try:
+            timestamp = time.time()
+            det_objs = self.processor._run_behavior_evaluation(
+                None, person_tracks, phone_dets or [], food_dets or [],
+                book_dets or [], timestamp, fight_detected,
+            )
+            detections = []
+            for d in det_objs:
+                detections.append({
+                    'type': d.type, 'bbox': d.bbox, 'confidence': d.confidence,
+                    'color': d.color, 'label': d.label, 'is_alert': d.is_alert,
+                    'is_distracted': d.is_distracted, 'track_id': d.track_id,
+                })
+            return detections
+        except Exception as e:
+            print(f'[ERROR] evaluate_tracks(): {e}')
+            return []
 
     def detect(self, frame, person_tracks=None) -> List[Dict]:
         """

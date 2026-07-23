@@ -99,8 +99,18 @@ class SharedHelpers:
         variance_y = np.var(wrist_array[:, 1])
         bbox_h = person.bbox[3] - person.bbox[1]
         normalized_variance = (variance_x + variance_y) / max(bbox_h ** 2, 1)
-        is_writing = normalized_variance > 0.0015   # start here, tune against your footage
-        confidence = min(normalized_variance / 0.004, 0.95)
+        # Was 0.0015 originally (too permissive — ordinary fidgeting or a
+        # phone-scrolling thumb read as "writing" and silently vetoed both
+        # distracted AND phone-use detection). Raising it to 0.0035 then
+        # overshot the other way — real, careful handwriting often has
+        # smaller wrist motion than that, and hands_near_book essentially
+        # never fires as a backstop (COCO's generic "book" class rarely
+        # detects an open notebook at a normal writing angle), so genuine
+        # writers started getting mislabeled "distracted" instead. 0.0022
+        # is a middle point; treat it as a starting value and nudge it
+        # after watching a session against your own footage/camera angle.
+        is_writing = normalized_variance > 0.0022
+        confidence = min(normalized_variance / 0.005, 0.95)
         return is_writing, confidence
 
 
@@ -108,8 +118,15 @@ class SharedHelpers:
 class TemporalBehaviorEngine:
     LOW_CONFIDENCE_THRESHOLD     = 0.4
     HEAD_DOWN_CONSECUTIVE_FRAMES = 2
-    ALERT_CONFIRM_FRAMES  = 3    # was 10 — alerts now confirm in ~0.3s at 10fps
-    NORMAL_CONFIRM_FRAMES = 3    # was 5
+    # Both of these used to re-confirm behavior over several more frames on
+    # top of the leaky-counter hysteresis already applied upstream in
+    # head_pose_detection.py / phone_detection.py. That stacked two
+    # independent smoothing delays in series. The leaky counters already
+    # guarantee a stable, debounced raw_behavior signal by the time it gets
+    # here, so this layer only needs to catch a single additional frame of
+    # agreement, not re-run its own multi-frame vote.
+    ALERT_CONFIRM_FRAMES  = 1    # was 3
+    NORMAL_CONFIRM_FRAMES = 2    # was 3
 
     def __init__(self):
         self.tracked_people: Dict[int, TrackedPerson] = {}

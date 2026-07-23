@@ -37,18 +37,11 @@ class HandRaiseDetector:
                 if wrist[0] == 0.0:
                     continue
                 # In image coords y increases downward, so raised wrist has smaller y.
-                # Require the arm to be roughly extended upward rather than the
-                # wrist just happening to be near shoulder height, which
-                # incidental gestures (adjusting hair, elbow resting on desk
-                # with hand near shoulder) can also produce. Originally this
-                # required the elbow strictly below the wrist (arm fully
-                # extended straight up), but a very common natural
-                # "hand raised near the head" pose has the forearm bent, with
-                # the elbow roughly level with — or even a little above — the
-                # wrist. Allow the elbow some tolerance instead of rejecting
-                # that shape outright.
-                elbow_tolerance = bbox_h * 0.06
-                if wrist[1] < shoulder[1] - pixel_thresh and elbow[1] > wrist[1] - elbow_tolerance:
+                # Require the arm to actually be extended upward — elbow below (i.e.
+                # larger y than) the wrist — not just the wrist happening to be near
+                # shoulder height, which incidental gestures (adjusting hair, elbow
+                # resting on desk with hand near shoulder) can also produce.
+                if wrist[1] < shoulder[1] - pixel_thresh and elbow[1] > wrist[1]:
                     return True, float(wrist[2])
 
         except Exception as exc:

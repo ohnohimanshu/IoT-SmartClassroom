@@ -29,11 +29,6 @@ class PhoneDetector:
     PHONE_SINGLE_HAND_Y_MIN    = 0.45   # wrist-relative-y above this = torso zone
     PHONE_SINGLE_HAND_Y_MAX    = 0.85
 
-    # Phone held up near the face (Path 2c) — independent of head_is_down,
-    # since this pose doesn't produce a down head pose or a lap-level wrist.
-    PHONE_FACE_Y_MAX    = 0.35   # wrist relative-y must be in the upper part of the bbox (near head/shoulder)
-    PHONE_FACE_DIST_MAX = 0.30   # wrist-to-nose distance, relative to bbox_h
-
     # Leaky-counter thresholds. At process_fps=10, ~6 net frames of
     # "credit" is roughly ~0.6s of real sustained heuristic match.
     HEURISTIC_THRESHOLD = 6
@@ -186,28 +181,6 @@ class PhoneDetector:
                     if not any(_book_near(p) for p in both_wrists_for_veto):
                         heuristic_matched = True
                         match_conf = 0.55
-
-            # Path 2c: phone held up near the face. Both branches above are
-            # gated on head_is_down, which only covers "looking down at a
-            # phone in the lap." Someone holding a phone up near eye level
-            # to look at it has neither a down head pose nor a lap-level
-            # wrist — that pose was completely outside what either branch
-            # above could ever match. Detect it independently: a wrist
-            # sitting close to the nose/face, well above the lap zone, is a
-            # strong candidate regardless of head pose.
-            if not heuristic_matched and len(person.keypoints) > 0:
-                nose = person.keypoints[0]
-                if _wrist_ok(nose, 0.4):
-                    face_pt = nose[:2]
-                    for w in wrist_pts:
-                        rel_y = (w[1] - y1) / bbox_h
-                        dist_to_face = np.linalg.norm(w - face_pt) / bbox_h
-                        if (rel_y < self.PHONE_FACE_Y_MAX
-                                and dist_to_face < self.PHONE_FACE_DIST_MAX
-                                and not _book_near(w)):
-                            heuristic_matched = True
-                            match_conf = 0.55
-                            break
 
             confirmed = self._leaky_update(self._heuristic_counters, tid, heuristic_matched, self.HEURISTIC_THRESHOLD)
             if heuristic_matched and confirmed:
