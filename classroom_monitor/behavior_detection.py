@@ -122,6 +122,14 @@ class ProductionStreamProcessor:
         self.person_tracks: List[Tuple] = []
         self.behavior_engine  = TemporalBehaviorEngine()
         self.fight_detector   = None
+        # Static-false-positive suppression (see _update_static_fp_map /
+        # _filter_static_fp below) — tracks phone-shaped detections that
+        # keep appearing at the same screen location with no person ever
+        # nearby (a poster, light switch, reflective surface, etc).
+        self._static_fp_counters: Dict[Tuple[int, int], int] = {}
+        self._STATIC_FP_CELL = 40        # px grid cell size
+        self._STATIC_FP_THRESHOLD = 40   # ~4s of net unmatched hits at process_fps=10
+        self._STATIC_FP_CAP = 80
         track_buffer_frames = 60          # must match bytetrack_classroom.yaml's track_buffer
         self.behavior_engine.cleanup_threshold = (track_buffer_frames / process_fps) + 1.0
 
@@ -195,7 +203,179 @@ class ProductionStreamProcessor:
                     last_ts = now
             time.sleep(0.01)
 
-    def _parse_object_detections(self, frame: np.ndarray):
+    @staticmethod
+    def _is_dup_box(box: Tuple, existing: List[Tuple], iou_thresh: float = 0.3) -> bool:
+        """IoU + center-distance dedup. Replaces the old flat '25px' check,
+        which was calibrated for full-frame-scale boxes only — it under-
+        merges for tiny ROI-crop detections (a few px of jitter there is
+        proportionally huge) and over-merges for large boxes far apart in
+        a big frame. Center distance is checked in addition to IoU because
+        two small, barely-overlapping boxes for the same real phone can
+        have ~0 IoU while clearly being the same object.
+        """
+        x1, y1, x2, y2, _ = box
+        bw, bh = max(x2 - x1, 1), max(y2 - y1, 1)
+        cx, cy = (x1 + x2) / 2.0, (y1 + y2) / 2.0
+        for (ex1, ey1, ex2, ey2, _) in existing:
+            ix1, iy1 = max(x1, ex1), max(y1, ey1)
+            ix2, iy2 = min(x2, ex2), min(y2, ey2)
+            if ix2 > ix1 and iy2 > iy1:
+                inter = (ix2 - ix1) * (iy2 - iy1)
+                union = bw * bh + max(ex2 - ex1, 1) * max(ey2 - ey1, 1) - inter
+                if union > 0 and inter / union > iou_thresh:
+                    return True
+            ecx, ecy = (ex1 + ex2) / 2.0, (ey1 + ey2) / 2.0
+            if abs(cx - ecx) < bw * 0.5 and abs(cy - ecy) < bh * 0.5:
+                return True
+        return False
+
+    def _hand_roi_phone_boost(self, frame: np.ndarray, person_tracks: List[Tuple],
+                               existing_phone_dets: List[Tuple]) -> List[Tuple]:
+        """
+        Small-object accuracy boost: crop a tight, upscaled region around
+        each wrist keypoint and re-run the phone model on just that patch.
+
+        Why: in a wide classroom shot a held phone can be a ~15-25px
+        object. Full-frame detectors (generic and custom-trained alike)
+        systematically under-detect objects that small — this is the same
+        problem tiled/"sliced" inference (SAHI) exists to solve. We
+        already have wrist keypoints from the pose model for free, so we
+        can target exactly the region a phone would be in and upscale it
+        2-2.5x before inference, which meaningfully increases recall on
+        small/occluded phones without having to slice the whole frame.
+
+        Gated to keep cost down:
+        - Only for tracks whose bbox is small relative to the frame (i.e.
+          camera is wide/far — the regime this actually helps). Close-up
+          shots already give full-frame detection enough pixels to work with.
+        - Skipped for a person who already has a confident phone hit inside
+          their padded bbox from the full-frame pass — no need to re-check.
+        """
+        boosted: List[Tuple] = []
+        if (self.phone_model is None and self.object_model is None) or not person_tracks:
+            return boosted
+        model = self.phone_model or self.object_model
+        use_generic = model is self.object_model
+        frame_h, frame_w = frame.shape[:2]
+
+        for tid, x1, y1, x2, y2, conf, kp in person_tracks:
+            bbox_h, bbox_w = y2 - y1, x2 - x1
+            if bbox_h <= 0 or bbox_w <= 0 or kp is None or len(kp) <= 10:
+                continue
+            if bbox_h > frame_h * 0.42:
+                continue  # person already large enough in-frame; full-frame pass suffices
+
+            pad_x, pad_y = bbox_w * 0.25, bbox_h * 0.20
+            already_found = any(
+                px1 < x2 + pad_x and px2 > x1 - pad_x and py1 < y2 + pad_y and py2 > y1 - pad_y and pconf >= 0.40
+                for (px1, py1, px2, py2, pconf) in existing_phone_dets
+            )
+            if already_found:
+                continue
+
+            wrist_pts = []
+            for idx in (9, 10):
+                if idx < len(kp):
+                    w = kp[idx]
+                    if len(w) >= 3 and w[2] >= 0.3 and w[0] != 0.0:
+                        wrist_pts.append((float(w[0]), float(w[1])))
+            if not wrist_pts:
+                continue
+
+            for (wx, wy) in wrist_pts:
+                half = bbox_h * 0.22
+                cx1, cy1 = int(max(0, wx - half)), int(max(0, wy - half))
+                cx2, cy2 = int(min(frame_w, wx + half)), int(min(frame_h, wy + half))
+                if cx2 - cx1 < 20 or cy2 - cy1 < 20:
+                    continue
+                crop = frame[cy1:cy2, cx1:cx2]
+                if crop.size == 0:
+                    continue
+
+                scale = 2.5 if max(crop.shape[:2]) < 200 else 1.5
+                crop_rs = cv2.resize(crop, None, fx=scale, fy=scale, interpolation=cv2.INTER_LINEAR)
+
+                try:
+                    # Lower conf floor than the full-frame pass (0.20 vs 0.25)
+                    # is deliberate: this crop is small and phone-centric by
+                    # construction, so the base rate of noise here is much
+                    # lower than scanning the whole frame at that threshold.
+                    for result in model(crop_rs, verbose=False, conf=0.20, iou=0.45):
+                        if result.boxes is None:
+                            continue
+                        for i in range(len(result.boxes)):
+                            if use_generic and int(result.boxes.cls[i]) not in self._PHONE_CLS:
+                                continue
+                            pconf = float(result.boxes.conf[i])
+                            bx1, by1, bx2, by2 = result.boxes.xyxy[i].tolist()
+                            fx1, fy1 = cx1 + bx1 / scale, cy1 + by1 / scale
+                            fx2, fy2 = cx1 + bx2 / scale, cy1 + by2 / scale
+                            box = (int(fx1), int(fy1), int(fx2), int(fy2), pconf)
+                            if not self._is_dup_box(box, existing_phone_dets) and not self._is_dup_box(box, boosted):
+                                boosted.append(box)
+                except Exception as e:
+                    print(f'[WARN] ROI phone boost failed tid={tid}: {e}')
+
+        if boosted:
+            print(f'[PHONE-ROI] Found {len(boosted)} additional phone(s) via hand-ROI boost')
+        return boosted
+
+    def _update_static_fp_map(self, phone_dets: List[Tuple], person_tracks: List[Tuple]):
+        """
+        Tracks phone-shaped detections that recur at the same screen
+        location without ever being near a person — almost certainly a
+        fixed environmental false positive (poster, light switch,
+        reflective surface) rather than an actual phone, which moves.
+
+        Observed in production logs: the same ~(0,280)-(50,350) box got
+        rejected over and over for a dozen different track IDs across
+        multiple sessions. It was never causing a false alert (the
+        per-person padded-bbox check already rejects it correctly), but
+        it was pure wasted matching work and log spam every single frame.
+
+        Uses a leaky per-grid-cell counter (accumulates on unmatched
+        hits, decays otherwise) rather than a hard blacklist, so a real
+        phone that happens to pass through that exact spot briefly won't
+        get stuck suppressed.
+        """
+        seen_cells = set()
+        for (px1, py1, px2, py2, conf) in phone_dets:
+            cx, cy = (px1 + px2) / 2.0, (py1 + py2) / 2.0
+            cell = (int(cx) // self._STATIC_FP_CELL, int(cy) // self._STATIC_FP_CELL)
+            seen_cells.add(cell)
+            near_person = any(
+                px1 < x2 + 40 and px2 > x1 - 40 and py1 < y2 + 40 and py2 > y1 - 40
+                for (_tid, x1, y1, x2, y2, *_rest) in person_tracks
+            )
+            val = self._static_fp_counters.get(cell, 0)
+            val = min(val + 1, self._STATIC_FP_CAP) if not near_person else max(val - 2, 0)
+            if val == 0:
+                self._static_fp_counters.pop(cell, None)
+            else:
+                self._static_fp_counters[cell] = val
+
+        for cell in list(self._static_fp_counters):
+            if cell not in seen_cells:
+                v = max(self._static_fp_counters[cell] - 1, 0)
+                if v == 0:
+                    del self._static_fp_counters[cell]
+                else:
+                    self._static_fp_counters[cell] = v
+
+    def _filter_static_fp(self, phone_dets: List[Tuple]) -> List[Tuple]:
+        if not self._static_fp_counters:
+            return phone_dets
+        kept = []
+        for box in phone_dets:
+            px1, py1, px2, py2, conf = box
+            cx, cy = (px1 + px2) / 2.0, (py1 + py2) / 2.0
+            cell = (int(cx) // self._STATIC_FP_CELL, int(cy) // self._STATIC_FP_CELL)
+            if self._static_fp_counters.get(cell, 0) >= self._STATIC_FP_THRESHOLD:
+                continue
+            kept.append(box)
+        return kept
+
+    def _parse_object_detections(self, frame: np.ndarray, person_tracks: Optional[List[Tuple]] = None):
         phone_dets, food_dets, book_dets = [], [], []
         if self.object_model is not None:
             try:
@@ -230,15 +410,28 @@ class ProductionStreamProcessor:
                     for i in range(len(result.boxes)):
                         conf = float(result.boxes.conf[i])
                         x1, y1, x2, y2 = map(int, result.boxes.xyxy[i])
-                        is_dup = any(abs(x1 - ex1) < 25 and abs(y1 - ey1) < 25
-                                     for (ex1, ey1, ex2, ey2, _) in phone_dets)
-                        if not is_dup:
-                            phone_dets.append((x1, y1, x2, y2, conf))
+                        box = (x1, y1, x2, y2, conf)
+                        if not self._is_dup_box(box, phone_dets):
+                            phone_dets.append(box)
                             new_count += 1
                     if new_count:
                         print(f'[PHONE-MODEL] Found {new_count} additional phone(s)')
             except Exception as e:
                 print(f'[WARN] Custom phone model failed: {e}')
+
+        # Static-false-positive suppression — filter out phone-shaped
+        # detections recurring at a fixed, person-less screen location
+        # before spending any more work on them (heuristic matching,
+        # ROI boost, logging).
+        self._update_static_fp_map(phone_dets, person_tracks or [])
+        phone_dets = self._filter_static_fp(phone_dets)
+
+        # Hand-ROI boost pass (see _hand_roi_phone_boost docstring) — only
+        # meaningfully useful once we know where people/wrists are, so it
+        # runs last and merges into the same list.
+        if person_tracks:
+            phone_dets.extend(self._hand_roi_phone_boost(frame, person_tracks, phone_dets))
+
         return phone_dets, food_dets, book_dets
 
     def _parse_pose_detections(self, frame: np.ndarray):
@@ -357,7 +550,7 @@ class ProductionStreamProcessor:
         t0 = time.time()
         try:
             person_tracks = self._parse_pose_detections(frame)
-            phone_dets, food_dets, book_dets = self._parse_object_detections(frame)
+            phone_dets, food_dets, book_dets = self._parse_object_detections(frame, person_tracks)
             fight_detected = False
             if self.fight_detector is not None:
                 self.fight_detector.add_frame(frame)   # buffer frames for 3D CNN
@@ -519,7 +712,7 @@ class ClassroomBehaviorDetector:
             timestamp     = time.time()
             if person_tracks is None:
                 person_tracks = self.processor._parse_pose_detections(frame)
-            phone_dets, food_dets, book_dets = self.processor._parse_object_detections(frame)
+            phone_dets, food_dets, book_dets = self.processor._parse_object_detections(frame, person_tracks)
             det_objs = self.processor._run_behavior_evaluation(frame, person_tracks, phone_dets, food_dets, book_dets, timestamp)
             detections = []
             for d in det_objs:

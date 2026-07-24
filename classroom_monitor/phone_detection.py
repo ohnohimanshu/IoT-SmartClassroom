@@ -49,6 +49,44 @@ class PhoneDetector:
         self._heuristic_counters = {}
         self._yolo_counters = {}
 
+    @staticmethod
+    def _face_anchor(kp) -> Optional[np.ndarray]:
+        """
+        Best-available anchor point for the "phone near face" distance
+        check. Prefers the nose, but falls back to eye-center, then a
+        visible ear, if the nose keypoint isn't trustworthy.
+
+        This matters because a hand/phone held up against the face is
+        exactly the situation most likely to drop nose confidence below
+        threshold — the object we're trying to detect is the same thing
+        occluding the landmark we were using to detect it. Without a
+        fallback, this whole path silently goes dark right when it's
+        needed most.
+        """
+        def ok(pt, min_conf):
+            return pt is not None and len(pt) >= 3 and pt[2] >= min_conf and pt[0] != 0.0
+
+        if kp is None:
+            return None
+
+        nose = kp[0] if len(kp) > 0 else None
+        if ok(nose, 0.3):
+            return nose[:2]
+
+        left_eye  = kp[1] if len(kp) > 1 else None
+        right_eye = kp[2] if len(kp) > 2 else None
+        eyes = [e[:2] for e in (left_eye, right_eye) if ok(e, 0.3)]
+        if eyes:
+            return np.mean(eyes, axis=0)
+
+        left_ear  = kp[3] if len(kp) > 3 else None
+        right_ear = kp[4] if len(kp) > 4 else None
+        for ear in (left_ear, right_ear):
+            if ok(ear, 0.3):
+                return ear[:2]
+
+        return None
+
     @classmethod
     def _leaky_update(cls, counters: dict, tid, matched: bool, threshold: int) -> bool:
         val = counters.get(tid, 0)
@@ -89,13 +127,25 @@ class PhoneDetector:
         yolo_hit_conf = None
         if phone_detections:
             for (px1, py1, px2, py2, conf) in phone_detections:
-                # Raised from 0.25 — that floor was letting through
-                # low-confidence noise from the custom classroom model
-                # (a repeated real false positive sat at 0.25-0.44 the
-                # whole time, consistent with the model mistaking a
-                # notebook cover for a phone at low confidence rather than
-                # a genuine detection).
-                if conf < 0.40:
+                # Was raised to 0.40 to kill one specific recurring false
+                # positive at a fixed frame location. That's now handled
+                # properly (and more precisely) by location-based
+                # suppression in behavior_detection.py's
+                # _filter_static_fp, so this floor no longer needs to do
+                # that job. Left at 0.40 it was silently discarding real,
+                # legitimate low-confidence hits from the custom model
+                # everywhere else in frame — a normal-angle phone from a
+                # custom-trained model commonly scores 0.28-0.39. Dropped
+                # to 0.28, just above the model's own 0.25 call-threshold.
+                #
+                # This branch used to be the ONE rejection path in this
+                # function with no log line at all, which is exactly why
+                # "[PHONE-MODEL] Found N phone(s)" kept appearing with no
+                # corresponding debug output below it — detections were
+                # dying here, invisibly. Never leave a rejection silent.
+                if conf < 0.28:
+                    print(f'[PHONE-DEBUG] tid={tid} rejected: below confidence floor '
+                          f'conf={conf:.2f} < 0.28')
                     continue
 
                 pc  = np.array([(px1 + px2) / 2.0, (py1 + py2) / 2.0])
@@ -190,16 +240,25 @@ class PhoneDetector:
             # exists to catch. Not gated on head_is_down: looking at a
             # phone held to the ear/cheek often still reads as "focused"
             # head pose since the chin doesn't drop.
-            nose = person.keypoints[0] if len(person.keypoints) > 0 else None
-            if _wrist_ok(nose, 0.3):
+            #
+            # Anchor point falls back nose -> eye-center -> ear instead of
+            # requiring the nose specifically. Observed in production: a
+            # phone held up against the face is the single most common
+            # thing that drops nose-keypoint confidence below 0.3 — so
+            # nose-only anchoring goes blind exactly when this path is
+            # needed most (real case: a student holding a phone to their
+            # face was scored "Focused" because the nose keypoint dropped
+            # out and this whole path never even started).
+            face_anchor = self._face_anchor(person.keypoints)
+            if face_anchor is not None:
                 for w_idx, e_idx in ((9, 7), (10, 8)):
                     w = person.keypoints[w_idx] if w_idx < len(person.keypoints) else None
                     e = person.keypoints[e_idx] if e_idx < len(person.keypoints) else None
                     if not (_wrist_ok(w, 0.35) and e is not None and len(e) >= 3 and e[2] >= 0.3):
                         continue
-                    dist_to_nose = np.linalg.norm(w[:2] - nose[:2]) / bbox_h
+                    dist_to_face = np.linalg.norm(w[:2] - face_anchor) / bbox_h
                     forearm_bent = w[1] <= e[1] - bbox_h * self.PHONE_FOREARM_BEND_FRAC
-                    if (dist_to_nose < self.PHONE_NEAR_FACE_DIST_FRAC and forearm_bent
+                    if (dist_to_face < self.PHONE_NEAR_FACE_DIST_FRAC and forearm_bent
                             and not _book_near(w[:2])):
                         heuristic_matched = True
                         match_conf = 0.62
