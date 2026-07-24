@@ -6,7 +6,7 @@ from classroom_monitor.head_pose_detection import HeadPoseDetector
 
 class PhoneDetector:
     """
-    Two independent detection paths:
+    Three independent detection paths:
 
     Path 1 - YOLO actually detected a phone-shaped object near a hand.
              Real visual evidence, needs only light smoothing.
@@ -17,7 +17,14 @@ class PhoneDetector:
              hand holding a phone in the lap. Persistence is required
              before this is trusted, and the book/notebook veto matters.
 
-    Persistence on both paths uses LEAKY counters (decay by 1 on a miss,
+    Path 3 - No phone object seen; phone held up near the face/ear. Head
+             pose is often still "focused"-looking here (chin isn't down),
+             so this can't be gated on head_is_down like Path 2 — it's
+             keyed on wrist-near-nose distance plus a bent-forearm check
+             (wrist above elbow) to distinguish "hand at face" from "hand
+             at chest/shoulder".
+
+    Persistence on all heuristic paths uses LEAKY counters (decay by 1 on a miss,
     not reset to 0) rather than strict consecutive-frame counters. Pose
     estimation is noisy frame to frame, and a hard reset means one bad
     frame in the middle of five seconds of real phone use can wipe out
@@ -28,6 +35,8 @@ class PhoneDetector:
     PHONE_CUPPED_SPREAD_MAX    = 0.20   # tight-ish cupped grip — open notebook has notably wider spread
     PHONE_SINGLE_HAND_Y_MIN    = 0.45   # wrist-relative-y above this = torso zone
     PHONE_SINGLE_HAND_Y_MAX    = 0.85
+    PHONE_NEAR_FACE_DIST_FRAC  = 0.35   # wrist-to-nose distance / bbox_h — "hand at face" zone
+    PHONE_FOREARM_BEND_FRAC    = 0.03   # wrist must sit at least this much above the elbow (/bbox_h)
 
     # Leaky-counter thresholds. At process_fps=10, ~6 net frames of
     # "credit" is roughly ~0.6s of real sustained heuristic match.
@@ -94,6 +103,8 @@ class PhoneDetector:
                 pw  = px2 - px1
 
                 if max(pw, ph) / bbox_h > 0.7 or min(pw, ph) / bbox_h < 0.03:
+                    print(f'[PHONE-DEBUG] tid={tid} rejected: size ratio '
+                          f'max={max(pw, ph)/bbox_h:.2f} min={min(pw, ph)/bbox_h:.2f}')
                     continue
 
                 # Padding scaled to person size instead of a flat 20px —
@@ -105,8 +116,12 @@ class PhoneDetector:
                 in_person_x = px1 < x2 + pad_x and px2 > x1 - pad_x
                 in_person_y = py1 < y2 + pad_y and py2 > y1 - pad_y
                 if not (in_person_x and in_person_y):
+                    print(f'[PHONE-DEBUG] tid={tid} rejected: outside padded bbox '
+                          f'person=({x1},{y1},{x2},{y2}) phone=({px1},{py1},{px2},{py2}) '
+                          f'pad=({pad_x:.0f},{pad_y:.0f})')
                     continue
 
+                matched_kp = False
                 if person.keypoints is not None and len(person.keypoints) > 10:
                     for idx in (9, 10, 7, 8):
                         if idx >= len(person.keypoints):
@@ -114,20 +129,36 @@ class PhoneDetector:
                         w = person.keypoints[idx]
                         if _wrist_ok(w, 0.4) and np.linalg.norm(w[:2] - pc) / bbox_h < 0.45:
                             yolo_hit_conf = float(conf)
+                            matched_kp = True
                             break
 
-                if yolo_hit_conf is None and conf >= 0.45:
+                if yolo_hit_conf is None and conf >= 0.40:
                     overlap_x = max(0, min(px2, x2) - max(px1, x1))
                     overlap_y = max(0, min(py2, y2) - max(py1, y1))
                     overlap_area = overlap_x * overlap_y
                     phone_area   = max((px2 - px1) * (py2 - py1), 1)
                     if overlap_area / phone_area > 0.5:
                         yolo_hit_conf = float(conf)
+                    elif not matched_kp:
+                        wrist_dists = []
+                        if person.keypoints is not None and len(person.keypoints) > 10:
+                            for idx in (9, 10, 7, 8):
+                                if idx < len(person.keypoints):
+                                    w = person.keypoints[idx]
+                                    wrist_dists.append(
+                                        f'idx{idx}:conf={w[2]:.2f},d={np.linalg.norm(w[:2]-pc)/bbox_h:.2f}'
+                                        if w is not None and len(w) >= 3 else f'idx{idx}:None')
+                        print(f'[PHONE-DEBUG] tid={tid} rejected: conf={conf:.2f} '
+                              f'no wrist match ({", ".join(wrist_dists)}), '
+                              f'overlap/phone_area={overlap_area/phone_area:.2f}')
 
                 if yolo_hit_conf is not None:
                     break
 
         yolo_confirmed = self._leaky_update(self._yolo_counters, tid, yolo_hit_conf is not None, self.YOLO_HIT_THRESHOLD)
+        if yolo_hit_conf is not None:
+            print(f'[PHONE-DEBUG] tid={tid} yolo hit conf={yolo_hit_conf:.2f} '
+                  f'counter={self._yolo_counters.get(tid, 0)}/{self.YOLO_HIT_THRESHOLD}')
         if yolo_hit_conf is not None:
             self._leaky_update(self._heuristic_counters, tid, False, self.HEURISTIC_THRESHOLD)
             if yolo_confirmed:
@@ -148,14 +179,37 @@ class PhoneDetector:
             wrist_pts = [w[:2] for w in (left_wrist, right_wrist) if _wrist_ok(w, 0.5)]
             both_wrists_for_veto = [w[:2] for w in (left_wrist, right_wrist) if _wrist_ok(w, 0.4)]
 
-            if not wrist_pts:
-                self._leaky_update(self._heuristic_counters, tid, False, self.HEURISTIC_THRESHOLD)
-                return False, 0.0
-
             heuristic_matched = False
             match_conf = 0.0
 
-            if head_is_down and len(wrist_pts) >= 1:
+            # ── Path 3: phone held near face/ear ─────────────────────────
+            # Deliberately uses a lower wrist-confidence floor (0.35) than
+            # Path 2's 0.5 — a hand held up near the face/ear is commonly
+            # partly occluded by the forearm or the phone itself, which
+            # depresses keypoint confidence exactly in the case this path
+            # exists to catch. Not gated on head_is_down: looking at a
+            # phone held to the ear/cheek often still reads as "focused"
+            # head pose since the chin doesn't drop.
+            nose = person.keypoints[0] if len(person.keypoints) > 0 else None
+            if _wrist_ok(nose, 0.3):
+                for w_idx, e_idx in ((9, 7), (10, 8)):
+                    w = person.keypoints[w_idx] if w_idx < len(person.keypoints) else None
+                    e = person.keypoints[e_idx] if e_idx < len(person.keypoints) else None
+                    if not (_wrist_ok(w, 0.35) and e is not None and len(e) >= 3 and e[2] >= 0.3):
+                        continue
+                    dist_to_nose = np.linalg.norm(w[:2] - nose[:2]) / bbox_h
+                    forearm_bent = w[1] <= e[1] - bbox_h * self.PHONE_FOREARM_BEND_FRAC
+                    if (dist_to_nose < self.PHONE_NEAR_FACE_DIST_FRAC and forearm_bent
+                            and not _book_near(w[:2])):
+                        heuristic_matched = True
+                        match_conf = 0.62
+                        break
+
+            if not heuristic_matched and not wrist_pts:
+                self._leaky_update(self._heuristic_counters, tid, False, self.HEURISTIC_THRESHOLD)
+                return False, 0.0
+
+            if not heuristic_matched and head_is_down and len(wrist_pts) >= 1:
                 for w in wrist_pts:
                     rel_y = (w[1] - y1) / bbox_h
                     rel_x_offset = abs(w[0] - (x1 + x2) / 2.0) / bbox_w
