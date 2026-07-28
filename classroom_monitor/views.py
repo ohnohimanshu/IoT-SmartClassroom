@@ -827,8 +827,10 @@ def _generate_video_stream(video_path, camera_id=0, camera_location='Classroom',
             except _queue.Empty:
                 continue
             try:
+                with result_lock:
+                    current_tracks = list(latest_tracks)
                 with yolo_track_lock:
-                    phone_dets, food_dets, book_dets = detector.processor._parse_object_detections(work_frame)
+                    phone_dets, food_dets, book_dets = detector.processor._parse_object_detections(work_frame, current_tracks)
                 fight_detected = False
                 fd = detector.processor.fight_detector
                 if fd is not None:

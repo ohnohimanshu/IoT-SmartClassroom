@@ -15,10 +15,7 @@ from classroom_monitor.constants import (
 from classroom_monitor.behavior_detection_core import (
     TrackedPerson, DetectionResult, TemporalBehaviorEngine, SharedHelpers
 )
-from classroom_monitor.head_pose_detection import HeadPoseDetector
-from classroom_monitor.phone_detection import PhoneDetector
-from classroom_monitor.hand_raise_detection import HandRaiseDetector
-from classroom_monitor.food_detection import FoodDetector
+from classroom_monitor.behavior_lstm import SharedBehaviorLSTM
 
 
 def _http_verify_ssl() -> bool:
@@ -134,10 +131,8 @@ class ProductionStreamProcessor:
         self.behavior_engine.cleanup_threshold = (track_buffer_frames / process_fps) + 1.0
 
         # Initialize modular detectors
-        self.head_pose_detector = HeadPoseDetector()
-        self.phone_detector     = PhoneDetector()
-        self.hand_raise_detector = HandRaiseDetector()
-        self.food_detector      = FoodDetector()
+        # Initialize sequence model
+        self.lstm_model, self.lstm_device, self.lstm_loaded = SharedBehaviorLSTM.get()
 
         self._ensure_models()
         self._init_fight_detector()
@@ -262,45 +257,42 @@ class ProductionStreamProcessor:
             bbox_h, bbox_w = y2 - y1, x2 - x1
             if bbox_h <= 0 or bbox_w <= 0 or kp is None or len(kp) <= 10:
                 continue
-            if bbox_h > frame_h * 0.42:
-                continue  # person already large enough in-frame; full-frame pass suffices
 
-            pad_x, pad_y = bbox_w * 0.25, bbox_h * 0.20
+            pad_x, pad_y = bbox_w * 0.30, bbox_h * 0.25
             already_found = any(
-                px1 < x2 + pad_x and px2 > x1 - pad_x and py1 < y2 + pad_y and py2 > y1 - pad_y and pconf >= 0.40
+                px1 < x2 + pad_x and px2 > x1 - pad_x and py1 < y2 + pad_y and py2 > y1 - pad_y and pconf >= 0.35
                 for (px1, py1, px2, py2, pconf) in existing_phone_dets
             )
             if already_found:
                 continue
 
             wrist_pts = []
-            for idx in (9, 10):
+            for idx in (9, 10, 7, 8):
                 if idx < len(kp):
                     w = kp[idx]
-                    if len(w) >= 3 and w[2] >= 0.3 and w[0] != 0.0:
+                    if len(w) >= 3 and w[2] >= 0.20 and w[0] != 0.0:
                         wrist_pts.append((float(w[0]), float(w[1])))
-            if not wrist_pts:
-                continue
+            # Always include the student's torso/lap center point as a crop target
+            torso_cx = (x1 + x2) / 2.0
+            torso_cy = y1 + bbox_h * 0.58
+            wrist_pts.append((torso_cx, torso_cy))
 
             for (wx, wy) in wrist_pts:
-                half = bbox_h * 0.22
-                cx1, cy1 = int(max(0, wx - half)), int(max(0, wy - half))
-                cx2, cy2 = int(min(frame_w, wx + half)), int(min(frame_h, wy + half))
+                half_w = max(bbox_w * 0.35, bbox_h * 0.22)
+                half_h = max(bbox_h * 0.28, bbox_w * 0.25)
+                cx1, cy1 = int(max(0, wx - half_w)), int(max(0, wy - half_h))
+                cx2, cy2 = int(min(frame_w, wx + half_w)), int(min(frame_h, wy + half_h))
                 if cx2 - cx1 < 20 or cy2 - cy1 < 20:
                     continue
                 crop = frame[cy1:cy2, cx1:cx2]
                 if crop.size == 0:
                     continue
 
-                scale = 2.5 if max(crop.shape[:2]) < 200 else 1.5
+                scale = 2.5 if max(crop.shape[:2]) < 250 else 1.5
                 crop_rs = cv2.resize(crop, None, fx=scale, fy=scale, interpolation=cv2.INTER_LINEAR)
 
                 try:
-                    # Lower conf floor than the full-frame pass (0.20 vs 0.25)
-                    # is deliberate: this crop is small and phone-centric by
-                    # construction, so the base rate of noise here is much
-                    # lower than scanning the whole frame at that threshold.
-                    for result in model(crop_rs, verbose=False, conf=0.20, iou=0.45):
+                    for result in model(crop_rs, verbose=False, conf=0.15, iou=0.45):
                         if result.boxes is None:
                             continue
                         for i in range(len(result.boxes)):
@@ -462,9 +454,53 @@ class ProductionStreamProcessor:
 
     def _run_behavior_evaluation(self, frame, person_tracks, phone_dets, food_dets, book_dets, timestamp, fight_detected=False):
         active_tids = set()
+        
+        try:
+            import torch
+        except ImportError:
+            torch = None
+
         for tid, x1, y1, x2, y2, conf, kp in person_tracks:
             active_tids.add(tid)
-            self.behavior_engine.update_person(tid, (x1, y1, x2, y2), kp, timestamp)
+            # Compute auxiliary features
+            aux = np.zeros(4, dtype=np.float32)
+            bbox_h = max(y2 - y1, 1)
+            
+            # 0: phone dist (0 to 1, 1 being close)
+            phone_closest = 1000.0
+            for (px1, py1, px2, py2, pconf) in phone_dets:
+                pc = np.array([(px1+px2)/2, (py1+py2)/2])
+                if x1 <= pc[0] <= x2 and y1 <= pc[1] <= y2:
+                    dist = 0.0
+                else:
+                    dist = np.linalg.norm(pc - np.array([(x1+x2)/2, (y1+y2)/2])) / bbox_h
+                phone_closest = min(phone_closest, dist)
+            aux[0] = max(0, 1.0 - phone_closest) if phone_closest < 1000 else 0
+            
+            # 1: food dist
+            food_closest = 1000.0
+            for (fx1, fy1, fx2, fy2, fconf) in food_dets:
+                fc = np.array([(fx1+fx2)/2, (fy1+fy2)/2])
+                if x1 <= fc[0] <= x2 and y1 <= fc[1] <= y2:
+                    dist = 0.0
+                else:
+                    dist = np.linalg.norm(fc - np.array([(x1+x2)/2, (y1+y2)/2])) / bbox_h
+                food_closest = min(food_closest, dist)
+            aux[1] = max(0, 1.0 - food_closest) if food_closest < 1000 else 0
+            
+            # 2: book dist
+            book_closest = 1000.0
+            for (bx1, by1, bx2, by2, bconf) in book_dets:
+                bc = np.array([(bx1+bx2)/2, (by1+by2)/2])
+                if x1 <= bc[0] <= x2 and y1 <= bc[1] <= y2:
+                    dist = 0.0
+                else:
+                    dist = np.linalg.norm(bc - np.array([(x1+x2)/2, (y1+y2)/2])) / bbox_h
+                book_closest = min(book_closest, dist)
+            aux[2] = max(0, 1.0 - book_closest) if book_closest < 1000 else 0
+            
+            self.behavior_engine.update_person(tid, (x1, y1, x2, y2), kp, timestamp, aux_features=aux)
+            
         self.behavior_engine.cleanup_stale(timestamp)
         results = []
         for tid in active_tids:
@@ -472,6 +508,7 @@ class ProductionStreamProcessor:
                 if tid not in self.behavior_engine.tracked_people:
                     continue
                 person = self.behavior_engine.tracked_people[tid]
+                
             if fight_detected:
                 result = DetectionResult(
                     type='fighting', bbox=person.bbox, confidence=0.9,
@@ -480,61 +517,81 @@ class ProductionStreamProcessor:
                 )
                 results.append(result)
             else:
-                head_pose = self.head_pose_detector.calculate_head_pose(person)
-                is_hand_raised, hand_conf = self.hand_raise_detector.detect_hand_raise(person)
-                raw_behavior = ""
-                raw_confidence = 0.0
-                if is_hand_raised:
-                    raw_behavior = "hand_raised"
-                    raw_confidence = hand_conf
+                raw_behavior = "focused"
+                raw_confidence = 0.75
+                
+                # Check writing variance (shared feature)
+                is_writing, w_conf = SharedHelpers.calculate_wrist_motion_variance(person)
+                
+                if hasattr(self, 'lstm_loaded') and self.lstm_loaded and len(person.normalized_pose_history) == 16 and torch is not None:
+                    # Run LSTM
+                    try:
+                        seq = np.array(person.normalized_pose_history) # (16, 38)
+                        seq_t = torch.FloatTensor(seq).unsqueeze(0).to(self.lstm_device)
+                        with torch.no_grad():
+                            out = self.lstm_model(seq_t)
+                            probs = torch.softmax(out, dim=1)[0]
+                            pred_idx = torch.argmax(probs).item()
+                            pred_conf = probs[pred_idx].item()
+                            
+                        classes = ['focused', 'distracted', 'hand_raised', 'using_phone', 'eating_food']
+                        raw_behavior = classes[pred_idx]
+                        raw_confidence = pred_conf
+                    except Exception as e:
+                        print(f'[LSTM] Error: {e}')
                 else:
-                    is_phone, phone_conf = self.phone_detector.detect_phone_usage(person, phone_dets, head_pose, book_dets)
-                    if is_phone:
+                    # Fallback Geometry Heuristics (no LSTM loaded or sequence too short)
+                    aux = person.normalized_pose_history[-1][-4:] if len(person.normalized_pose_history) > 0 else np.zeros(4)
+                    phone_val, food_val = aux[0], aux[1]
+                    
+                    kp = person.keypoints
+                    is_head_down = False
+                    if kp is not None and len(kp) >= 3 and len(kp[0]) >= 3 and len(kp[1]) >= 3 and len(kp[2]) >= 3:
+                        nose, leye, reye = kp[0], kp[1], kp[2]
+                        if nose[2] > 0.5 and leye[2] > 0.5 and reye[2] > 0.5:
+                            inter_eye = np.linalg.norm(leye[:2] - reye[:2])
+                            if inter_eye > 0.1:
+                                drop_ratio = (nose[1] - (leye[1] + reye[1])/2) / inter_eye
+                                if drop_ratio > 0.38:
+                                    is_head_down = True
+                    
+                    bbox_h = max(person.bbox[3] - person.bbox[1], 1)
+                    bbox_w = max(person.bbox[2] - person.bbox[0], 1)
+                    center_x = (person.bbox[0] + person.bbox[2]) / 2.0
+                    
+                    if phone_val > 0.75:
                         raw_behavior = "using_phone"
-                        raw_confidence = phone_conf
+                        raw_confidence = 0.65
+                    elif food_val > 0.75:
+                        raw_behavior = "eating_food"
+                        raw_confidence = 0.65
+                    elif is_writing:
+                        raw_behavior = "focused"
+                        raw_confidence = 0.70
                     else:
-                        is_eating, eating_conf = self.food_detector.detect_eating(person, food_dets)
-                        if is_eating:
-                            raw_behavior = "eating_food"
-                            raw_confidence = eating_conf
-                        else:
-                            if head_pose == "focused":
-                                raw_behavior   = "focused"
+                        if kp is not None and len(kp) > 10:
+                            pixel_thresh = bbox_h * 0.08
+                            # check hand raise
+                            raised = False
+                            for s, e, w in [(5, 7, 9), (6, 8, 10)]:
+                                if s < len(kp) and e < len(kp) and w < len(kp):
+                                    shoulder, elbow, wrist = kp[s], kp[e], kp[w]
+                                    if len(shoulder) >= 3 and len(elbow) >= 3 and len(wrist) >= 3:
+                                        if shoulder[2] > 0.4 and elbow[2] > 0.4 and wrist[2] > 0.4 and wrist[0] != 0:
+                                            if wrist[1] < shoulder[1] - pixel_thresh and elbow[1] > wrist[1]:
+                                                raised = True
+                            if raised:
+                                raw_behavior = "hand_raised"
                                 raw_confidence = 0.75
-                            elif head_pose == "head_down":
-                                # hands_near_book relies on COCO's generic "book" class,
-                                # which essentially never fires on an open notebook/notepad
-                                # at a normal writing angle -- so this veto almost never
-                                # actually confirms real writing, and writers with head
-                                # down get mislabeled "distracted" by default. Wrist-motion
-                                # variance (already computed for phone-vs-writing
-                                # disambiguation elsewhere) is a much more reliable signal
-                                # here: real handwriting produces small, repetitive wrist
-                                # motion that phone-holding or idle hands don't.
-                                #
-                                # This veto only applies to head_down (writing posture).
-                                # looking_away means the head is turned aside, not down at
-                                # a desk -- there's no legitimate "writing" interpretation
-                                # for that, so it no longer shares this branch. Previously
-                                # bundling both meant a student looking away with any
-                                # incidental hand movement (adjusting a phone, gesturing)
-                                # got relabeled "focused" instead of "distracted".
-                                is_writing_motion, _ = SharedHelpers.calculate_wrist_motion_variance(person)
-                                if SharedHelpers.hands_near_book(person, book_dets) or is_writing_motion:
-                                    raw_behavior   = "focused"
-                                    raw_confidence = 0.70
-                                else:
-                                    raw_behavior   = "distracted"
-                                    raw_confidence = 0.70
-                            elif head_pose == "looking_away":
-                                raw_behavior   = "distracted"
-                                raw_confidence = 0.70
-                            elif head_pose == "not_visible":
-                                raw_behavior   = "not_visible"
-                                raw_confidence = 0.60
-                            else:
-                                raw_behavior   = "distracted"
+                            elif is_head_down:
+                                raw_behavior = "head_down"
                                 raw_confidence = 0.65
+                
+                # We can still resolve writing veto here to be safe
+                if raw_behavior == "head_down" and is_writing:
+                    raw_behavior = "focused"
+                    raw_confidence = 0.70
+                    
                 final_behavior, confidence = self.behavior_engine.evaluate_final_behavior(person, raw_behavior, raw_confidence)
                 is_alert = final_behavior in ALERT_POSES
                 is_distracted = final_behavior in DISTRACTED_POSES

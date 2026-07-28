@@ -25,8 +25,8 @@ class HeadPoseDetector:
     # Leaky-counter thresholds (not raw frame counts — see class docstring).
     # At process_fps=10, ~10 net frames of "credit" roughly corresponds to
     # ~1s of real sustained behavior, tolerant of the odd noisy frame.
-    HEAD_DOWN_THRESHOLD = 10
-    LOOKING_AWAY_THRESHOLD = 10
+    HEAD_DOWN_THRESHOLD = 4
+    LOOKING_AWAY_THRESHOLD = 6
     COUNTER_CAP = 20  # prevents unbounded buildup while someone stays down/away
 
     # Yaw: nose horizontal offset from eye-center, relative to inter-eye
@@ -36,9 +36,8 @@ class HeadPoseDetector:
     YAW_LOOKING_AWAY_RATIO = 0.65
 
     # Pitch: nose vertical drop below the eye-line, relative to inter-eye
-    # distance. Writing produces a real, sustained pitch drop that looks
-    # identical to "distracted head down" from pose alone.
-    PITCH_HEAD_DOWN_RATIO = 0.6
+    # distance. Writing or looking down produces a pitch drop.
+    PITCH_HEAD_DOWN_RATIO = 0.38
 
     def __init__(self):
         self.head_down_counters = {}

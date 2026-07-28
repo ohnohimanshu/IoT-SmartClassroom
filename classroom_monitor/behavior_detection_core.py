@@ -18,6 +18,7 @@ class TrackedPerson:
     last_seen: float = 0.0
     last_final_behavior: str = 'focused'
     keypoint_history: deque = field(default_factory=lambda: deque(maxlen=30))
+    normalized_pose_history: deque = field(default_factory=lambda: deque(maxlen=16)) # For LSTM
     last_raw_confidence: float = 0.0
 
 
@@ -42,6 +43,46 @@ class SharedHelpers:
             if np.linalg.norm(np.array(pt) - bc) / bbox_h < 0.26:
                 return True
         return False
+
+    @staticmethod
+    def normalize_keypoints(keypoints: np.ndarray, bbox: Tuple[int, int, int, int]) -> np.ndarray:
+        """
+        Normalize 17 keypoints (x,y) to center (0,0) and scale (torso length).
+        If missing, fill with 0.
+        Returns flat array of 34 floats.
+        """
+        out = np.zeros(34, dtype=np.float32)
+        if keypoints is None or len(keypoints) < 17:
+            return out
+            
+        # Try to find a stable center (e.g., hips midpoint or shoulders midpoint)
+        left_shoulder = keypoints[5][:2] if len(keypoints[5]) >= 2 and keypoints[5][0] != 0 else None
+        right_shoulder = keypoints[6][:2] if len(keypoints[6]) >= 2 and keypoints[6][0] != 0 else None
+        left_hip = keypoints[11][:2] if len(keypoints[11]) >= 2 and keypoints[11][0] != 0 else None
+        right_hip = keypoints[12][:2] if len(keypoints[12]) >= 2 and keypoints[12][0] != 0 else None
+        
+        valid_centers = []
+        if left_shoulder is not None and right_shoulder is not None:
+            valid_centers.append((left_shoulder + right_shoulder) / 2)
+        if left_hip is not None and right_hip is not None:
+            valid_centers.append((left_hip + right_hip) / 2)
+            
+        if valid_centers:
+            center = np.mean(valid_centers, axis=0)
+        else:
+            x1, y1, x2, y2 = bbox
+            center = np.array([(x1 + x2) / 2.0, y1 + (y2 - y1) * 0.5])
+            
+        # Scale by bounding box height
+        bbox_h = max(bbox[3] - bbox[1], 1.0)
+        scale = bbox_h
+        
+        for i in range(17):
+            if i < len(keypoints) and keypoints[i][0] != 0:
+                out[i*2] = (keypoints[i][0] - center[0]) / scale
+                out[i*2+1] = (keypoints[i][1] - center[1]) / scale
+                
+        return out
 
     @staticmethod
     def hands_near_book(person: 'TrackedPerson', book_detections: List[Tuple]) -> bool:
@@ -134,7 +175,7 @@ class TemporalBehaviorEngine:
         self.low_confidence_counters: Dict[int, int] = {}
         self.lock = threading.Lock()
 
-    def update_person(self, track_id: int, bbox: Tuple, keypoints: Optional[np.ndarray], timestamp: float):
+    def update_person(self, track_id: int, bbox: Tuple, keypoints: Optional[np.ndarray], timestamp: float, aux_features: Optional[np.ndarray] = None):
         with self.lock:
             if track_id not in self.tracked_people:
                 print(f'[TRACK] New track_id {track_id} created')
@@ -147,6 +188,14 @@ class TemporalBehaviorEngine:
 
             if keypoints is not None and keypoints.size > 0:
                 p.keypoint_history.append((timestamp, keypoints.copy()))
+                norm_kp = SharedHelpers.normalize_keypoints(keypoints, bbox)
+                
+                if aux_features is None:
+                    aux_features = np.zeros(4, dtype=np.float32)
+                
+                # Combine normalized keypoints (34) with aux features (4) = 38
+                full_feature = np.concatenate([norm_kp, aux_features])
+                p.normalized_pose_history.append(full_feature)
 
     def cleanup_stale(self, current_time: float):
         with self.lock:
@@ -166,13 +215,14 @@ class TemporalBehaviorEngine:
         if len(history) >= 1:
             last = history[-1]
             if last in ALERT_POSES or last == 'hand_raised':
-                # For alert behaviours: confirm over last N frames (majority vote)
-                n = min(self.ALERT_CONFIRM_FRAMES, len(history))
-                recent = history[-n:]
-                alert_count = sum(1 for h in recent if h == last)
-                # Confirm if ≥ 2/3 of recent frames agree (was 100% for all N)
-                if alert_count / n >= 0.67:
+                final_behavior = last
+            elif person.last_final_behavior in ALERT_POSES or person.last_final_behavior == 'hand_raised':
+                # Hold alert state until N consecutive non-alert frames occur
+                recent = history[-6:]
+                if len(recent) >= 5 and all(h not in ALERT_POSES and h != 'hand_raised' for h in recent):
                     final_behavior = last
+                else:
+                    final_behavior = person.last_final_behavior
             else:
                 if len(history) >= self.NORMAL_CONFIRM_FRAMES:
                     recent = history[-self.NORMAL_CONFIRM_FRAMES:]
@@ -181,7 +231,7 @@ class TemporalBehaviorEngine:
                     else:
                         window = history[-8:]
                         top_label, top_count = Counter(window).most_common(1)[0]
-                        if top_count / len(window) > 0.5:   # was 0.6
+                        if top_count / len(window) > 0.5:
                             final_behavior = top_label
                 else:
                     final_behavior = last
